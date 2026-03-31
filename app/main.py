@@ -1,21 +1,33 @@
+from urllib.parse import urlsplit, urlunsplit
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import auth, users, rfq, products, actions, owner, chat
+from app.config import settings
+from app.routers import actions, auth, chat, owner, products, rfq, users
 
 app = FastAPI(
     title="RFQ Management API",
     version="1.0.0",
-    description="Avocarbon RFQ chatbot backend — Phase 1",
+    description="Avocarbon RFQ chatbot backend - Phase 1",
 )
+
+
+def _build_allowed_origins() -> list[str]:
+    origins = {settings.frontend_url}
+    parsed = urlsplit(settings.frontend_url)
+
+    if parsed.scheme and parsed.hostname in {"localhost", "127.0.0.1"}:
+        sibling_host = "127.0.0.1" if parsed.hostname == "localhost" else "localhost"
+        sibling_netloc = sibling_host if not parsed.port else f"{sibling_host}:{parsed.port}"
+        origins.add(urlunsplit((parsed.scheme, sibling_netloc, "", "", "")))
+
+    return sorted(origins)
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=_build_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

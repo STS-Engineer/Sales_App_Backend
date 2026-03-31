@@ -43,7 +43,7 @@ async def _get_owner_emails(db: AsyncSession) -> list[str]:
 def _send_new_signup_email(owner_email: str, new_user_email: str, full_name: str | None) -> None:
     """Send an SMTP notification to the owner about a new signup."""
     display_name = full_name or new_user_email
-    frontend_url = getattr(settings, "FRONTEND_URL", "http://localhost:5173")
+    frontend_url = settings.frontend_url
     approval_link = f"{frontend_url}/users/validation"
 
     msg = EmailMessage()

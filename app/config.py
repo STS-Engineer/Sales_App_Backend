@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE))
 
     @property
+    def frontend_url(self) -> str:
+        return self.FRONTEND_URL.rstrip("/")
+
+    @property
     def async_db_url(self) -> URL:
         """
         Parse the raw DATABASE_URL and return a SQLAlchemy URL object with

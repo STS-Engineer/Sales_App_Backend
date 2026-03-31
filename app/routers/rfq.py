@@ -154,7 +154,7 @@ def _send_validation_email(
     acronym: str,
     rfq_id: str,
 ) -> None:
-    frontend_url = getattr(settings, "FRONTEND_URL", "http://localhost:5173")
+    frontend_url = settings.frontend_url
     rfq_link = f"{frontend_url}/rfq/{rfq_id}"
 
     msg = EmailMessage()

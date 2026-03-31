@@ -22,7 +22,7 @@ SMTP_FROM = "administration.STS@avocarbon.com"
 
 def _send_approval_email(user_email: str, _user_name: str | None, assigned_role: str) -> None:
     """Send an SMTP confirmation email to the newly approved user."""
-    frontend_url = getattr(settings, "FRONTEND_URL", "http://localhost:5173")
+    frontend_url = settings.frontend_url
     login_link = frontend_url
     approval_message = (
         "Hello, your account for the AVO Carbon RFQ Portal has been approved. "
