@@ -72,14 +72,14 @@ class ValidateRfqRequest(BaseModel):
 
 
 class CostingReviewRequest(BaseModel):
-    """Body for POST /api/rfq/{id}/costing_review — Costing feasibility step."""
-    is_feasible: bool
+    """Body for POST /api/rfq/{id}/costing_review — Costing scope step."""
+    scope: bool
     rejection_reason: str | None = None
 
     @model_validator(mode="after")
-    def rejection_required_if_not_feasible(self) -> "CostingReviewRequest":
-        if not self.is_feasible and not self.rejection_reason:
-            raise ValueError("rejection_reason is required when is_feasible=False")
+    def rejection_required_if_out_of_scope(self) -> "CostingReviewRequest":
+        if not self.scope and not self.rejection_reason:
+            raise ValueError("rejection_reason is required when scope=False")
         return self
 
 

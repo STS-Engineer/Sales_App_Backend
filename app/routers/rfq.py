@@ -51,6 +51,21 @@ def _set_phase_sub_status(rfq: Rfq, phase: RfqPhase, sub_status: RfqSubStatus) -
     rfq.sub_status = sub_status
 
 
+def _assert_terminal_status_allowed(rfq: Rfq, target_phase: RfqPhase, target_sub_status: RfqSubStatus) -> None:
+    if (
+        target_phase == RfqPhase.CLOSED
+        and target_sub_status == RfqSubStatus.LOST
+        and rfq.phase in {RfqPhase.RFQ, RfqPhase.COSTING}
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "RFQs rejected during the RFQ or COSTING phases must close as "
+                "CANCELED, not LOST."
+            ),
+        )
+
+
 def _can_view_rfq(current_user: User, rfq: Rfq) -> bool:
     return (
         current_user.role == UserRole.OWNER
@@ -398,12 +413,15 @@ async def submit_rfq_for_validation(
     rfq.rfq_data = extracted_data
     rfq.zone_manager_email = zone_manager_email
     rfq.product_line_acronym = acronym
-    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.IN_VALIDATION)
+    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION)
 
     await log_action(
         db,
         rfq_id,
-        f"RFQ submitted for validation -> {RfqPhase.RFQ.value}/{RfqSubStatus.IN_VALIDATION.value}",
+        (
+            "RFQ submitted for validation -> "
+            f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_FOR_VALIDATION.value}"
+        ),
         current_user.email,
     )
     await db.commit()
@@ -429,6 +447,7 @@ async def update_rfq_status(
     ),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_terminal_status_allowed(rfq, body.phase, body.sub_status)
     _ensure_valid_phase_sub_status(body.phase, body.sub_status)
     _set_phase_sub_status(rfq, body.phase, body.sub_status)
 
@@ -499,11 +518,14 @@ async def validate_rfq(
             detail="You are not assigned as the Zone Manager for this RFQ.",
         )
 
-    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.IN_VALIDATION):
+    if (rfq.phase, rfq.sub_status) != (
+        RfqPhase.RFQ,
+        RfqSubStatus.PENDING_FOR_VALIDATION,
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "RFQ must be in RFQ/IN_VALIDATION before it can be validated. "
+                "RFQ must be in RFQ/PENDING_FOR_VALIDATION before it can be validated. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
@@ -517,12 +539,12 @@ async def validate_rfq(
             current_user.email,
         )
     else:
-        _set_phase_sub_status(rfq, RfqPhase.CLOSED, RfqSubStatus.LOST)
+        _set_phase_sub_status(rfq, RfqPhase.CLOSED, RfqSubStatus.CANCELED)
         rfq.rejection_reason = body.rejection_reason
         await log_action(
             db,
             rfq_id,
-            f"Zone Manager rejected -> {RfqPhase.CLOSED.value}/{RfqSubStatus.LOST.value}: {body.rejection_reason}",
+            f"Zone Manager rejected -> {RfqPhase.CLOSED.value}/{RfqSubStatus.CANCELED.value}: {body.rejection_reason}",
             current_user.email,
         )
 
@@ -549,7 +571,7 @@ async def costing_review(
             ),
         )
 
-    if body.is_feasible:
+    if body.scope:
         _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.PRICING)
         await log_action(
             db,
@@ -558,12 +580,12 @@ async def costing_review(
             current_user.email,
         )
     else:
-        _set_phase_sub_status(rfq, RfqPhase.CLOSED, RfqSubStatus.LOST)
+        _set_phase_sub_status(rfq, RfqPhase.CLOSED, RfqSubStatus.CANCELED)
         rfq.rejection_reason = body.rejection_reason
         await log_action(
             db,
             rfq_id,
-            f"Costing review rejected -> {RfqPhase.CLOSED.value}/{RfqSubStatus.LOST.value}: {body.rejection_reason}",
+            f"Costing review rejected -> {RfqPhase.CLOSED.value}/{RfqSubStatus.CANCELED.value}: {body.rejection_reason}",
             current_user.email,
         )
 

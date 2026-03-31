@@ -24,7 +24,7 @@ class RfqSubStatus(str, enum.Enum):
     # RFQ phase
     POTENTIAL = "POTENTIAL"
     NEW_RFQ = "NEW_RFQ"
-    IN_VALIDATION = "IN_VALIDATION"
+    PENDING_FOR_VALIDATION = "PENDING_FOR_VALIDATION"
     # COSTING phase
     FEASIBILITY = "FEASIBILITY"
     PRICING = "PRICING"
@@ -51,7 +51,7 @@ VALID_PHASE_SUBSTATUS: dict[RfqPhase, set[RfqSubStatus]] = {
     RfqPhase.RFQ: {
         RfqSubStatus.POTENTIAL,
         RfqSubStatus.NEW_RFQ,
-        RfqSubStatus.IN_VALIDATION,
+        RfqSubStatus.PENDING_FOR_VALIDATION,
     },
     RfqPhase.COSTING: {
         RfqSubStatus.FEASIBILITY,
@@ -92,28 +92,23 @@ ALLOWED_TRANSITIONS: dict[
     # ── RFQ phase ────────────────────────────────────────────────────
     (RfqPhase.RFQ, RfqSubStatus.POTENTIAL): {
         (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
         (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
     },
     (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ): {
-        (RfqPhase.RFQ, RfqSubStatus.IN_VALIDATION),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),
         (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
     },
-    (RfqPhase.RFQ, RfqSubStatus.IN_VALIDATION): {
+    (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION): {
         (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),  # approved
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),           # rejected
         (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
     },
     # ── COSTING phase ────────────────────────────────────────────────
     (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY): {
         (RfqPhase.COSTING, RfqSubStatus.PRICING),       # feasible
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
         (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
     },
     (RfqPhase.COSTING, RfqSubStatus.PRICING): {
         (RfqPhase.OFFER, RfqSubStatus.PREPARATION),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
         (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
     },
     # ── OFFER phase ──────────────────────────────────────────────────

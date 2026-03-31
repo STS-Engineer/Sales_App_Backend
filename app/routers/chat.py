@@ -1,5 +1,7 @@
 import json
 import datetime
+import re
+import unicodedata
 import httpx
 from openai import AsyncOpenAI
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +13,7 @@ from app.config import settings
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
+from app.routers.rfq import submit_rfq_for_validation
 from app.models.user import User
 from app.models.validation_matrix import ValidationMatrix
 
@@ -21,10 +24,90 @@ client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY or "dummy_key")
 
 BASE_URL = "https://rfq-api.azurewebsites.net"
 INITIAL_GREETING = (
-    "Hello, I'm your sales assistant. I'll be helping you fill your RFQ. "
-    "Do you want me to guide you step-by-step, or you can give me a whole paragraph "
-    "and I'll extract the needed fields for each step and tell you the missing fields?"
+    "Please select your preferred language.\n"
+    "1- English\n"
+    "2- Français\n"
+    "3- 中文\n"
+    "4- Español\n"
+    "5- Deutsch\n"
+    "6- हिन्दी"
 )
+LANGUAGE_SELECTION_RULE = (
+    "CRITICAL RULE: The user will respond to the initial greeting with a language "
+    "choice (either by number or name). You MUST instantly acknowledge their choice "
+    "in that specific language. From that point forward, conduct the ENTIRE "
+    "conversation, including all step-by-step guidance and missing field "
+    "announcements, strictly in their chosen language."
+)
+LANGUAGE_OPTIONS: dict[str, dict[str, object]] = {
+    "en": {
+        "menu_number": "1",
+        "name": "English",
+        "aliases": {"1", "english", "en"},
+        "assistant_intro": (
+            "Hello, I'm your sales assistant. I'll be helping you fill your RFQ. "
+            "Do you want me to guide you step-by-step, or you can give me a whole "
+            "paragraph and I'll extract the needed fields for each step and tell "
+            "you the missing fields?"
+        ),
+    },
+    "fr": {
+        "menu_number": "2",
+        "name": "Français",
+        "aliases": {"2", "français", "francais", "french", "fr"},
+        "assistant_intro": (
+            "Bonjour, je suis votre assistant commercial. Je vais vous aider à "
+            "remplir votre RFQ. Souhaitez-vous que je vous guide étape par étape, "
+            "ou préférez-vous me donner un paragraphe complet afin que j'extraie "
+            "les champs nécessaires pour chaque étape et que je vous indique les "
+            "informations manquantes ?"
+        ),
+    },
+    "zh": {
+        "menu_number": "3",
+        "name": "中文",
+        "aliases": {"3", "中文", "chinese", "mandarin", "zh"},
+        "assistant_intro": (
+            "您好，我是您的销售助手。我将帮助您填写 RFQ。您希望我一步一步引导您，"
+            "还是您可以直接给我一整段文字，我会为每个步骤提取所需字段并告诉您"
+            "还缺少哪些信息？"
+        ),
+    },
+    "es": {
+        "menu_number": "4",
+        "name": "Español",
+        "aliases": {"4", "español", "espanol", "spanish", "es"},
+        "assistant_intro": (
+            "Hola, soy su asistente comercial. Le ayudaré a completar su RFQ. "
+            "¿Quiere que le guíe paso a paso, o puede darme un párrafo completo y "
+            "yo extraeré los campos necesarios para cada etapa y le diré qué "
+            "información falta?"
+        ),
+    },
+    "de": {
+        "menu_number": "5",
+        "name": "Deutsch",
+        "aliases": {"5", "deutsch", "german", "de"},
+        "assistant_intro": (
+            "Hallo, ich bin Ihr Vertriebsassistent. Ich helfe Ihnen beim Ausfüllen "
+            "Ihrer RFQ. Möchten Sie, dass ich Sie Schritt für Schritt führe, oder "
+            "können Sie mir einen ganzen Absatz geben und ich extrahiere die "
+            "benötigten Felder für jeden Schritt und teile Ihnen mit, welche "
+            "Informationen noch fehlen?"
+        ),
+    },
+    "hi": {
+        "menu_number": "6",
+        "name": "हिन्दी",
+        "aliases": {"6", "हिन्दी", "हिंदी", "hindi", "hi"},
+        "assistant_intro": (
+            "नमस्ते, मैं आपका सेल्स असिस्टेंट हूँ। मैं आपका RFQ भरने में मदद करूँगा। "
+            "क्या आप चाहते हैं कि मैं आपको चरण-दर-चरण मार्गदर्शन दूँ, या आप मुझे "
+            "एक पूरा पैराग्राफ दे सकते हैं और मैं हर चरण के लिए आवश्यक फ़ील्ड निकालकर "
+            "बताऊँगा कि कौन-सी जानकारी अभी बाकी है?"
+        ),
+    },
+}
 POTENTIAL_ALLOWED_FIELDS = {
     "customer_name",
     "application",
@@ -58,7 +141,7 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "product_ownership",
     "pays_for_development",
     "capacity_available",
-    "is_feasible",
+    "scope",
     "customer_status",
     "strategic_note",
     "final_recommendation",
@@ -114,11 +197,88 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "product_ownership",
             "pays_for_development",
             "capacity_available",
-            "is_feasible",
+            "scope",
         ],
     ),
     (4, ["to_total", "zone_manager_email"]),
 ]
+
+
+def _normalize_scope_value(value):
+    if isinstance(value, bool):
+        return "In scope" if value else "Out of scope"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return "In scope"
+        if normalized == "false":
+            return "Out of scope"
+    return value
+
+
+def _normalize_rfq_data_fields(data: dict | None) -> dict:
+    normalized = dict(data or {})
+    legacy_scope = normalized.pop("is_feasible", None)
+    if "scope" not in normalized and legacy_scope is not None:
+        normalized["scope"] = _normalize_scope_value(legacy_scope)
+    return normalized
+
+
+def _normalize_language_token(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
+    normalized = "".join(
+        char for char in normalized if not unicodedata.combining(char)
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _detect_language_choice(message: str | None) -> dict[str, object] | None:
+    raw_message = str(message or "").strip()
+    if not raw_message:
+        return None
+
+    numeric_match = re.fullmatch(r"([1-6])(?:\s*[-.)]?\s*[^\d].*)?", raw_message)
+    if numeric_match:
+        selected_number = numeric_match.group(1)
+        for code, option in LANGUAGE_OPTIONS.items():
+            if option["menu_number"] == selected_number:
+                return {"code": code, **option}
+
+    normalized_message = _normalize_language_token(raw_message)
+    for code, option in LANGUAGE_OPTIONS.items():
+        aliases = {
+            _normalize_language_token(alias)
+            for alias in option["aliases"]  # type: ignore[index]
+        }
+        if normalized_message in aliases:
+            return {"code": code, **option}
+        if any(alias and alias in normalized_message for alias in aliases):
+            return {"code": code, **option}
+
+    return None
+
+
+def _build_language_context(preferred_language_code: str | None) -> str:
+    if not preferred_language_code:
+        return (
+            "No preferred language has been stored yet. Treat the current user "
+            "message as their response to the language-selection menu. Do not start "
+            "the RFQ workflow until you have either acknowledged one of the 6 "
+            "supported languages or asked the user to choose again from the menu."
+        )
+
+    preferred = LANGUAGE_OPTIONS.get(preferred_language_code)
+    if not preferred:
+        return (
+            "A preferred language code is stored, but it is not recognized. Ask the "
+            "user to pick one of the 6 supported languages from the menu."
+        )
+
+    return (
+        f"The preferred language is {preferred['name']}. You MUST write every "
+        f"response strictly in {preferred['name']}. Keep all future guidance, "
+        f"questions, confirmations, and status updates in that language."
+    )
 
 
 def _normalize_chat_mode(rfq: Rfq, requested_mode: str) -> str:
@@ -262,6 +422,9 @@ def _normalize_tool_arguments(func_name: str, args: dict | None) -> dict:
                 for key, value in normalized.items()
                 if key != "fields_to_update"
             }
+        legacy_scope = fields.pop("is_feasible", None) if isinstance(fields, dict) else None
+        if isinstance(fields, dict) and legacy_scope is not None and "scope" not in fields:
+            fields["scope"] = _normalize_scope_value(legacy_scope)
         normalized = {"fields_to_update": fields if isinstance(fields, dict) else {}}
     elif func_name == "uploadRfqFiles" and "file_confirmed" not in normalized:
         normalized["file_confirmed"] = bool(
@@ -382,6 +545,7 @@ async def _execute_tool_calls(
     http_client: httpx.AsyncClient,
     db: AsyncSession,
     rfq: Rfq,
+    current_user: User,
     extracted_data: dict,
     chat_mode: str,
     tool_calls_used: list[str],
@@ -492,6 +656,44 @@ async def _execute_tool_calls(
             except Exception as e:
                 tool_response_text = json.dumps({"error": str(e)})
 
+        elif func_name == "submitValidation":
+            try:
+                submit_result = await submit_rfq_for_validation(
+                    rfq_id=rfq.rfq_id,
+                    db=db,
+                    current_user=current_user,
+                )
+                await db.refresh(rfq)
+                extracted_data.clear()
+                extracted_data.update(_normalize_rfq_data_fields(rfq.rfq_data))
+                tool_response_text = json.dumps(
+                    {
+                        "success": True,
+                        "message": submit_result.get(
+                            "message",
+                            "RFQ submitted for validation.",
+                        ),
+                        "phase": rfq.phase.value,
+                        "sub_status": rfq.sub_status.value,
+                        "zone_manager_email": rfq.zone_manager_email,
+                    }
+                )
+            except HTTPException as exc:
+                detail = exc.detail
+                if not isinstance(detail, str):
+                    detail = json.dumps(detail)
+                tool_response_text = json.dumps(
+                    {
+                        "success": False,
+                        "error": detail,
+                        "status_code": exc.status_code,
+                    }
+                )
+            except Exception as exc:
+                tool_response_text = json.dumps(
+                    {"success": False, "error": str(exc)}
+                )
+
         elif func_name == "updateFormFields":
             fields = args.get("fields_to_update", {})
             filtered_fields = _filter_update_fields(chat_mode, fields)
@@ -528,7 +730,9 @@ class ChatResponse(BaseModel):
     response: str
     tool_calls_used: list[str] | None = None
 
-SYSTEM_PROMPT = """STRICT ANTI-HALLUCINATION DIRECTIVE:
+SYSTEM_PROMPT = LANGUAGE_SELECTION_RULE + """
+
+STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer, Product, Product Line, or Contact.
 If the user provides a Customer name, you MUST call the checkGroupeExistence tool. YOU MUST WAIT for the system to return the JSON response containing the database result.
 DO NOT generate a text response confirming or denying the customer until you have physically received the tool_call_id response from the system. If you violate this rule, the system will fail.
@@ -561,12 +765,13 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - product_ownership
 - pays_for_development
 - capacity_available
-- is_feasible
+- scope
 - customer_status
 - strategic_note
 - final_recommendation
 - to_total
 - zone_manager_email
+CRITICAL DATA RULE: Even if you are conversing with the user in French, Spanish, Chinese, Hindi, German, or any other language, the keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped above (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
 If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combine them into a single string and save it under the costing_data key. DO NOT invent new keys.
 
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
@@ -575,6 +780,9 @@ TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolca
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
 - If the user gives a whole paragraph, extract every field you can for the current step in a single pass, save them immediately, then tell the user exactly which required fields are still missing for that step.
+
+CRITICAL STATE RULE:
+If an RFQ is rejected during the RFQ or COSTING phases, the terminal outcome MUST be CANCELED, never LOST. LOST is only allowed after the RFQ has reached the OFFER, PO, or PROTOTYPE phases.
 
 You are a rigorous, highly-structured B2B RFQ Assistant. Your primary goal is to guide the user through the RFQ data collection process smoothly, in a strict order, utilizing the provided exact tools to extract and validate information into the database.
 
@@ -651,20 +859,25 @@ Ask the user the following questions sequentially or all at once:
 - Do we have the capacity to fulfill this request?
 - Do u have any comments to add?
 - L'assistant DOIT ensuite synth??tiser la position commerciale et faire une recommandation.
-CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormFields` to save them using the exact keys listed in the mapping (e.g., {"fields_to_update": {"responsibility_design": "...", "capacity_available": "...", "customer_status": "...", "strategic_note": "...", "final_recommendation": "..."}}).
+CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormFields` to save them using the exact keys listed in the mapping (e.g., {"fields_to_update": {"responsibility_design": "...", "capacity_available": "...", "scope": "...", "customer_status": "...", "strategic_note": "...", "final_recommendation": "..."}}).
 
 ### Step 5: Final Calculation & Routing
 1. You MUST calculate the TO TOTAL (Keur) using this exact formula: (target_price_eur * annual_volume) / 1000.
 2. Call the `retrieveZoneManager` tool using the calculated TO TOTAL and the saved product_line_acronym.
 3. CRITICAL RULE: Once the tool returns the Zone Manager email, you MUST immediately call `updateFormFields` with {"fields_to_update": {"to_total": "<calculated_value>", "zone_manager_email": "<email_from_tool>"}}.
-4. Tell the user: 'I have completed the data collection. Please review the form and click the "Submit Validation" button to send this RFQ to the assigned Zone Manager.' NEVER ask the user to provide the email.
+4. Then you MUST ask the user exactly this question, translated into their chosen language: 'The Zone Manager assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
+5. If the user confirms (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
+6. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the email notification was sent to the assigned Zone Manager.
 """
 
-POTENTIAL_SYSTEM_PROMPT = """STRICT ANTI-HALLUCINATION DIRECTIVE:
+POTENTIAL_SYSTEM_PROMPT = LANGUAGE_SELECTION_RULE + """
+
+STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer or Contact.
 If the user provides a Customer name, you MUST call the checkGroupeExistence tool and wait for the result before confirming anything.
 
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information, you MUST immediately call the 'updateFormFields' tool to save that data point.
+CRITICAL DATA RULE: Even if you are conversing with the user in French, Spanish, Chinese, Hindi, German, or any other language, the keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
 
 You are the Potential Opportunity Intake Assistant. This is NOT the full RFQ workflow.
 Your job is only to collect the lightweight opportunity details needed for the Potential tab.
@@ -701,7 +914,7 @@ You MUST NOT ask about or save any of these fields in Potential mode:
 - product_ownership
 - pays_for_development
 - capacity_available
-- is_feasible
+- scope
 - to_total
 - zone_manager_email
 
@@ -771,6 +984,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "submitValidation",
+            "description": (
+                "Submits the RFQ for validation, transitions it to PENDING_FOR_VALIDATION, "
+                "and sends the notification email to the assigned Zone Manager. Call "
+                "this only after the user explicitly confirms submission."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "uploadRfqFiles",
             "description": "Confirms the user has uploaded the RFQ drawing files.",
             "parameters": {
@@ -826,7 +1054,7 @@ async def handle_chat(
         raise HTTPException(status_code=404, detail="RFQ not found")
 
     chat_mode = _normalize_chat_mode(rfq, req.chat_mode)
-    extracted_data = dict(rfq.rfq_data or {})
+    extracted_data = _normalize_rfq_data_fields(rfq.rfq_data)
 
     if chat_mode == "potential":
         rfq.phase = RfqPhase.RFQ
@@ -872,6 +1100,34 @@ async def handle_chat(
     # We append the user's message to the DB array
     history.append({"role": "user", "content": req.message})
 
+    detected_language = None
+    if not extracted_data.get("preferred_language"):
+        detected_language = _detect_language_choice(req.message)
+        if detected_language:
+            extracted_data["preferred_language"] = detected_language["code"]
+            extracted_data["preferred_language_label"] = detected_language["name"]
+
+    if (
+        detected_language
+        and len(history) == 2
+        and history[0].get("role") == "assistant"
+        and history[0].get("content") == INITIAL_GREETING
+    ):
+        intro_message = str(detected_language["assistant_intro"])
+        history.append({"role": "assistant", "content": intro_message})
+
+        if chat_mode == "potential":
+            extracted_data["potential_chat_history"] = history
+            rfq.rfq_data = extracted_data
+        else:
+            rfq.chat_history = history
+            rfq.rfq_data = extracted_data
+
+        await db.commit()
+        await db.refresh(rfq)
+
+        return ChatResponse(response=intro_message, tool_calls_used=None)
+
     # Ensure history does not bloat past 10 messages but preserve tool_call pairings
     start_idx = max(0, len(history) - 10)
     while start_idx > 0 and history[start_idx].get("role") == "tool":
@@ -888,10 +1144,14 @@ async def handle_chat(
     current_rfq_state["phase"] = rfq.phase.value
     current_rfq_state["sub_status"] = rfq.sub_status.value
     base_system_prompt = POTENTIAL_SYSTEM_PROMPT if chat_mode == "potential" else SYSTEM_PROMPT
+    language_context = _build_language_context(extracted_data.get("preferred_language"))
     missing_fields_prompt = _build_missing_fields_prompt(chat_mode, current_rfq_state)
 
     # Create a dynamic system message containing the database state
     DYNAMIC_SYSTEM_PROMPT = f"""{base_system_prompt}
+
+=== LANGUAGE LOCK ===
+{language_context}
 
 === MISSING FIELDS ENGINE ===
 {missing_fields_prompt}
@@ -952,6 +1212,7 @@ CRITICAL INSTRUCTION:
                     http_client=http_client,
                     db=db,
                     rfq=rfq,
+                    current_user=current_user,
                     extracted_data=extracted_data,
                     chat_mode=chat_mode,
                     tool_calls_used=tool_calls_used,
@@ -989,6 +1250,7 @@ CRITICAL INSTRUCTION:
                         http_client=http_client,
                         db=db,
                         rfq=rfq,
+                        current_user=current_user,
                         extracted_data=extracted_data,
                         chat_mode=chat_mode,
                         tool_calls_used=tool_calls_used,

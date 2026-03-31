@@ -146,7 +146,7 @@ async def trigger_workflow(
     rfq.product_line_acronym = acronym
     rfq.zone_manager_email = zone_manager_email
     rfq.phase = RfqPhase.RFQ
-    rfq.sub_status = RfqSubStatus.IN_VALIDATION
+    rfq.sub_status = RfqSubStatus.PENDING_FOR_VALIDATION
     rfq_data["zone_manager_email"] = zone_manager_email
     rfq_data.pop("validator_email", None)
     rfq_data["systematic_rfq_id"] = systematic_rfq_id
