@@ -51,6 +51,10 @@ def _set_phase_sub_status(rfq: Rfq, phase: RfqPhase, sub_status: RfqSubStatus) -
     rfq.sub_status = sub_status
 
 
+def _validation_action_timestamp(rfq: Rfq) -> datetime.datetime | None:
+    return rfq.approved_at or rfq.rejected_at
+
+
 def _assert_terminal_status_allowed(rfq: Rfq, target_phase: RfqPhase, target_sub_status: RfqSubStatus) -> None:
     if (
         target_phase == RfqPhase.CLOSED
@@ -153,21 +157,20 @@ def _send_validation_email(
     systematic_rfq_id: str,
     acronym: str,
     rfq_id: str,
+    validator_role: str = "Validator",
 ) -> None:
     frontend_url = settings.frontend_url
-    rfq_link = f"{frontend_url}/rfq/{rfq_id}"
+    rfq_link = f"{frontend_url}/rfqs/new?id={rfq_id}"
 
     msg = EmailMessage()
-    msg["Subject"] = f"Action Required: Zone Manager Review for RFQ {systematic_rfq_id}"
+    msg["Subject"] = f"Action Required: {validator_role} Review for RFQ {systematic_rfq_id}"
     msg["From"] = SMTP_FROM
     msg["To"] = zone_manager_email
 
     text_body = f"""Hello,
 
 A new RFQ ({systematic_rfq_id}) for the {acronym} product line has been submitted.
-
-You have been assigned as the Zone Manager for this RFQ.
-It requires your validation in order to proceed to the Costing phase.
+It requires your validation as the {validator_role} in order to proceed to the Costing phase.
 Please log into the AVO Carbon RFQ Portal to review the details:
 {rfq_link}
 
@@ -180,9 +183,9 @@ RFQ Automated System
     <html>
       <body style="font-family: Arial, sans-serif; color: #333333; line-height: 1.6; background-color: #f9f9f9; padding: 20px;">
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 30px; border-radius: 8px; border: 1px solid #e0e0e0;">
-          <h2 style="color: #1a365d; margin-top: 0;">Zone Manager Review Required</h2>
+          <h2 style="color: #1a365d; margin-top: 0;">{validator_role} Review Required</h2>
           <p>Hello,</p>
-          <p>A new RFQ <strong>({systematic_rfq_id})</strong> for the <strong>{acronym}</strong> product line has been submitted and requires your approval as the <strong>Zone Manager</strong> to proceed to the Costing phase.</p>
+          <p>A new RFQ <strong>({systematic_rfq_id})</strong> for the <strong>{acronym}</strong> product line has been submitted. It requires your validation as the <strong>{validator_role}</strong> in order to proceed to the Costing phase.</p>
 
           <div style="margin: 30px 0; text-align: center;">
             <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
@@ -211,6 +214,95 @@ RFQ Automated System
             server.send_message(msg)
     except Exception as exc:
         print(f"SMTP Error: {exc}")
+
+
+async def _submit_rfq_for_validation_internal(
+    *,
+    rfq: Rfq,
+    db: AsyncSession,
+    current_user: User,
+    send_email: bool = True,
+) -> dict[str, str | bool]:
+    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
+        raise HTTPException(status_code=403, detail="Not authorized to submit this RFQ.")
+
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
+        RfqSubStatus.POTENTIAL,
+        RfqSubStatus.NEW_RFQ,
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only RFQs in RFQ/POTENTIAL or RFQ/NEW_RFQ can be submitted for validation. "
+                f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
+            ),
+        )
+
+    extracted_data = dict(rfq.rfq_data or {})
+    acronym = (extracted_data.get("product_line_acronym") or "").strip()
+    revision = str(extracted_data.get("revision_level") or "00").strip() or "00"
+    zone_manager_email = (
+        extracted_data.get("zone_manager_email") or extracted_data.get("validator_email") or ""
+    ).strip()
+    validator_role = str(extracted_data.get("validator_role") or "Validator").strip() or "Validator"
+
+    if not acronym:
+        raise HTTPException(
+            status_code=400,
+            detail="Product line acronym is missing. Cannot submit this RFQ.",
+        )
+    if not zone_manager_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Validator email is missing. Cannot submit this RFQ.",
+        )
+
+    extracted_data["product_line_acronym"] = acronym
+    extracted_data["zone_manager_email"] = zone_manager_email
+    extracted_data["validator_role"] = validator_role
+    extracted_data.pop("validator_email", None)
+    if not extracted_data.get("systematic_rfq_id"):
+        extracted_data["systematic_rfq_id"] = await _generate_systematic_rfq_id(
+            db, acronym, revision
+        )
+    systematic_rfq_id = str(extracted_data["systematic_rfq_id"])
+    rfq.rfq_data = extracted_data
+    rfq.zone_manager_email = zone_manager_email
+    rfq.product_line_acronym = acronym
+    rfq.approved_at = None
+    rfq.rejected_at = None
+    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION)
+
+    await log_action(
+        db,
+        rfq.rfq_id,
+        (
+            "RFQ submitted for validation -> "
+            f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_FOR_VALIDATION.value}"
+        ),
+        current_user.email,
+    )
+    await db.commit()
+    await db.refresh(rfq)
+
+    if send_email:
+        _send_validation_email(
+            zone_manager_email,
+            systematic_rfq_id,
+            acronym,
+            rfq.rfq_id,
+            validator_role=validator_role,
+        )
+
+    return {
+        "message": "RFQ submitted for validation.",
+        "systematic_rfq_id": systematic_rfq_id,
+        "phase": rfq.phase.value,
+        "sub_status": rfq.sub_status.value,
+        "zone_manager_email": zone_manager_email,
+        "validator_role": validator_role,
+        "email_sent": send_email,
+    }
 
 
 @router.post("", response_model=RfqOut, status_code=201)
@@ -368,73 +460,12 @@ async def submit_rfq_for_validation(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to submit this RFQ.")
-
-    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
-        RfqSubStatus.POTENTIAL,
-        RfqSubStatus.NEW_RFQ,
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Only RFQs in RFQ/POTENTIAL or RFQ/NEW_RFQ can be submitted for validation. "
-                f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
-            ),
-        )
-
-    extracted_data = dict(rfq.rfq_data or {})
-    acronym = (extracted_data.get("product_line_acronym") or "").strip()
-    revision = str(extracted_data.get("revision_level") or "00").strip() or "00"
-    zone_manager_email = (
-        extracted_data.get("zone_manager_email") or extracted_data.get("validator_email") or ""
-    ).strip()
-
-    if not acronym:
-        raise HTTPException(
-            status_code=400,
-            detail="Product line acronym is missing. Cannot submit this RFQ.",
-        )
-    if not zone_manager_email:
-        raise HTTPException(
-            status_code=400,
-            detail="Zone Manager email is missing. Cannot submit this RFQ.",
-        )
-
-    extracted_data["product_line_acronym"] = acronym
-    extracted_data["zone_manager_email"] = zone_manager_email
-    extracted_data.pop("validator_email", None)
-    if not extracted_data.get("systematic_rfq_id"):
-        extracted_data["systematic_rfq_id"] = await _generate_systematic_rfq_id(
-            db, acronym, revision
-        )
-    systematic_rfq_id = extracted_data["systematic_rfq_id"]
-    rfq.rfq_data = extracted_data
-    rfq.zone_manager_email = zone_manager_email
-    rfq.product_line_acronym = acronym
-    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION)
-
-    await log_action(
-        db,
-        rfq_id,
-        (
-            "RFQ submitted for validation -> "
-            f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_FOR_VALIDATION.value}"
-        ),
-        current_user.email,
+    return await _submit_rfq_for_validation_internal(
+        rfq=rfq,
+        db=db,
+        current_user=current_user,
+        send_email=True,
     )
-    await db.commit()
-    await db.refresh(rfq)
-
-    _send_validation_email(zone_manager_email, systematic_rfq_id, acronym, rfq_id)
-
-    return {
-        "message": "RFQ submitted for validation.",
-        "systematic_rfq_id": systematic_rfq_id,
-        "phase": rfq.phase.value,
-        "sub_status": rfq.sub_status.value,
-    }
 
 
 @router.put("/{rfq_id}/status", response_model=RfqOut)
@@ -515,7 +546,13 @@ async def validate_rfq(
     if current_user.role != UserRole.OWNER and rfq.zone_manager_email != current_user.email:
         raise HTTPException(
             status_code=403,
-            detail="You are not assigned as the Zone Manager for this RFQ.",
+            detail="You are not assigned as the Validator for this RFQ.",
+        )
+
+    if _validation_action_timestamp(rfq):
+        raise HTTPException(
+            status_code=400,
+            detail="A validation action has already been recorded for this RFQ.",
         )
 
     if (rfq.phase, rfq.sub_status) != (
@@ -532,19 +569,24 @@ async def validate_rfq(
 
     if body.approved:
         _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.FEASIBILITY)
+        rfq.approved_at = datetime.datetime.now(datetime.timezone.utc)
+        rfq.rejected_at = None
+        rfq.rejection_reason = None
         await log_action(
             db,
             rfq_id,
-            f"Zone Manager approved -> {RfqPhase.COSTING.value}/{RfqSubStatus.FEASIBILITY.value}",
+            f"Validator approved -> {RfqPhase.COSTING.value}/{RfqSubStatus.FEASIBILITY.value}",
             current_user.email,
         )
     else:
         _set_phase_sub_status(rfq, RfqPhase.CLOSED, RfqSubStatus.CANCELED)
+        rfq.approved_at = None
+        rfq.rejected_at = datetime.datetime.now(datetime.timezone.utc)
         rfq.rejection_reason = body.rejection_reason
         await log_action(
             db,
             rfq_id,
-            f"Zone Manager rejected -> {RfqPhase.CLOSED.value}/{RfqSubStatus.CANCELED.value}: {body.rejection_reason}",
+            f"Validator rejected -> {RfqPhase.CLOSED.value}/{RfqSubStatus.CANCELED.value}: {body.rejection_reason}",
             current_user.email,
         )
 

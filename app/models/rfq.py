@@ -197,6 +197,14 @@ class Rfq(Base):
     # Set only when sub_status = LOST / CANCELED
     rejection_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     autopsy_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     # Files uploaded by the costing team
     costing_files: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

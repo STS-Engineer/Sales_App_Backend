@@ -19,6 +19,8 @@ class RfqOut(BaseModel):
     costing_files: list[dict[str, Any]] | None
     rejection_reason: str | None
     autopsy_notes: str | None
+    approved_at: datetime | None
+    rejected_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -60,7 +62,7 @@ class AutopsyRequest(BaseModel):
 
 
 class ValidateRfqRequest(BaseModel):
-    """Body for POST /api/rfq/{id}/validate — Zone Manager approve/reject."""
+    """Body for POST /api/rfq/{id}/validate - Validator approve/reject."""
     approved: bool
     rejection_reason: str | None = None
 

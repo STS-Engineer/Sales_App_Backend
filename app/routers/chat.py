@@ -13,7 +13,7 @@ from app.config import settings
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
-from app.routers.rfq import submit_rfq_for_validation
+from app.routers.rfq import _submit_rfq_for_validation_internal
 from app.models.user import User
 from app.models.validation_matrix import ValidationMatrix
 
@@ -39,6 +39,13 @@ LANGUAGE_SELECTION_RULE = (
     "conversation, including all step-by-step guidance and missing field "
     "announcements, strictly in their chosen language."
 )
+STATE_RECONCILIATION_DIRECTIVE = """
+CRITICAL DIRECTIVE - PROACTIVE DATA EXTRACTION:
+1. You are an automated data extraction engine. You MUST NOT wait for the user to ask you to save or update the form.
+2. STATE RECONCILIATION: On every single turn, you must compare the recent conversation history against the 'CURRENT RFQ DATABASE STATE'. 
+3. If the user has provided ANY valid information in the recent chat history that is currently missing or empty in the database state, your IMMEDIATE and ONLY next action MUST be to call the 'updateFormFields' tool to save that data.
+4. Do not acknowledge the user's answer in text without ALSO calling the tool in the same response.
+"""
 LANGUAGE_OPTIONS: dict[str, dict[str, object]] = {
     "en": {
         "menu_number": "1",
@@ -112,7 +119,6 @@ POTENTIAL_ALLOWED_FIELDS = {
     "customer_name",
     "application",
     "contact_email",
-    "contact_first_name",
     "contact_name",
     "contact_role",
     "contact_phone",
@@ -151,7 +157,7 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
 POTENTIAL_STEPS: list[tuple[int, list[str]]] = [
     (1, ["customer_name", "application"]),
     (2, ["contact_email"]),
-    (3, ["contact_first_name", "contact_name", "contact_role", "contact_phone"]),
+    (3, ["contact_name", "contact_role", "contact_phone"]),
 ]
 RFQ_STEPS: list[tuple[int, list[str]]] = [
     (
@@ -172,7 +178,6 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "rfq_reception_date",
             "quotation_expected_date",
             "contact_email",
-            "contact_first_name",
             "contact_name",
             "contact_role",
             "contact_phone",
@@ -222,6 +227,15 @@ def _normalize_rfq_data_fields(data: dict | None) -> dict:
     if "scope" not in normalized and legacy_scope is not None:
         normalized["scope"] = _normalize_scope_value(legacy_scope)
     return normalized
+
+
+def _coerce_numeric_value(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r"[^0-9.\-]", "", str(value or "").replace(",", ""))
+    if not cleaned:
+        raise ValueError("Numeric value is missing.")
+    return float(cleaned)
 
 
 def _normalize_language_token(value: str) -> str:
@@ -549,8 +563,9 @@ async def _execute_tool_calls(
     extracted_data: dict,
     chat_mode: str,
     tool_calls_used: list[str],
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     tool_messages: list[dict] = []
+    auto_redirect = False
 
     for tool_call in tool_calls:
         func_name = tool_call["name"]
@@ -597,7 +612,7 @@ async def _execute_tool_calls(
             acronym = args.get("product_line_acronym")
 
             try:
-                to_total_float = float(to_total_val)
+                to_total_float = _coerce_numeric_value(to_total_val)
                 query = select(ValidationMatrix).where(
                     ValidationMatrix.acronym == acronym
                 )
@@ -606,7 +621,7 @@ async def _execute_tool_calls(
 
                 if matrix:
                     if to_total_float <= matrix.n3_kam_limit:
-                        required_role = "KAM"
+                        required_role = "Commercial"
                     elif to_total_float <= matrix.n2_zone_limit:
                         required_role = "Zone Manager"
                     elif to_total_float <= matrix.n1_vp_limit:
@@ -617,7 +632,7 @@ async def _execute_tool_calls(
                     zone_manager_email = None
                     delivery_zone = extracted_data.get("delivery_zone", "").lower()
 
-                    if required_role == "KAM":
+                    if required_role == "Commercial":
                         zone_manager_email = rfq.created_by_email
                     elif required_role == "VP Sales":
                         zone_manager_email = "eric.suszylo@avocarbon.com"
@@ -639,9 +654,14 @@ async def _execute_tool_calls(
                         else:
                             zone_manager_email = "franck.lagadec@avocarbon.com"
 
+                    extracted_data["validator_role"] = required_role
+                    if zone_manager_email:
+                        extracted_data["zone_manager_email"] = zone_manager_email
+
                     tool_response_text = json.dumps(
                         {
                             "role_assigned": required_role,
+                            "validator_role": required_role,
                             "zone_manager_email": zone_manager_email,
                         }
                     )
@@ -658,14 +678,22 @@ async def _execute_tool_calls(
 
         elif func_name == "submitValidation":
             try:
-                submit_result = await submit_rfq_for_validation(
-                    rfq_id=rfq.rfq_id,
+                validator_email = (
+                    extracted_data.get("zone_manager_email")
+                    or rfq.zone_manager_email
+                    or ""
+                )
+                is_self_validator = str(validator_email).strip().casefold() == current_user.email.casefold()
+                submit_result = await _submit_rfq_for_validation_internal(
+                    rfq=rfq,
                     db=db,
                     current_user=current_user,
+                    send_email=not is_self_validator,
                 )
                 await db.refresh(rfq)
                 extracted_data.clear()
                 extracted_data.update(_normalize_rfq_data_fields(rfq.rfq_data))
+                auto_redirect = auto_redirect or is_self_validator
                 tool_response_text = json.dumps(
                     {
                         "success": True,
@@ -676,6 +704,9 @@ async def _execute_tool_calls(
                         "phase": rfq.phase.value,
                         "sub_status": rfq.sub_status.value,
                         "zone_manager_email": rfq.zone_manager_email,
+                        "validator_role": extracted_data.get("validator_role"),
+                        "email_sent": submit_result.get("email_sent", not is_self_validator),
+                        "auto_redirect": is_self_validator,
                     }
                 )
             except HTTPException as exc:
@@ -719,7 +750,7 @@ async def _execute_tool_calls(
             }
         )
 
-    return tool_messages
+    return tool_messages, auto_redirect
 
 class ChatRequest(BaseModel):
     rfq_id: str
@@ -729,8 +760,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     tool_calls_used: list[str] | None = None
+    auto_redirect: bool | None = None
 
-SYSTEM_PROMPT = LANGUAGE_SELECTION_RULE + """
+SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + LANGUAGE_SELECTION_RULE + """
 
 STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer, Product, Product Line, or Contact.
@@ -738,12 +770,14 @@ If the user provides a Customer name, you MUST call the checkGroupeExistence too
 DO NOT generate a text response confirming or denying the customer until you have physically received the tool_call_id response from the system. If you violate this rule, the system will fail.
 
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information (e.g., Application, chosen Product Name, Contact Info, Target Price, Quantities, Dates, etc.), you MUST immediately call the 'updateFormFields' tool to save that specific data point to the database. You can call 'updateFormFields' at the exact same time as you ask your next question. If you fail to call 'updateFormFields', the UI will break.
+USER-FACING TERMINOLOGY RULE: When speaking to the user, you MUST always say 'Validator' and NEVER say 'Zone Manager'. This terminology rule applies to every user-facing sentence, confirmation, and question.
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
 - customer_name
 - application
 - product_name
+- product_line_acronym
 - costing_data (Format ALL costing parameters as a single formatted string/list here)
 - customer_pn
 - revision_level
@@ -754,6 +788,10 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - annual_volume
 - rfq_reception_date
 - quotation_expected_date
+- contact_email
+- contact_name
+- contact_role
+- contact_phone
 - target_price_eur
 - expected_delivery_conditions
 - expected_payment_terms
@@ -780,6 +818,7 @@ TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolca
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
 - If the user gives a whole paragraph, extract every field you can for the current step in a single pass, save them immediately, then tell the user exactly which required fields are still missing for that step.
+- PARAGRAPH MODE IS MANDATORY EXTRACTION MODE: If the user pastes a large paragraph, you MUST parse the entire paragraph, map every possible field you can find, and call `updateFormFields` with one large JSON payload containing all discovered fields in a single execution before you ask any follow-up question.
 
 CRITICAL STATE RULE:
 If an RFQ is rejected during the RFQ or COSTING phases, the terminal outcome MUST be CANCELED, never LOST. LOST is only allowed after the RFQ has reached the OFFER, PO, or PROTOTYPE phases.
@@ -812,9 +851,9 @@ You must strictly follow this exact sequential checklist to collect data. Do not
 2. Ask 'What is the Application?'.
 3. CRITICAL RULE: Once the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"application": "<user_answer>"}}. You are FORBIDDEN from calling `retrieveProducts` until you have successfully saved the application.
 4. ONLY AFTER the application is saved, call `retrieveProducts` with an empty string ("") to fetch the catalog.
-5. Ask the user to select one of the products you retrieved. Once selected, call `retrieveProductlines` to lock it in.
+5. Ask the user to select one of the products you retrieved. Once selected, immediately save both `product_name` and the authorized `product_line_acronym` with `updateFormFields` to lock them in.
 6. Ask for the drawing upload. Once confirmed, call `uploadRfqFiles`.
-7. Ask concurrently for: P/N, Revision level, Delivery Zone, Plant, Country, SOP, Qty per year, and dates. Extract them using `updateFormFields`.
+7. Ask concurrently for: P/N, Revision level, Delivery Zone, Plant, Country, SOP, Quantity per year, and dates. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user (for example: "1,200,000 pcs"). Extract them using `updateFormFields`.
 
 STEP 1 VALIDATION RULE:
 Before moving to Step 2 (Commercial Expectations), you MUST verify that you have collected and saved ALL of the following required fields via updateFormFields:
@@ -824,7 +863,7 @@ Before moving to Step 2 (Commercial Expectations), you MUST verify that you have
 - rfq_files
 - customer_pn & revision_level
 - delivery_zone, delivery_plant, country, sop_year, annual_volume, rfq_reception_date, quotation_expected_date
-- contact_email, contact_first_name, contact_name, contact_role, contact_phone
+- contact_email, contact_name, contact_role, contact_phone
 
 NOTE: costing_data is OPTIONAL. If the product has no specific costing parameters, skip it.
 
@@ -833,8 +872,8 @@ If ANY of the required fields are missing, you MUST proactively list the missing
 
 ### Step 2: Contact Info
 1. Ask for Contact Email. Call `checkContactExistence`.
-2. IF FOUND: Ask the user to confirm the details. CRITICAL RULE: If the user says 'Yes' or confirms the details, you MUST immediately call `updateFormFields` to save the existing {"fields_to_update": {"contact_first_name": "...", "contact_name": "...", "contact_phone": "...", "contact_role": "..."}} into the current RFQ form. Do not assume the system auto-saves them.
-3. IF NOT FOUND: Ask the user for the missing details and extract them via `updateFormFields`.
+2. IF FOUND: Ask the user to confirm the details. CRITICAL RULE: If the system gives separate first-name and last-name style fields, you MUST combine them into one full name string and save it ONLY in `contact_name`. If the user confirms the details, you MUST immediately call `updateFormFields` to save {"fields_to_update": {"contact_name": "<full_name>", "contact_phone": "...", "contact_role": "..."}} into the current RFQ form. Do not assume the system auto-saves them.
+3. IF NOT FOUND: Ask the user for the Full Name, Role, and Phone Number, and save the full name directly in `contact_name`. NEVER ask separately for first name and last name.
 
 ### Step 3: Commercial Expectations
 Ask sequentially for:
@@ -862,21 +901,23 @@ Ask the user the following questions sequentially or all at once:
 CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormFields` to save them using the exact keys listed in the mapping (e.g., {"fields_to_update": {"responsibility_design": "...", "capacity_available": "...", "scope": "...", "customer_status": "...", "strategic_note": "...", "final_recommendation": "..."}}).
 
 ### Step 5: Final Calculation & Routing
-1. You MUST calculate the TO TOTAL (Keur) using this exact formula: (target_price_eur * annual_volume) / 1000.
-2. Call the `retrieveZoneManager` tool using the calculated TO TOTAL and the saved product_line_acronym.
-3. CRITICAL RULE: Once the tool returns the Zone Manager email, you MUST immediately call `updateFormFields` with {"fields_to_update": {"to_total": "<calculated_value>", "zone_manager_email": "<email_from_tool>"}}.
-4. Then you MUST ask the user exactly this question, translated into their chosen language: 'The Zone Manager assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
-5. If the user confirms (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
-6. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the email notification was sent to the assigned Zone Manager.
+1. `annual_volume` is stored as text. CRITICAL MATH RULE: When calculating the TO TOTAL, you must first strip all text, spaces, and commas from annual_volume to convert it to a pure number before applying the formula.
+2. You MUST calculate the TO TOTAL (Keur) using this exact formula: (target_price_eur * annual_volume) / 1000.
+3. Call the `retrieveZoneManager` tool using the calculated TO TOTAL and the saved product_line_acronym.
+4. CRITICAL RULE: Once the tool returns the Validator email, you MUST immediately call `updateFormFields` with {"fields_to_update": {"to_total": "<calculated_value>", "zone_manager_email": "<email_from_tool>"}}.
+5. Then you MUST ask the user exactly this question, translated into their chosen language: 'The Validator assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
+6. If the user confirms (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
+7. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the validation workflow has started.
 """
 
-POTENTIAL_SYSTEM_PROMPT = LANGUAGE_SELECTION_RULE + """
+POTENTIAL_SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + LANGUAGE_SELECTION_RULE + """
 
 STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer or Contact.
 If the user provides a Customer name, you MUST call the checkGroupeExistence tool and wait for the result before confirming anything.
 
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information, you MUST immediately call the 'updateFormFields' tool to save that data point.
+PARAGRAPH MODE IS MANDATORY EXTRACTION MODE: If the user pastes a large paragraph, you MUST parse the entire paragraph, map every possible field you can find, and call `updateFormFields` with one large JSON payload containing all discovered fields in a single execution before you ask any follow-up question.
 CRITICAL DATA RULE: Even if you are conversing with the user in French, Spanish, Chinese, Hindi, German, or any other language, the keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
 
 You are the Potential Opportunity Intake Assistant. This is NOT the full RFQ workflow.
@@ -886,7 +927,6 @@ You MUST ONLY collect and save these fields:
 - customer_name
 - application
 - contact_email
-- contact_first_name
 - contact_name
 - contact_role
 - contact_phone
@@ -929,8 +969,8 @@ You must ask ONE question at a time and follow this sequence:
 1. Ask for the customer name.
 2. Ask for the application.
 3. Ask for the contact email and call checkContactExistence.
-4. If the contact exists, ask the user to confirm the found details and immediately save them if they confirm.
-5. If the contact does not exist, ask for the missing first name, last name, role, and phone number, then save them.
+4. If the contact exists, ask the user to confirm the found details. If the system returns separate first-name and last-name style fields, combine them into one full name string and save it only in `contact_name`.
+5. If the contact does not exist, ask for the missing full name, role, and phone number, then save them.
 6. Once customer, application, and contact details are all saved, tell the user the potential intake is complete and they can switch to the New RFQ tab when they are ready for the full RFQ workflow.
 """
 
@@ -970,7 +1010,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "retrieveZoneManager",
-            "description": "Queries the validation matrix in the database to find the correct Zone Manager email based on the TO Total and Product Line.",
+            "description": "Queries the validation matrix in the database to find the correct Validator email based on the TO Total and Product Line.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -987,7 +1027,7 @@ TOOLS = [
             "name": "submitValidation",
             "description": (
                 "Submits the RFQ for validation, transitions it to PENDING_FOR_VALIDATION, "
-                "and sends the notification email to the assigned Zone Manager. Call "
+                "and sends the notification email to the assigned Validator when needed. Call "
                 "this only after the user explicitly confirms submission."
             ),
             "parameters": {
@@ -1128,8 +1168,9 @@ async def handle_chat(
 
         return ChatResponse(response=intro_message, tool_calls_used=None)
 
-    # Ensure history does not bloat past 10 messages but preserve tool_call pairings
-    start_idx = max(0, len(history) - 10)
+    # Keep a wider short-term history window so the assistant can reconcile
+    # recent user answers against the current RFQ state before responding.
+    start_idx = max(0, len(history) - 20)
     while start_idx > 0 and history[start_idx].get("role") == "tool":
         start_idx -= 1
     # Check if the previous message was the assistant creating these tools
@@ -1165,7 +1206,9 @@ CRITICAL INSTRUCTION:
 2. NEVER ask the user for information that is already populated in this JSON.
 3. Use the populated fields and the missing-fields engine to determine exactly which step of the checklist you are currently on.
 4. If the user gives a whole paragraph, extract every possible field for the current step before asking follow-up questions about missing items.
-5. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
+5. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.
+6. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
+7. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
 """
 
     # Prep messages for OpenAI
@@ -1177,6 +1220,7 @@ CRITICAL INSTRUCTION:
     # Initialize tool calls tracking for the UI badge
     tool_calls_used = []
     final_text = ""
+    auto_redirect = False
     
     # 1. Call OpenAI (1st pass)
     try:
@@ -1207,7 +1251,7 @@ CRITICAL INSTRUCTION:
             messages_for_llm.append(assistant_tool_message)
 
             async with httpx.AsyncClient() as http_client:
-                tool_messages = await _execute_tool_calls(
+                tool_messages, redirect_requested = await _execute_tool_calls(
                     tool_calls=normalized_tool_calls,
                     http_client=http_client,
                     db=db,
@@ -1217,6 +1261,7 @@ CRITICAL INSTRUCTION:
                     chat_mode=chat_mode,
                     tool_calls_used=tool_calls_used,
                 )
+                auto_redirect = auto_redirect or redirect_requested
                 for tool_message in tool_messages:
                     history.append(tool_message)
                     messages_for_llm.append(tool_message)
@@ -1245,7 +1290,7 @@ CRITICAL INSTRUCTION:
                 messages_for_llm.append(synthetic_assistant_message)
 
                 async with httpx.AsyncClient() as http_client:
-                    follow_up_tool_messages = await _execute_tool_calls(
+                    follow_up_tool_messages, redirect_requested = await _execute_tool_calls(
                         tool_calls=follow_up_tool_calls,
                         http_client=http_client,
                         db=db,
@@ -1255,6 +1300,7 @@ CRITICAL INSTRUCTION:
                         chat_mode=chat_mode,
                         tool_calls_used=tool_calls_used,
                     )
+                    auto_redirect = auto_redirect or redirect_requested
                     for tool_message in follow_up_tool_messages:
                         history.append(tool_message)
                         messages_for_llm.append(tool_message)
@@ -1312,5 +1358,6 @@ CRITICAL INSTRUCTION:
 
     return ChatResponse(
         response=final_text,
-        tool_calls_used=tool_calls_used if tool_calls_used else None
+        tool_calls_used=tool_calls_used if tool_calls_used else None,
+        auto_redirect=auto_redirect or None,
     )
