@@ -1,10 +1,13 @@
 import datetime
 import os
-import shutil
 import smtplib
+import uuid
 from email.message import EmailMessage
+from functools import lru_cache
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +37,85 @@ SMTP_SERVER = "avocarbon-com.mail.protection.outlook.com"
 SMTP_PORT = 25
 SMTP_FROM = "administration.STS@avocarbon.com"
 TERMINAL_SUBSTATUSES = {RfqSubStatus.LOST, RfqSubStatus.CANCELED}
+RFQ_FILES_CONTAINER = "rfq-files"
+
+
+@lru_cache(maxsize=1)
+def _get_blob_service_client() -> BlobServiceClient:
+    if not settings.azure_connection_string:
+        raise RuntimeError("AZURE_CONNECTION_STRING is not configured.")
+    return BlobServiceClient.from_connection_string(settings.azure_connection_string)
+
+
+def _get_rfq_files_container_client():
+    container_client = _get_blob_service_client().get_container_client(RFQ_FILES_CONTAINER)
+    try:
+        if not container_client.exists():
+            container_client.create_container()
+    except ResourceExistsError:
+        pass
+    return container_client
+
+
+@lru_cache(maxsize=1)
+def _get_azure_connection_parts() -> dict[str, str]:
+    parts: dict[str, str] = {}
+    for chunk in settings.azure_connection_string.split(";"):
+        if not chunk or "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        parts[key.strip()] = value
+    return parts
+
+
+def _build_blob_access_url(blob_name: str) -> str:
+    blob_client = _get_rfq_files_container_client().get_blob_client(blob_name)
+    connection_parts = _get_azure_connection_parts()
+    account_name = connection_parts.get("AccountName", "")
+    account_key = connection_parts.get("AccountKey", "")
+
+    if not account_name or not account_key:
+        return blob_client.url
+
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        account_key=account_key,
+        container_name=RFQ_FILES_CONTAINER,
+        blob_name=blob_name,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650),
+    )
+    return f"{blob_client.url}?{sas_token}" if sas_token else blob_client.url
+
+
+def _safe_upload_filename(filename: str | None) -> str:
+    return os.path.basename(filename or "attachment") or "attachment"
+
+
+def _extract_local_stored_name(file_meta: dict) -> str:
+    path = str(file_meta.get("path") or file_meta.get("download_url") or "")
+    if "/api/rfq/download/" not in path:
+        return ""
+    return path.rsplit("/", 1)[-1]
+
+
+def _delete_legacy_local_file(file_meta: dict) -> None:
+    stored_name = _extract_local_stored_name(file_meta)
+    if not stored_name:
+        return
+    file_path = os.path.join("uploads", stored_name)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+
+def _delete_azure_blob(file_meta: dict) -> None:
+    blob_name = str(file_meta.get("blob_name") or "").strip()
+    if not blob_name or not settings.azure_connection_string:
+        return
+    try:
+        _get_rfq_files_container_client().delete_blob(blob_name)
+    except ResourceNotFoundError:
+        pass
 
 
 def _ensure_valid_phase_sub_status(phase: RfqPhase, sub_status: RfqSubStatus) -> None:
@@ -382,19 +464,38 @@ async def upload_rfq_file(
     if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
         raise HTTPException(status_code=403, detail="Not authorized to upload files to this RFQ.")
 
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
+    safe_name = _safe_upload_filename(file.filename)
+    file_id = str(uuid.uuid4())
+    blob_name = f"{rfq_id}/{file_id}-{safe_name}"
 
-    safe_name = os.path.basename(file.filename or "attachment")
-    stored_name = f"{rfq_id}_{safe_name}"
-    file_path = os.path.join(upload_dir, stored_name)
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    try:
+        await file.seek(0)
+        container_client = _get_rfq_files_container_client()
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(
+            file.file,
+            overwrite=False,
+            content_settings=ContentSettings(
+                content_type=file.content_type or "application/octet-stream"
+            ),
+        )
+        blob_access_url = _build_blob_access_url(blob_name)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to upload file to Azure Blob Storage: {exc}",
+        ) from exc
 
     file_meta = {
+        "id": file_id,
+        "name": safe_name,
         "filename": safe_name,
-        "path": f"/api/rfq/download/{stored_name}",
+        "path": blob_access_url,
+        "url": blob_access_url,
+        "download_url": blob_access_url,
+        "blob_url": blob_client.url,
+        "blob_name": blob_name,
+        "content_type": file.content_type or "application/octet-stream",
         "uploaded_by": current_user.email,
         "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
@@ -410,9 +511,111 @@ async def upload_rfq_file(
 
     return {
         "message": "File uploaded successfully",
-        "file_path": file_meta["path"],
+        "file_path": file_meta["url"],
         "file": file_meta,
     }
+
+
+@router.delete("/{rfq_id}/files/{file_id}")
+async def delete_rfq_file(
+    rfq_id: str,
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
+        raise HTTPException(status_code=403, detail="Not authorized to delete files from this RFQ.")
+
+    extracted_data = dict(rfq.rfq_data or {})
+    existing_files = list(extracted_data.get("rfq_files") or [])
+
+    target_index = next(
+        (
+            index
+            for index, entry in enumerate(existing_files)
+            if str(entry.get("id") or entry.get("blob_name") or entry.get("filename") or "") == file_id
+        ),
+        -1,
+    )
+
+    if target_index < 0:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    removed_file = existing_files.pop(target_index)
+    _delete_azure_blob(removed_file)
+    _delete_legacy_local_file(removed_file)
+
+    extracted_data["rfq_files"] = existing_files
+    if existing_files:
+        latest_file = existing_files[-1]
+        extracted_data["rfq_file_path"] = (
+            latest_file.get("url")
+            or latest_file.get("download_url")
+            or latest_file.get("path")
+        )
+    else:
+        extracted_data.pop("rfq_file_path", None)
+
+    rfq.rfq_data = extracted_data
+    await db.commit()
+    await db.refresh(rfq)
+
+    return {"message": "File deleted successfully"}
+
+
+@router.delete("/{rfq_id}/files")
+async def delete_rfq_file_by_name(
+    rfq_id: str,
+    body: dict | None = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    filename = str((body or {}).get("filename") or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required.")
+
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
+        raise HTTPException(status_code=403, detail="Not authorized to delete files from this RFQ.")
+
+    extracted_data = dict(rfq.rfq_data or {})
+    existing_files = list(extracted_data.get("rfq_files") or [])
+
+    target_index = next(
+        (
+            index
+            for index, entry in enumerate(existing_files)
+            if str(entry.get("filename") or entry.get("name") or "").strip() == filename
+        ),
+        -1,
+    )
+
+    if target_index < 0:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    removed_file = existing_files.pop(target_index)
+    _delete_azure_blob(removed_file)
+    _delete_legacy_local_file(removed_file)
+
+    extracted_data["rfq_files"] = existing_files
+    if existing_files:
+        latest_file = existing_files[-1]
+        extracted_data["rfq_file_path"] = (
+            latest_file.get("url")
+            or latest_file.get("download_url")
+            or latest_file.get("path")
+        )
+    else:
+        extracted_data.pop("rfq_file_path", None)
+
+    rfq.rfq_data = extracted_data
+    await db.commit()
+    await db.refresh(rfq)
+
+    return {"message": "File deleted successfully"}
 
 
 @router.get("/download/{filename}")

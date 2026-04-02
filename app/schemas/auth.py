@@ -7,7 +7,7 @@ from app.models.user import UserRole
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
-    full_name: str | None = None
+    full_name: str
 
 
 class LoginRequest(BaseModel):

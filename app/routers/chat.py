@@ -46,6 +46,18 @@ CRITICAL DIRECTIVE - PROACTIVE DATA EXTRACTION:
 3. If the user has provided ANY valid information in the recent chat history that is currently missing or empty in the database state, your IMMEDIATE and ONLY next action MUST be to call the 'updateFormFields' tool to save that data.
 4. Do not acknowledge the user's answer in text without ALSO calling the tool in the same response.
 """
+ENGLISH_INITIAL_GREETING = (
+    "Hello, I'm your sales assistant. I'll be helping you fill your RFQ. "
+    "How would you like to proceed?\n"
+    "1. Guide me step by step\n"
+    "2. I will provide a whole paragraph"
+)
+ENGLISH_ONLY_RULE = (
+    "CRITICAL RULE: The conversation MUST be strictly in English. Whenever you give "
+    "the user a choice or ask a multiple-choice question, you MUST format it as a "
+    "numbered list (1, 2, 3...). You must be able to understand and proceed if the "
+    "user simply replies with the number of their choice."
+)
 LANGUAGE_OPTIONS: dict[str, dict[str, object]] = {
     "en": {
         "menu_number": "1",
@@ -553,6 +565,20 @@ def _build_tool_call_assistant_message(tool_calls: list[dict]) -> dict:
     }
 
 
+def _append_assistant_text_if_new(history: list[dict], content: str) -> None:
+    text = str(content or "").strip()
+    if not text:
+        return
+    if history:
+        last_message = history[-1]
+        if (
+            last_message.get("role") == "assistant"
+            and str(last_message.get("content") or "").strip() == text
+        ):
+            return
+    history.append({"role": "assistant", "content": text})
+
+
 async def _execute_tool_calls(
     *,
     tool_calls: list[dict],
@@ -678,11 +704,46 @@ async def _execute_tool_calls(
 
         elif func_name == "submitValidation":
             try:
-                validator_email = (
-                    extracted_data.get("zone_manager_email")
-                    or rfq.zone_manager_email
+                saved_data = _normalize_rfq_data_fields(rfq.rfq_data)
+                validator_email = str(saved_data.get("zone_manager_email") or rfq.zone_manager_email or "").strip()
+                to_total_value = str(saved_data.get("to_total") or "").strip()
+                product_line_acronym = str(
+                    saved_data.get("product_line_acronym")
+                    or rfq.product_line_acronym
                     or ""
-                )
+                ).strip()
+
+                missing_step4_fields = [
+                    field_name
+                    for field_name, field_value in (
+                        ("to_total", to_total_value),
+                        ("zone_manager_email", validator_email),
+                        ("product_line_acronym", product_line_acronym),
+                    )
+                    if not field_value
+                ]
+
+                if missing_step4_fields:
+                    tool_response_text = json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                "Step 4 data must be saved with updateFormFields before "
+                                "submitValidation can run."
+                            ),
+                            "missing_fields": missing_step4_fields,
+                        }
+                    )
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": func_name,
+                            "content": tool_response_text,
+                        }
+                    )
+                    continue
+
                 is_self_validator = str(validator_email).strip().casefold() == current_user.email.casefold()
                 submit_result = await _submit_rfq_for_validation_internal(
                     rfq=rfq,
@@ -730,6 +791,12 @@ async def _execute_tool_calls(
             filtered_fields = _filter_update_fields(chat_mode, fields)
             for key, value in filtered_fields.items():
                 extracted_data[key] = str(value)
+            rfq.rfq_data = dict(extracted_data)
+            if "zone_manager_email" in filtered_fields:
+                rfq.zone_manager_email = str(filtered_fields.get("zone_manager_email") or "").strip() or None
+            if "product_line_acronym" in filtered_fields:
+                rfq.product_line_acronym = str(filtered_fields.get("product_line_acronym") or "").strip() or None
+            await db.flush()
             tool_response_text = json.dumps(
                 {
                     "success": True,
@@ -762,7 +829,7 @@ class ChatResponse(BaseModel):
     tool_calls_used: list[str] | None = None
     auto_redirect: bool | None = None
 
-SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + LANGUAGE_SELECTION_RULE + """
+SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """
 
 STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer, Product, Product Line, or Contact.
@@ -809,7 +876,7 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - final_recommendation
 - to_total
 - zone_manager_email
-CRITICAL DATA RULE: Even if you are conversing with the user in French, Spanish, Chinese, Hindi, German, or any other language, the keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped above (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
+CRITICAL DATA RULE: The keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped above (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
 If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combine them into a single string and save it under the costing_data key. DO NOT invent new keys.
 
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
@@ -817,8 +884,13 @@ TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolca
 
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
-- If the user gives a whole paragraph, extract every field you can for the current step in a single pass, save them immediately, then tell the user exactly which required fields are still missing for that step.
-- PARAGRAPH MODE IS MANDATORY EXTRACTION MODE: If the user pastes a large paragraph, you MUST parse the entire paragraph, map every possible field you can find, and call `updateFormFields` with one large JSON payload containing all discovered fields in a single execution before you ask any follow-up question.
+- CRITICAL RULE FOR PARAGRAPH MODE: If the user selects Option 2 (or says they want to provide a paragraph), your immediate response MUST be extremely brief. You must ONLY say: 'Great! Please paste your entire RFQ paragraph below.' DO NOT list the required fields. DO NOT provide examples. Wait for the user to paste the text.
+- AFTER THE USER PASTES THE PARAGRAPH:
+  1. Parse the entire text and immediately call `updateFormFields` with every piece of data you can extract across ALL steps.
+  2. If you extract a `product_name`, you MUST immediately call `retrieveProducts` for that specific product so you can look up costing/product data proactively.
+  3. If `retrieveProducts` returns matching product data, silently apply the useful data. If it returns empty or no data for that product, leave those fields empty and ask the user only for the missing details.
+  4. After the tool executes, look at the dynamically injected `MISSING_FIELDS_PROMPT` for the current step.
+  5. Your text response to the user should ONLY list the specific fields that are still missing for the CURRENT step, formatted as a clean, numbered list.
 
 CRITICAL STATE RULE:
 If an RFQ is rejected during the RFQ or COSTING phases, the terminal outcome MUST be CANCELED, never LOST. LOST is only allowed after the RFQ has reached the OFFER, PO, or PROTOTYPE phases.
@@ -856,26 +928,18 @@ You must strictly follow this exact sequential checklist to collect data. Do not
 7. Ask concurrently for: P/N, Revision level, Delivery Zone, Plant, Country, SOP, Quantity per year, and dates. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user (for example: "1,200,000 pcs"). Extract them using `updateFormFields`.
 
 STEP 1 VALIDATION RULE:
-Before moving to Step 2 (Commercial Expectations), you MUST verify that you have collected and saved ALL of the following required fields via updateFormFields:
-- customer_name
-- application (CRITICAL: You must extract and save the exact text the user types for their application).
-- product_name and product_line_acronym
-- rfq_files
-- customer_pn & revision_level
-- delivery_zone, delivery_plant, country, sop_year, annual_volume, rfq_reception_date, quotation_expected_date
-- contact_email, contact_name, contact_role, contact_phone
-
+Before moving to Step 2 (Commercial Expectations), you MUST verify Step 1 completeness using the CURRENT RFQ DATABASE STATE and the dynamically injected MISSING_FIELDS_PROMPT.
+CRITICAL RULE: DO NOT dump the full Step 1 checklist to the user upfront.
+If anything is missing, you MUST ask ONLY for the specific missing fields for the CURRENT step, formatted as a clean numbered list.
 NOTE: costing_data is OPTIONAL. If the product has no specific costing parameters, skip it.
 
-If ANY of the required fields are missing, you MUST proactively list the missing fields to the user and ask them to provide the answers before you allow the conversation to move to Step 2.
 
-
-### Step 2: Contact Info
+### Step 1.2: Contact Info
 1. Ask for Contact Email. Call `checkContactExistence`.
 2. IF FOUND: Ask the user to confirm the details. CRITICAL RULE: If the system gives separate first-name and last-name style fields, you MUST combine them into one full name string and save it ONLY in `contact_name`. If the user confirms the details, you MUST immediately call `updateFormFields` to save {"fields_to_update": {"contact_name": "<full_name>", "contact_phone": "...", "contact_role": "..."}} into the current RFQ form. Do not assume the system auto-saves them.
 3. IF NOT FOUND: Ask the user for the Full Name, Role, and Phone Number, and save the full name directly in `contact_name`. NEVER ask separately for first name and last name.
 
-### Step 3: Commercial Expectations
+### Step 2: Commercial Expectations
 Ask sequentially for:
 - Target Price
 - Delivery Conditions
@@ -885,7 +949,7 @@ Ask sequentially for:
 - Entry Barriers
 CRITICAL RULE: The moment the user provides these commercial expectations, you MUST immediately call `updateFormFields` using the exact JSON keys listed above. DO NOT move to the Strategic Alignment questions until you have successfully called the tool to save these fields.
 
-### Step 4: Strategic Alignment
+### Step 3: Strategic Alignment
 Ask the user the following questions sequentially or all at once:
 - Who is responsible for design?
 - Who is responsible for validation?
@@ -900,17 +964,18 @@ Ask the user the following questions sequentially or all at once:
 - L'assistant DOIT ensuite synth??tiser la position commerciale et faire une recommandation.
 CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormFields` to save them using the exact keys listed in the mapping (e.g., {"fields_to_update": {"responsibility_design": "...", "capacity_available": "...", "scope": "...", "customer_status": "...", "strategic_note": "...", "final_recommendation": "..."}}).
 
-### Step 5: Final Calculation & Routing
+### Step 4: Final Calculation & Routing
 1. `annual_volume` is stored as text. CRITICAL MATH RULE: When calculating the TO TOTAL, you must first strip all text, spaces, and commas from annual_volume to convert it to a pure number before applying the formula.
 2. You MUST calculate the TO TOTAL (Keur) using this exact formula: (target_price_eur * annual_volume) / 1000.
 3. Call the `retrieveZoneManager` tool using the calculated TO TOTAL and the saved product_line_acronym.
 4. CRITICAL RULE: Once the tool returns the Validator email, you MUST immediately call `updateFormFields` with {"fields_to_update": {"to_total": "<calculated_value>", "zone_manager_email": "<email_from_tool>"}}.
-5. Then you MUST ask the user exactly this question, translated into their chosen language: 'The Validator assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
-6. If the user confirms (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
-7. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the validation workflow has started.
+5. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
+6. Then you MUST ask the user exactly this question in English: 'The Validator assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
+7. If the user confirms (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
+8. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the validation workflow has started.
 """
 
-POTENTIAL_SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + LANGUAGE_SELECTION_RULE + """
+POTENTIAL_SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """
 
 STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer or Contact.
@@ -918,7 +983,7 @@ If the user provides a Customer name, you MUST call the checkGroupeExistence too
 
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information, you MUST immediately call the 'updateFormFields' tool to save that data point.
 PARAGRAPH MODE IS MANDATORY EXTRACTION MODE: If the user pastes a large paragraph, you MUST parse the entire paragraph, map every possible field you can find, and call `updateFormFields` with one large JSON payload containing all discovered fields in a single execution before you ask any follow-up question.
-CRITICAL DATA RULE: Even if you are conversing with the user in French, Spanish, Chinese, Hindi, German, or any other language, the keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
+CRITICAL DATA RULE: The keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
 
 You are the Potential Opportunity Intake Assistant. This is NOT the full RFQ workflow.
 Your job is only to collect the lightweight opportunity details needed for the Potential tab.
@@ -963,7 +1028,11 @@ TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolca
 
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
-- If the user gives a whole paragraph, extract every allowed Potential field you can in a single pass, save them immediately, then tell the user exactly which required fields are still missing for that step.
+- CRITICAL RULE FOR PARAGRAPH MODE: If the user selects Option 2 (or says they want to provide a paragraph), your immediate response MUST be extremely brief. You must ONLY say: 'Great! Please paste your entire RFQ paragraph below.' DO NOT list the required fields. DO NOT provide examples. Wait for the user to paste the text.
+- AFTER THE USER PASTES THE PARAGRAPH:
+  1. Parse the entire text and immediately call `updateFormFields` with every piece of data you can extract across ALL allowed Potential fields.
+  2. After the tool executes, look at the dynamically injected `MISSING_FIELDS_PROMPT` for the current step.
+  3. Your text response to the user should ONLY list the specific fields that are still missing for the CURRENT step, formatted as a clean, numbered list.
 
 You must ask ONE question at a time and follow this sequence:
 1. Ask for the customer name.
@@ -1135,38 +1204,10 @@ async def handle_chat(
     history = sanitized_history
 
     if not history:
-        history.append({"role": "assistant", "content": INITIAL_GREETING})
+        history.append({"role": "assistant", "content": ENGLISH_INITIAL_GREETING})
 
     # We append the user's message to the DB array
     history.append({"role": "user", "content": req.message})
-
-    detected_language = None
-    if not extracted_data.get("preferred_language"):
-        detected_language = _detect_language_choice(req.message)
-        if detected_language:
-            extracted_data["preferred_language"] = detected_language["code"]
-            extracted_data["preferred_language_label"] = detected_language["name"]
-
-    if (
-        detected_language
-        and len(history) == 2
-        and history[0].get("role") == "assistant"
-        and history[0].get("content") == INITIAL_GREETING
-    ):
-        intro_message = str(detected_language["assistant_intro"])
-        history.append({"role": "assistant", "content": intro_message})
-
-        if chat_mode == "potential":
-            extracted_data["potential_chat_history"] = history
-            rfq.rfq_data = extracted_data
-        else:
-            rfq.chat_history = history
-            rfq.rfq_data = extracted_data
-
-        await db.commit()
-        await db.refresh(rfq)
-
-        return ChatResponse(response=intro_message, tool_calls_used=None)
 
     # Keep a wider short-term history window so the assistant can reconcile
     # recent user answers against the current RFQ state before responding.
@@ -1185,16 +1226,12 @@ async def handle_chat(
     current_rfq_state["phase"] = rfq.phase.value
     current_rfq_state["sub_status"] = rfq.sub_status.value
     base_system_prompt = POTENTIAL_SYSTEM_PROMPT if chat_mode == "potential" else SYSTEM_PROMPT
-    language_context = _build_language_context(extracted_data.get("preferred_language"))
     missing_fields_prompt = _build_missing_fields_prompt(chat_mode, current_rfq_state)
 
     # Create a dynamic system message containing the database state
     DYNAMIC_SYSTEM_PROMPT = f"""{base_system_prompt}
 
-=== LANGUAGE LOCK ===
-{language_context}
-
-=== MISSING FIELDS ENGINE ===
+=== MISSING_FIELDS_PROMPT ===
 {missing_fields_prompt}
 
 === CURRENT RFQ DATABASE STATE ===
@@ -1205,10 +1242,14 @@ CRITICAL INSTRUCTION:
 1. Look at the CURRENT RFQ DATABASE STATE above. 
 2. NEVER ask the user for information that is already populated in this JSON.
 3. Use the populated fields and the missing-fields engine to determine exactly which step of the checklist you are currently on.
-4. If the user gives a whole paragraph, extract every possible field for the current step before asking follow-up questions about missing items.
-5. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.
-6. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
-7. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
+4. If the user selects Option 2 or says they want to provide a paragraph, your immediate response MUST ONLY be: 'Great! Please paste your entire RFQ paragraph below.'
+5. After the user pastes the paragraph, extract every possible field across ALL relevant steps and call `updateFormFields` immediately.
+6. If you extract a product_name from the paragraph, you MUST immediately call `retrieveProducts` for that specific product before asking for manual costing details.
+7. Then use the MISSING_FIELDS_PROMPT to identify only the missing fields for the CURRENT step.
+8. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.
+9. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
+10. Your follow-up text after paragraph extraction should ONLY list the specific missing fields for the CURRENT step as a clean numbered list.
+11. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
 """
 
     # Prep messages for OpenAI
@@ -1235,7 +1276,9 @@ CRITICAL INSTRUCTION:
         assistant_tool_message = None
 
         if normalized_tool_calls:
-            assistant_tool_message = ai_message.model_dump(exclude_unset=True)
+            assistant_tool_message = _build_tool_call_assistant_message(
+                normalized_tool_calls
+            )
         else:
             normalized_tool_calls = _extract_tool_calls_from_text(
                 ai_message.content or ""
@@ -1322,7 +1365,7 @@ CRITICAL INSTRUCTION:
                     "- I've processed the latest information.\n"
                     "- Please continue with the next missing fields."
                 )
-            history.append({"role": "assistant", "content": final_text})
+            _append_assistant_text_if_new(history, final_text)
 
         else:
             final_text = (ai_message.content or "").strip()
@@ -1332,7 +1375,7 @@ CRITICAL INSTRUCTION:
                     "- I've processed the latest information.\n"
                     "- Please continue with the next missing fields."
                 )
-            history.append({"role": "assistant", "content": final_text})
+            _append_assistant_text_if_new(history, final_text)
 
     except Exception as e:
         error_detail = str(e).strip() or e.__class__.__name__
@@ -1343,7 +1386,7 @@ CRITICAL INSTRUCTION:
             f"- Details: `{error_detail}`\n"
             "- Please try again."
         )
-        history.append({"role": "assistant", "content": final_text})
+        _append_assistant_text_if_new(history, final_text)
 
     # Update state and commit
     if chat_mode == "potential":

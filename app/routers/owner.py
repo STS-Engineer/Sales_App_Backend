@@ -1,3 +1,4 @@
+import logging
 import smtplib
 from email.message import EmailMessage
 
@@ -13,6 +14,7 @@ from app.schemas.auth import ApproveUserRequest, UserOut
 from app.schemas.user import RoleUpdateRequest, UserOut as UserOutFull
 
 router = APIRouter(prefix="/api/owner", tags=["owner"])
+logger = logging.getLogger(__name__)
 
 # ── Outlook SMTP relay settings ──────────────────────────────────────
 SMTP_SERVER = "avocarbon-com.mail.protection.outlook.com"
@@ -69,10 +71,12 @@ AVO Carbon RFQ System
     msg.add_alternative(html_body, subtype="html")
 
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.send_message(msg)
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
+            server.ehlo()
+            server.sendmail(SMTP_FROM, [user_email], msg.as_string())
+        logger.info("Approval email sent to %s with role %s", user_email, assigned_role)
     except Exception as e:
-        print(f"SMTP Error (approval notification): {e}")
+        logger.exception("SMTP Error (approval notification) for %s: %s", user_email, e)
 
 
 def _format_role_label(role: UserRole) -> str:

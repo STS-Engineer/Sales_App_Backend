@@ -116,9 +116,13 @@ async def _create_pending_user(body: RegisterRequest, db: AsyncSession) -> dict[
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already registered.")
 
+    normalized_full_name = body.full_name.strip()
+    if not normalized_full_name:
+        raise HTTPException(status_code=400, detail="Full name is required.")
+
     user = User(
         email=body.email,
-        full_name=body.full_name,
+        full_name=normalized_full_name,
         role=UserRole.COMMERCIAL,
         is_approved=False,
     )
@@ -129,7 +133,7 @@ async def _create_pending_user(body: RegisterRequest, db: AsyncSession) -> dict[
 
     owner_emails = await _get_owner_emails(db)
     for owner_email in owner_emails:
-        _send_new_signup_email(owner_email, body.email, body.full_name)
+        _send_new_signup_email(owner_email, body.email, normalized_full_name)
 
     return {
         "message": "Signup successful. Your account is pending approval by the system Owner."

@@ -26,12 +26,22 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     OPENAI_API_KEY: str | None = None
     FRONTEND_URL: str = "http://localhost:5173"
+    AZURE_CONNECTION_STRING: str | None = None
+    AZURE_RFQ_FILES_CONTAINER: str = "rfq-files"
 
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE))
 
     @property
     def frontend_url(self) -> str:
         return self.FRONTEND_URL.rstrip("/")
+
+    @property
+    def azure_connection_string(self) -> str:
+        return (self.AZURE_CONNECTION_STRING or "").strip("\"' ")
+
+    @property
+    def azure_rfq_files_container(self) -> str:
+        return (self.AZURE_RFQ_FILES_CONTAINER or "rfq-files").strip().lower()
 
     @property
     def async_db_url(self) -> URL:

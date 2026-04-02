@@ -12,6 +12,6 @@ httpx>=0.27.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 openai
+azure-storage-blob>=12.24.0
 dnspython==2.8.0
 email-validator==2.3.0
-
