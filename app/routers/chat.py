@@ -165,7 +165,14 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "final_recommendation",
     "to_total",
     "zone_manager_email",
+    "validator_role",
 }
+AI_GENERATED_STEP_FIELDS = [
+    "to_total",
+    "zone_manager_email",
+    "validator_email",
+    "validator_role",
+]
 POTENTIAL_STEPS: list[tuple[int, list[str]]] = [
     (1, ["customer_name", "application"]),
     (2, ["contact_email"]),
@@ -217,7 +224,7 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "scope",
         ],
     ),
-    (4, ["to_total", "zone_manager_email"]),
+    (4, ["to_total", "zone_manager_email", "validator_role"]),
 ]
 
 
@@ -350,13 +357,16 @@ def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[in
 
 def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
     current_step, missing_fields = _get_current_step_and_missing_fields(chat_mode, data)
+    user_keys_missing = [key for key in missing_fields if key not in AI_GENERATED_STEP_FIELDS]
+    ai_keys_missing = [key for key in missing_fields if key in AI_GENERATED_STEP_FIELDS]
     prompt = (
-        f"The user is currently on Step {current_step}. "
-        f"The following required fields are empty: {missing_fields}. Ask the user for these."
+        f"STATE RECONCILIATION FOR STEP {current_step}:\n"
+        f"- Missing fields you must ASK THE USER for: {user_keys_missing}\n"
+        f"- Missing fields YOU MUST GENERATE/CALCULATE yourself: {ai_keys_missing}"
     )
     if not missing_fields:
         prompt += (
-            " All required fields for this step are already present, so move to the next "
+            "\nAll required fields for this step are already present, so move to the next "
             "workflow action instead of re-asking completed fields."
         )
     return prompt
@@ -876,6 +886,7 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - final_recommendation
 - to_total
 - zone_manager_email
+- validator_role
 CRITICAL DATA RULE: The keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped above (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
 If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combine them into a single string and save it under the costing_data key. DO NOT invent new keys.
 
@@ -965,12 +976,13 @@ Ask the user the following questions sequentially or all at once:
 CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormFields` to save them using the exact keys listed in the mapping (e.g., {"fields_to_update": {"responsibility_design": "...", "capacity_available": "...", "scope": "...", "customer_status": "...", "strategic_note": "...", "final_recommendation": "..."}}).
 
 ### Step 4: Final Calculation & Routing
-1. `annual_volume` is stored as text. CRITICAL MATH RULE: When calculating the TO TOTAL, you must first strip all text, spaces, and commas from annual_volume to convert it to a pure number before applying the formula.
-2. You MUST calculate the TO TOTAL (Keur) using this exact formula: (target_price_eur * annual_volume) / 1000.
-3. Call the `retrieveZoneManager` tool using the calculated TO TOTAL and the saved product_line_acronym.
-4. CRITICAL RULE: Once the tool returns the Validator email, you MUST immediately call `updateFormFields` with {"fields_to_update": {"to_total": "<calculated_value>", "zone_manager_email": "<email_from_tool>"}}.
-5. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-6. Then you MUST ask the user exactly this question in English: 'The Validator assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
+CRITICAL STEP 4 RULES:
+1. Look at the missing fields list. If `to_total` or `zone_manager_email` are missing, DO NOT ask the user for them.
+2. You MUST autonomously calculate the TO Total using the formula: (target_price_eur * pure_number_of_annual_volume) / 1000. CRITICAL MATH RULE: `annual_volume` is stored as text, so you must first strip all text, spaces, and commas from `annual_volume` to convert it to a pure number.
+3. Once calculated, you MUST autonomously use the `retrieveZoneManager` tool to query the validation matrix and retrieve the Validator Email and Validator Role.
+4. You MUST call `updateFormFields` to save these AI-generated values to the database, including `to_total`, `zone_manager_email`, and `validator_role`.
+5. ONLY AFTER the missing fields state shows that `to_total` and `zone_manager_email` are no longer missing, you will ask the user exactly this question in English: 'The Validator assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
+6. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
 7. If the user confirms (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
 8. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the validation workflow has started.
 """
@@ -1248,8 +1260,9 @@ CRITICAL INSTRUCTION:
 7. Then use the MISSING_FIELDS_PROMPT to identify only the missing fields for the CURRENT step.
 8. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.
 9. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
-10. Your follow-up text after paragraph extraction should ONLY list the specific missing fields for the CURRENT step as a clean numbered list.
-11. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
+10. If the MISSING_FIELDS_PROMPT says `to_total`, `zone_manager_email`, `validator_email`, or `validator_role` are missing, you MUST generate or retrieve them yourself. You MUST NOT ask the user to manually provide them.
+11. Your follow-up text after paragraph extraction should ONLY list the specific missing fields for the CURRENT step as a clean numbered list.
+12. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
 """
 
     # Prep messages for OpenAI
