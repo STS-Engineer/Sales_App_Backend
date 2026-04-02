@@ -698,6 +698,7 @@ async def _execute_tool_calls(
                         {
                             "role_assigned": required_role,
                             "validator_role": required_role,
+                            "validator_email": zone_manager_email,
                             "zone_manager_email": zone_manager_email,
                         }
                     )

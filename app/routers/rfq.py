@@ -742,11 +742,20 @@ async def validate_rfq(
     rfq_id: str,
     body: ValidateRfqRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.ZONE_MANAGER, UserRole.OWNER)),
+    current_user: User = Depends(
+        require_role(UserRole.COMMERCIAL, UserRole.ZONE_MANAGER, UserRole.OWNER)
+    ),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
 
-    if current_user.role != UserRole.OWNER and rfq.zone_manager_email != current_user.email:
+    assigned_validator_email = str(rfq.zone_manager_email or "").strip()
+    current_user_email = str(current_user.email or "").strip()
+    is_assigned_validator = (
+        bool(assigned_validator_email)
+        and assigned_validator_email.casefold() == current_user_email.casefold()
+    )
+
+    if current_user.role != UserRole.OWNER and not is_assigned_validator:
         raise HTTPException(
             status_code=403,
             detail="You are not assigned as the Validator for this RFQ.",
