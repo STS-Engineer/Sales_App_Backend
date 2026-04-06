@@ -109,14 +109,11 @@ async def trigger_workflow(
     if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
         raise HTTPException(status_code=403, detail="Not authorized to trigger this workflow.")
 
-    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
-        RfqSubStatus.POTENTIAL,
-        RfqSubStatus.NEW_RFQ,
-    }:
+    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "RFQ must be in RFQ/POTENTIAL or RFQ/NEW_RFQ to trigger validation. "
+                "RFQ must be in RFQ/NEW_RFQ to trigger validation. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )

@@ -13,7 +13,10 @@ from app.config import settings
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
-from app.routers.rfq import _submit_rfq_for_validation_internal
+from app.routers.rfq import (
+    _maybe_assign_systematic_rfq_id,
+    _submit_rfq_for_validation_internal,
+)
 from app.models.user import User
 from app.models.validation_matrix import ValidationMatrix
 
@@ -56,7 +59,10 @@ ENGLISH_ONLY_RULE = (
     "CRITICAL RULE: The conversation MUST be strictly in English. Whenever you give "
     "the user a choice or ask a multiple-choice question, you MUST format it as a "
     "numbered list (1, 2, 3...). You must be able to understand and proceed if the "
-    "user simply replies with the number of their choice."
+    "user simply replies with the number of their choice. CRITICAL LANGUAGE RULE: "
+    "You are strictly forbidden from using any language other than English in your "
+    "text responses. Do not use Russian, French, or any other foreign words "
+    "(for example: never use 'уточнить'; use 'clarify' or 'specify')."
 )
 LANGUAGE_OPTIONS: dict[str, dict[str, object]] = {
     "en": {
@@ -144,6 +150,8 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "delivery_zone",
     "delivery_plant",
     "country",
+    "po_date",
+    "ppap_date",
     "sop_year",
     "annual_volume",
     "rfq_reception_date",
@@ -167,6 +175,47 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "zone_manager_email",
     "validator_role",
 }
+UPDATE_FORM_FIELD_ALIASES = {
+    "customerName": "customer_name",
+    "productName": "product_name",
+    "productLineAcronym": "product_line_acronym",
+    "customerPn": "customer_pn",
+    "revisionLevel": "revision_level",
+    "deliveryZone": "delivery_zone",
+    "deliveryPlant": "delivery_plant",
+    "contactEmail": "contact_email",
+    "contactName": "contact_name",
+    "contactRole": "contact_role",
+    "contactPhone": "contact_phone",
+    "targetPriceEur": "target_price_eur",
+    "expectedDeliveryConditions": "expected_delivery_conditions",
+    "expectedPaymentTerms": "expected_payment_terms",
+    "businessTrigger": "business_trigger",
+    "customerToolingConditions": "customer_tooling_conditions",
+    "entryBarriers": "entry_barriers",
+    "responsibilityDesign": "responsibility_design",
+    "responsibilityValidation": "responsibility_validation",
+    "productOwnership": "product_ownership",
+    "paysForDevelopment": "pays_for_development",
+    "capacityAvailable": "capacity_available",
+    "customerStatus": "customer_status",
+    "strategicNote": "strategic_note",
+    "finalRecommendation": "final_recommendation",
+    "toTotal": "to_total",
+    "zoneManagerEmail": "zone_manager_email",
+    "validatorRole": "validator_role",
+    "poDate": "po_date",
+    "ppapDate": "ppap_date",
+    "rfqReceptionDate": "rfq_reception_date",
+    "quotationExpectedDate": "quotation_expected_date",
+    "annualVolume": "annual_volume",
+    "sopYear": "sop_year",
+}
+UPDATE_FORM_FIELD_PROPERTIES = {
+    field_name: {"type": "string"}
+    for field_name in sorted(RFQ_ALLOWED_FIELDS)
+}
+UPDATE_FORM_FIELD_PROPERTIES["to_total"] = {"type": "number"}
 AI_GENERATED_STEP_FIELDS = [
     "to_total",
     "zone_manager_email",
@@ -192,6 +241,8 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "delivery_zone",
             "delivery_plant",
             "country",
+            "po_date",
+            "ppap_date",
             "sop_year",
             "annual_volume",
             "rfq_reception_date",
@@ -461,7 +512,11 @@ def _normalize_tool_arguments(func_name: str, args: dict | None) -> dict:
         legacy_scope = fields.pop("is_feasible", None) if isinstance(fields, dict) else None
         if isinstance(fields, dict) and legacy_scope is not None and "scope" not in fields:
             fields["scope"] = _normalize_scope_value(legacy_scope)
-        normalized = {"fields_to_update": fields if isinstance(fields, dict) else {}}
+        normalized_fields = {}
+        if isinstance(fields, dict):
+            for key, value in fields.items():
+                normalized_fields[UPDATE_FORM_FIELD_ALIASES.get(key, key)] = value
+        normalized = {"fields_to_update": normalized_fields}
     elif func_name == "uploadRfqFiles" and "file_confirmed" not in normalized:
         normalized["file_confirmed"] = bool(
             normalized.get("confirmed", normalized.get("fileConfirmed", True))
@@ -510,6 +565,10 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
 
     if isinstance(parsed_payload, dict) and "tool_calls" in parsed_payload:
         raw_calls = parsed_payload.get("tool_calls") or []
+    elif isinstance(parsed_payload, dict) and "tooluses" in parsed_payload:
+        raw_calls = parsed_payload.get("tooluses") or []
+    elif isinstance(parsed_payload, dict) and "tool_uses" in parsed_payload:
+        raw_calls = parsed_payload.get("tool_uses") or []
     elif isinstance(parsed_payload, dict):
         raw_calls = [parsed_payload]
     elif isinstance(parsed_payload, list):
@@ -523,6 +582,9 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
             continue
 
         func_name = item.get("toolname") or item.get("tool_name") or item.get("name")
+        recipient_name = item.get("recipientname") or item.get("recipient_name")
+        if not func_name and isinstance(recipient_name, str):
+            func_name = recipient_name.split(".")[-1]
         if not func_name and isinstance(item.get("function"), dict):
             func_name = item["function"].get("name")
 
@@ -557,6 +619,69 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
     return normalized_calls
 
 
+def _payload_contains_internal_tool_markers(payload) -> bool:
+    marker_keys = {
+        "tooluses",
+        "tool_uses",
+        "tool_calls",
+        "recipientname",
+        "recipient_name",
+        "toolcallid",
+        "tool_call_id",
+        "toolname",
+        "tool_name",
+    }
+    if isinstance(payload, dict):
+        lowered_keys = {str(key).casefold() for key in payload.keys()}
+        if marker_keys & lowered_keys:
+            return True
+        return any(_payload_contains_internal_tool_markers(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_payload_contains_internal_tool_markers(item) for item in payload)
+    return False
+
+
+def _is_internal_tool_payload_text(content: str) -> bool:
+    text = _strip_fenced_payload(content)
+    if not text:
+        return False
+
+    lowered = text.lstrip().casefold()
+    if lowered.startswith('{"tooluses":') or lowered.startswith('{"tool_uses":'):
+        return True
+
+    parsed_payload = _try_load_json_payload(text)
+    if parsed_payload is None:
+        return False
+    return _payload_contains_internal_tool_markers(parsed_payload)
+
+
+def _dedupe_adjacent_blocks(text: str) -> str:
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    if not blocks:
+        return ""
+
+    deduped_blocks: list[str] = []
+    previous_normalized = ""
+    for block in blocks:
+        normalized = re.sub(r"\s+", " ", block).strip().casefold()
+        if normalized and normalized == previous_normalized:
+            continue
+        deduped_blocks.append(block)
+        previous_normalized = normalized
+
+    return "\n\n".join(deduped_blocks).strip()
+
+
+def _sanitize_assistant_text(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return ""
+    if _is_internal_tool_payload_text(text):
+        return ""
+    return _dedupe_adjacent_blocks(text)
+
+
 def _build_tool_call_assistant_message(tool_calls: list[dict]) -> dict:
     return {
         "role": "assistant",
@@ -575,18 +700,19 @@ def _build_tool_call_assistant_message(tool_calls: list[dict]) -> dict:
     }
 
 
-def _append_assistant_text_if_new(history: list[dict], content: str) -> None:
-    text = str(content or "").strip()
+def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
+    text = _sanitize_assistant_text(content)
     if not text:
-        return
+        return ""
     if history:
         last_message = history[-1]
         if (
             last_message.get("role") == "assistant"
             and str(last_message.get("content") or "").strip() == text
         ):
-            return
+            return text
     history.append({"role": "assistant", "content": text})
+    return text
 
 
 async def _execute_tool_calls(
@@ -802,11 +928,17 @@ async def _execute_tool_calls(
             filtered_fields = _filter_update_fields(chat_mode, fields)
             for key, value in filtered_fields.items():
                 extracted_data[key] = str(value)
-            rfq.rfq_data = dict(extracted_data)
             if "zone_manager_email" in filtered_fields:
                 rfq.zone_manager_email = str(filtered_fields.get("zone_manager_email") or "").strip() or None
             if "product_line_acronym" in filtered_fields:
                 rfq.product_line_acronym = str(filtered_fields.get("product_line_acronym") or "").strip() or None
+            rfq.rfq_data = await _maybe_assign_systematic_rfq_id(
+                db,
+                rfq,
+                dict(extracted_data),
+            )
+            extracted_data.clear()
+            extracted_data.update(_normalize_rfq_data_fields(rfq.rfq_data))
             await db.flush()
             tool_response_text = json.dumps(
                 {
@@ -862,6 +994,8 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - delivery_zone
 - delivery_plant
 - country
+- po_date
+- ppap_date
 - sop_year
 - annual_volume
 - rfq_reception_date
@@ -892,7 +1026,9 @@ CRITICAL DATA RULE: The keys you send to the 'updateFormFields' tool MUST remain
 If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combine them into a single string and save it under the costing_data key. DO NOT invent new keys.
 
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
+FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
+CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
 
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
@@ -937,7 +1073,7 @@ You must strictly follow this exact sequential checklist to collect data. Do not
 4. ONLY AFTER the application is saved, call `retrieveProducts` with an empty string ("") to fetch the catalog.
 5. Ask the user to select one of the products you retrieved. Once selected, immediately save both `product_name` and the authorized `product_line_acronym` with `updateFormFields` to lock them in.
 6. Ask for the drawing upload. Once confirmed, call `uploadRfqFiles`.
-7. Ask concurrently for: P/N, Revision level, Delivery Zone, Plant, Country, SOP, Quantity per year, and dates. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user (for example: "1,200,000 pcs"). Extract them using `updateFormFields`.
+7. Ask for P/N, Revision level, Delivery Zone, Plant, and Country. Then explicitly ask 'What is the PO date?' and 'What is the PPAP date?' before you ask for the SOP year. After that, ask for Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user (for example: "1,200,000 pcs"). Extract them using `updateFormFields`.
 
 STEP 1 VALIDATION RULE:
 Before moving to Step 2 (Commercial Expectations), you MUST verify Step 1 completeness using the CURRENT RFQ DATABASE STATE and the dynamically injected MISSING_FIELDS_PROMPT.
@@ -1037,7 +1173,9 @@ You MUST NOT ask about or save any of these fields in Potential mode:
 - zone_manager_email
 
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks. NEVER output a single massive paragraph.
+FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
+CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
 
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
@@ -1153,6 +1291,7 @@ TOOLS = [
                     "fields_to_update": {
                         "type": "object",
                         "description": "Key-value pairs of fields to update.",
+                        "properties": UPDATE_FORM_FIELD_PROPERTIES,
                     }
                 },
                 "required": ["fields_to_update"],
@@ -1174,6 +1313,17 @@ async def handle_chat(
     
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
+
+    if str(req.chat_mode or "").strip().lower() == "potential" or (
+        rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.POTENTIAL
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Potential drafts must use the dedicated Potential chatbot until they are "
+                "promoted to a formal RFQ."
+            ),
+        )
 
     chat_mode = _normalize_chat_mode(rfq, req.chat_mode)
     extracted_data = _normalize_rfq_data_fields(rfq.rfq_data)
@@ -1198,6 +1348,12 @@ async def handle_chat(
             msg.get("role") == "assistant"
             and isinstance(msg.get("content"), str)
             and _is_crash_message(msg.get("content"))
+        ):
+            continue
+        if (
+            msg.get("role") == "assistant"
+            and isinstance(msg.get("content"), str)
+            and _is_internal_tool_payload_text(msg.get("content"))
         ):
             continue
             
@@ -1263,7 +1419,9 @@ CRITICAL INSTRUCTION:
 9. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
 10. If the MISSING_FIELDS_PROMPT says `to_total`, `zone_manager_email`, `validator_email`, or `validator_role` are missing, you MUST generate or retrieve them yourself. You MUST NOT ask the user to manually provide them.
 11. Your follow-up text after paragraph extraction should ONLY list the specific missing fields for the CURRENT step as a clean numbered list.
-12. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
+12. Combine missing-fields guidance into ONE single concise message. Do not repeat the same section header or send two separate text blocks for the same turn.
+13. NEVER type raw JSON, `tooluses`, or function-call payloads in your visible response. Use native tool calling only.
+14. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
 """
 
     # Prep messages for OpenAI
@@ -1283,6 +1441,7 @@ CRITICAL INSTRUCTION:
             model="gpt-5.2",
             messages=messages_for_llm,
             tools=TOOLS,
+            tool_choice="auto",
             temperature=0.2,
         )
         ai_message = completion.choices[0].message
@@ -1329,6 +1488,7 @@ CRITICAL INSTRUCTION:
                 model="gpt-5.2",
                 messages=messages_for_llm,
                 tools=TOOLS,
+                tool_choice="auto",
                 temperature=0.2,
             )
             follow_up_message = follow_up_completion.choices[0].message
@@ -1373,23 +1533,25 @@ CRITICAL INSTRUCTION:
             else:
                 final_text = (follow_up_message.content or "").strip()
 
+            final_text = _sanitize_assistant_text(final_text)
             if not final_text:
                 final_text = (
                     "**Update saved.**\n\n"
                     "- I've processed the latest information.\n"
                     "- Please continue with the next missing fields."
                 )
-            _append_assistant_text_if_new(history, final_text)
+            final_text = _append_assistant_text_if_new(history, final_text)
 
         else:
             final_text = (ai_message.content or "").strip()
+            final_text = _sanitize_assistant_text(final_text)
             if not final_text:
                 final_text = (
                     "**Update saved.**\n\n"
                     "- I've processed the latest information.\n"
                     "- Please continue with the next missing fields."
                 )
-            _append_assistant_text_if_new(history, final_text)
+            final_text = _append_assistant_text_if_new(history, final_text)
 
     except Exception as e:
         error_detail = str(e).strip() or e.__class__.__name__
@@ -1400,7 +1562,7 @@ CRITICAL INSTRUCTION:
             f"- Details: `{error_detail}`\n"
             "- Please try again."
         )
-        _append_assistant_text_if_new(history, final_text)
+        final_text = _append_assistant_text_if_new(history, final_text)
 
     # Update state and commit
     if chat_mode == "potential":

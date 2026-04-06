@@ -11,11 +11,13 @@ from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database import get_db
 from app.middleware.auth import get_current_user, require_role
 from app.models.audit_log import AuditLog
+from app.models.potential import Potential
 from app.models.rfq import ALLOWED_TRANSITIONS, Rfq, RfqPhase, RfqSubStatus, VALID_PHASE_SUBSTATUS
 from app.models.user import User, UserRole
 from app.schemas.rfq import (
@@ -28,8 +30,13 @@ from app.schemas.rfq import (
     RfqDataUpdateRequest,
     RfqOut,
     ValidateRfqRequest,
+    rfq_data_payload_to_dict,
 )
 from app.services.audit import log_action
+from app.services.potential import (
+    get_missing_potential_shared_fields,
+    sync_potential_to_rfq_data,
+)
 
 router = APIRouter(prefix="/api/rfq", tags=["rfq"])
 
@@ -165,8 +172,12 @@ def _assert_can_view_rfq(current_user: User, rfq: Rfq) -> None:
         raise HTTPException(status_code=403, detail="Not authorized to access this RFQ.")
 
 
+def _rfq_query():
+    return select(Rfq).options(selectinload(Rfq.potential))
+
+
 async def _get_rfq_or_404(db: AsyncSession, rfq_id: str) -> Rfq:
-    result = await db.execute(select(Rfq).where(Rfq.rfq_id == rfq_id))
+    result = await db.execute(_rfq_query().where(Rfq.rfq_id == rfq_id))
     rfq = result.scalar_one_or_none()
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found.")
@@ -210,6 +221,8 @@ async def _maybe_assign_systematic_rfq_id(
     rfq_data: dict,
 ) -> dict:
     next_data = dict(rfq_data)
+    if rfq.sub_status == RfqSubStatus.POTENTIAL:
+        return next_data
     if next_data.get("systematic_rfq_id"):
         return next_data
 
@@ -308,14 +321,11 @@ async def _submit_rfq_for_validation_internal(
     if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
         raise HTTPException(status_code=403, detail="Not authorized to submit this RFQ.")
 
-    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
-        RfqSubStatus.POTENTIAL,
-        RfqSubStatus.NEW_RFQ,
-    }:
+    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Only RFQs in RFQ/POTENTIAL or RFQ/NEW_RFQ can be submitted for validation. "
+                "Only RFQs in RFQ/NEW_RFQ can be submitted for validation. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
@@ -400,7 +410,7 @@ async def create_rfq(
     initial_sub_status = (
         RfqSubStatus.POTENTIAL if chat_mode == "potential" else RfqSubStatus.NEW_RFQ
     )
-    rfq_data = dict(request_body.rfq_data or {})
+    rfq_data = rfq_data_payload_to_dict(request_body.rfq_data)
     zone_manager_email = (
         rfq_data.get("zone_manager_email") or rfq_data.get("validator_email") or None
     )
@@ -416,10 +426,11 @@ async def create_rfq(
     )
     rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, rfq_data)
     db.add(rfq)
+    if initial_sub_status == RfqSubStatus.POTENTIAL:
+        rfq.potential = Potential(chat_history=[])
 
     await db.commit()
-    await db.refresh(rfq)
-    return rfq
+    return await _get_rfq_or_404(db, rfq.rfq_id)
 
 
 @router.put("/{rfq_id}/data", response_model=RfqOut)
@@ -434,22 +445,62 @@ async def update_rfq_data(
     if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
         raise HTTPException(status_code=403, detail="Not authorized to update this RFQ.")
 
+    incoming_data = rfq_data_payload_to_dict(body.rfq_data)
     next_data = dict(rfq.rfq_data or {})
-    next_data.update(body.rfq_data)
+    next_data.update(incoming_data)
     rfq.rfq_data = next_data
 
-    if "product_line_acronym" in body.rfq_data:
-        rfq.product_line_acronym = body.rfq_data.get("product_line_acronym")
-    if "zone_manager_email" in body.rfq_data or "validator_email" in body.rfq_data:
+    if "product_line_acronym" in incoming_data:
+        rfq.product_line_acronym = incoming_data.get("product_line_acronym")
+    if "zone_manager_email" in incoming_data or "validator_email" in incoming_data:
         rfq.zone_manager_email = (
-            body.rfq_data.get("zone_manager_email") or body.rfq_data.get("validator_email")
+            incoming_data.get("zone_manager_email")
+            or incoming_data.get("validator_email")
         )
 
     rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, next_data)
 
     await db.commit()
-    await db.refresh(rfq)
-    return rfq
+    return await _get_rfq_or_404(db, rfq_id)
+
+
+@router.post("/{rfq_id}/proceed-to-rfq", response_model=RfqOut)
+async def proceed_to_rfq(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
+        raise HTTPException(status_code=403, detail="Not authorized to proceed with this RFQ.")
+
+    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.POTENTIAL):
+        raise HTTPException(
+            status_code=409,
+            detail="This opportunity is no longer in the Potential phase.",
+        )
+
+    potential = rfq.potential
+    if potential is None:
+        raise HTTPException(status_code=400, detail="Potential data is missing for this RFQ.")
+
+    missing_fields = get_missing_potential_shared_fields(potential)
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Complete the Potential shared fields before proceeding.",
+                "missing_fields": missing_fields,
+            },
+        )
+
+    rfq.rfq_data = sync_potential_to_rfq_data(potential, rfq.rfq_data)
+    rfq.sub_status = RfqSubStatus.NEW_RFQ
+
+    await log_action(db, rfq_id, "Potential promoted to formal RFQ", current_user.email)
+    await db.commit()
+    return await _get_rfq_or_404(db, rfq_id)
 
 
 @router.post("/{rfq_id}/upload")
@@ -631,7 +682,12 @@ async def list_rfqs(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = select(Rfq).order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
+    query = _rfq_query().where(
+        ~(
+            (Rfq.phase == RfqPhase.RFQ)
+            & (Rfq.sub_status == RfqSubStatus.POTENTIAL)
+        )
+    ).order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
 
     if current_user.role != UserRole.OWNER:
         query = query.where(
@@ -692,8 +748,7 @@ async def update_rfq_status(
         current_user.email,
     )
     await db.commit()
-    await db.refresh(rfq)
-    return rfq
+    return await _get_rfq_or_404(db, rfq_id)
 
 
 @router.post("/{rfq_id}/autopsy", response_model=RfqOut)
@@ -719,8 +774,7 @@ async def submit_autopsy(
     rfq.autopsy_notes = body.autopsy_notes
     await log_action(db, rfq_id, "Autopsy submitted", current_user.email)
     await db.commit()
-    await db.refresh(rfq)
-    return rfq
+    return await _get_rfq_or_404(db, rfq_id)
 
 
 @router.get("/{rfq_id}/audit-logs", response_model=list[AuditLogOut])
@@ -803,8 +857,7 @@ async def validate_rfq(
         )
 
     await db.commit()
-    await db.refresh(rfq)
-    return rfq
+    return await _get_rfq_or_404(db, rfq_id)
 
 
 @router.post("/{rfq_id}/costing_review", response_model=RfqOut)
@@ -844,8 +897,7 @@ async def costing_review(
         )
 
     await db.commit()
-    await db.refresh(rfq)
-    return rfq
+    return await _get_rfq_or_404(db, rfq_id)
 
 
 @router.post("/{rfq_id}/advance", response_model=RfqOut)
@@ -910,5 +962,4 @@ async def advance_status(
         current_user.email,
     )
     await db.commit()
-    await db.refresh(rfq)
-    return rfq
+    return await _get_rfq_or_404(db, rfq_id)

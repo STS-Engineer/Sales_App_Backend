@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from app.models.rfq import RfqPhase, RfqSubStatus
+from app.schemas.potential import PotentialOut
 
 
 class RfqOut(BaseModel):
@@ -17,6 +18,7 @@ class RfqOut(BaseModel):
     rfq_data: dict[str, Any] | None
     chat_history: list[dict[str, Any]] | None
     costing_files: list[dict[str, Any]] | None
+    potential: PotentialOut | None = None
     rejection_reason: str | None
     autopsy_notes: str | None
     approved_at: datetime | None
@@ -37,16 +39,33 @@ class AuditLogOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RfqDataPayload(BaseModel):
+    po_date: str | None = None
+    ppap_date: str | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+def rfq_data_payload_to_dict(
+    payload: "RfqDataPayload | dict[str, Any] | None",
+) -> dict[str, Any]:
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return dict(payload)
+    return payload.model_dump(exclude_unset=True)
+
+
 class RfqCreateRequest(BaseModel):
     """Optional body when creating a new RFQ.
     chat_mode controls the initial sub_status: 'potential' → POTENTIAL, 'rfq' → NEW_RFQ.
     """
     chat_mode: str = "rfq"
-    rfq_data: dict[str, Any] | None = None
+    rfq_data: RfqDataPayload | None = None
 
 
 class RfqDataUpdateRequest(BaseModel):
-    rfq_data: dict[str, Any]
+    rfq_data: RfqDataPayload
 
 
 class PhaseStatusUpdateRequest(BaseModel):
