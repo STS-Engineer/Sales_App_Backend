@@ -682,12 +682,7 @@ async def list_rfqs(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = _rfq_query().where(
-        ~(
-            (Rfq.phase == RfqPhase.RFQ)
-            & (Rfq.sub_status == RfqSubStatus.POTENTIAL)
-        )
-    ).order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
+    query = _rfq_query().order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
 
     if current_user.role != UserRole.OWNER:
         query = query.where(
