@@ -8,7 +8,7 @@ from functools import lru_cache
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -33,6 +33,10 @@ from app.schemas.rfq import (
     rfq_data_payload_to_dict,
 )
 from app.services.audit import log_action
+from app.services.costing_template import (
+    build_costing_template_filename,
+    render_costing_template_pdf,
+)
 from app.services.potential import (
     get_missing_potential_shared_fields,
     sync_potential_to_rfq_data,
@@ -707,6 +711,34 @@ async def get_rfq(
     return rfq
 
 
+@router.get("/{rfq_id}/costing-template")
+async def download_costing_template(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_view_rfq(current_user, rfq)
+
+    if rfq.phase == RfqPhase.RFQ and rfq.approved_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The costing template is only available after the RFQ has been approved "
+                "to the costing phase."
+            ),
+        )
+
+    filename = build_costing_template_filename(rfq)
+    document_pdf = render_costing_template_pdf(rfq)
+
+    return Response(
+        content=document_pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.post("/{rfq_id}/submit")
 async def submit_rfq_for_validation(
     rfq_id: str,
@@ -874,11 +906,10 @@ async def costing_review(
         )
 
     if body.scope:
-        _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.PRICING)
         await log_action(
             db,
             rfq_id,
-            f"Costing review approved -> {RfqPhase.COSTING.value}/{RfqSubStatus.PRICING.value}",
+            "Costing review approved",
             current_user.email,
         )
     else:
