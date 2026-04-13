@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import base64
 import re
@@ -138,11 +138,14 @@ def build_costing_template_filename(rfq: Rfq) -> str:
 
 
 def render_costing_template_pdf(rfq: Rfq) -> bytes:
+    document_html = render_costing_template_html(rfq)
     try:
-        return _render_reportlab_pdf(rfq)
-    except ImportError:
-        document_html = render_costing_template_html(rfq)
         return _render_html_to_pdf(document_html)
+    except RuntimeError as exc:
+        try:
+            return _render_reportlab_pdf(rfq)
+        except ImportError:
+            raise exc
 
 
 def render_costing_template_html(rfq: Rfq) -> str:
