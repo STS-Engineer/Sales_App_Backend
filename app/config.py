@@ -1,4 +1,4 @@
-"""
+﻿"""
 Application settings.
 
 DATABASE_URL in .env can be any of:
@@ -15,8 +15,12 @@ from urllib.parse import urlparse, unquote
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
-# Resolve .env relative to this file (backend/app/config.py → backend/.env)
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_DEFAULT_FRONTEND_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://sales-management.azurewebsites.net",
+)
 
 
 class Settings(BaseSettings):
@@ -26,6 +30,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     OPENAI_API_KEY: str | None = None
     FRONTEND_URL: str = "http://localhost:5173"
+    FRONTEND_URLS: str | None = None
     AZURE_CONNECTION_STRING: str | None = None
     AZURE_RFQ_FILES_CONTAINER: str = "rfq-files"
 
@@ -34,6 +39,22 @@ class Settings(BaseSettings):
     @property
     def frontend_url(self) -> str:
         return self.FRONTEND_URL.rstrip("/")
+
+    @property
+    def frontend_urls(self) -> list[str]:
+        candidates: list[str] = [*_DEFAULT_FRONTEND_ORIGINS, self.FRONTEND_URL]
+        if self.FRONTEND_URLS:
+            candidates.extend(part.strip() for part in self.FRONTEND_URLS.split(","))
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for origin in candidates:
+            value = (origin or "").strip().rstrip("/")
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
 
     @property
     def azure_connection_string(self) -> str:
@@ -45,14 +66,7 @@ class Settings(BaseSettings):
 
     @property
     def async_db_url(self) -> URL:
-        """
-        Parse the raw DATABASE_URL and return a SQLAlchemy URL object with
-        the asyncpg driver.  URL.create() accepts decoded strings, so
-        percent-encoded passwords (e.g. St%24%400987 → St$@0987) work fine.
-        """
-        raw = self.DATABASE_URL
-        # Strip surrounding quotes that Windows/pydantic_settings may leave
-        raw = raw.strip("\"'")
+        raw = self.DATABASE_URL.strip("\"'")
         parsed = urlparse(raw)
         return URL.create(
             drivername="postgresql+asyncpg",

@@ -22,13 +22,14 @@ SPA_RESERVED_PREFIXES = ("api", "docs", "redoc", "openapi.json")
 
 
 def _build_allowed_origins() -> list[str]:
-    origins = {settings.frontend_url}
-    parsed = urlsplit(settings.frontend_url)
+    origins = set(settings.frontend_urls)
 
-    if parsed.scheme and parsed.hostname in {"localhost", "127.0.0.1"}:
-        sibling_host = "127.0.0.1" if parsed.hostname == "localhost" else "localhost"
-        sibling_netloc = sibling_host if not parsed.port else f"{sibling_host}:{parsed.port}"
-        origins.add(urlunsplit((parsed.scheme, sibling_netloc, "", "", "")))
+    for origin in list(origins):
+        parsed = urlsplit(origin)
+        if parsed.scheme and parsed.hostname in {"localhost", "127.0.0.1"}:
+            sibling_host = "127.0.0.1" if parsed.hostname == "localhost" else "localhost"
+            sibling_netloc = sibling_host if not parsed.port else f"{sibling_host}:{parsed.port}"
+            origins.add(urlunsplit((parsed.scheme, sibling_netloc, "", "", "")))
 
     return sorted(origins)
 

@@ -1083,7 +1083,7 @@ You must strictly follow this exact sequential checklist to collect data. Do not
 4. ONLY AFTER the application is saved or already present, call `retrieveProducts` with an empty string ("") to fetch the catalog IF `product_name` is still missing.
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save both `product_name` and the authorized `product_line_acronym` with `updateFormFields` to lock them in.
 6. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-7. Ask only for the remaining missing Step 1 fields among P/N, Revision level, Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user (for example: "1,200,000 pcs"). Extract them using `updateFormFields`.
+7. Ask only for the remaining missing Step 1 fields among P/N, Revision level, Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user. Extract them using `updateFormFields`.
 
 STEP 1 VALIDATION RULE:
 Before moving to Step 2 (Commercial Expectations), you MUST verify Step 1 completeness using the CURRENT RFQ DATABASE STATE and the dynamically injected MISSING_FIELDS_PROMPT.

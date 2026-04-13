@@ -730,7 +730,13 @@ async def download_costing_template(
         )
 
     filename = build_costing_template_filename(rfq)
-    document_pdf = render_costing_template_pdf(rfq)
+    try:
+        document_pdf = render_costing_template_pdf(rfq)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to generate the costing template PDF. {exc}",
+        ) from exc
 
     return Response(
         content=document_pdf,

@@ -15,3 +15,4 @@ openai
 azure-storage-blob>=12.24.0
 dnspython==2.8.0
 email-validator==2.3.0
+reportlab>=4.2.0
