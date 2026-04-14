@@ -1,13 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import asyncio
 import base64
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import threading
 from datetime import datetime, timezone
 from functools import lru_cache
 from html import escape
@@ -122,6 +120,13 @@ SECTION_ACCENTS: tuple[tuple[str, str, str, str], ...] = (
     ("#585858", "#f4f5f7", "#e2e4e8", "#444444"),
 )
 
+_WKHTMLTOPDF_CANDIDATE_PATHS = (
+    Path("/usr/bin/wkhtmltopdf"),
+    Path("/usr/local/bin/wkhtmltopdf"),
+    Path(r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe"),
+    Path(r"C:\Program Files (x86)\wkhtmltopdf\bin\wkhtmltopdf.exe"),
+)
+
 _BROWSER_CANDIDATE_PATHS = (
     Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
     Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
@@ -135,7 +140,6 @@ LOGO_CANDIDATE_PATHS = (
     BACKEND_ROOT / "app" / "assets" / "logo.png",
     DEPLOY_ROOT / "Sales_App_Frontend" / "src" / "assets" / "logo.png",
 )
-PLAYWRIGHT_BROWSERS_PATH = BACKEND_ROOT / ".playwright-browsers"
 
 
 def build_costing_template_filename(rfq: Rfq) -> str:
@@ -147,7 +151,11 @@ def build_costing_template_filename(rfq: Rfq) -> str:
 
 def render_costing_template_pdf(rfq: Rfq) -> bytes:
     document_html = render_costing_template_html(rfq)
-    return _render_html_to_pdf(document_html)
+    try:
+        return _render_html_to_pdf(document_html)
+    except RuntimeError:
+        # Last-resort fallback: ReportLab (no external binary needed)
+        return _render_reportlab_pdf(rfq)
 
 
 def render_costing_template_html(rfq: Rfq) -> str:
@@ -519,6 +527,143 @@ def render_costing_template_html(rfq: Rfq) -> str:
 """
 
 
+# ── PDF rendering ────────────────────────────────────────────────────────────
+
+
+def _render_html_to_pdf(document_html: str) -> bytes:
+    """
+    Tries renderers in order of preference:
+      1. wkhtmltopdf  (best fidelity, no Python deps beyond the binary)
+      2. Chrome/Edge headless  (fallback for Windows local dev)
+    Raises RuntimeError if none is available.
+    """
+    wkhtmltopdf_path = _find_wkhtmltopdf_executable()
+    if wkhtmltopdf_path is not None:
+        return _render_html_to_pdf_with_wkhtmltopdf(document_html, wkhtmltopdf_path)
+
+    browser_path = _find_browser_executable()
+    if browser_path is not None:
+        return _render_html_to_pdf_with_browser(document_html, browser_path)
+
+    raise RuntimeError(
+        "No PDF renderer found. "
+        "Install wkhtmltopdf (apt-get install wkhtmltopdf) "
+        "or add Chrome / Edge to the system PATH."
+    )
+
+
+def _render_html_to_pdf_with_wkhtmltopdf(document_html: str, wkhtmltopdf_path: Path) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="costing-template-") as temp_dir:
+        temp_path = Path(temp_dir)
+        html_path = temp_path / "costing-template.html"
+        pdf_path = temp_path / "costing-template.pdf"
+        html_path.write_text(document_html, encoding="utf-8")
+
+        command = [
+            str(wkhtmltopdf_path),
+            "--page-size", "A4",
+            "--margin-top", "28pt",
+            "--margin-right", "28pt",
+            "--margin-bottom", "28pt",
+            "--margin-left", "28pt",
+            "--no-outline",
+            "--print-media-type",
+            "--enable-local-file-access",
+            "--disable-smart-shrinking",
+            "--no-header-line",
+            "--no-footer-line",
+            "--quiet",
+            str(html_path),
+            str(pdf_path),
+        ]
+
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or exc.stdout or "").strip()
+            raise RuntimeError(
+                f"wkhtmltopdf PDF generation failed: {stderr or 'unknown error'}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("wkhtmltopdf PDF generation timed out.") from exc
+
+        if not pdf_path.exists():
+            raise RuntimeError("wkhtmltopdf did not produce an output file.")
+
+        return pdf_path.read_bytes()
+
+
+def _render_html_to_pdf_with_browser(document_html: str, browser_path: Path) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="costing-template-") as temp_dir:
+        temp_path = Path(temp_dir)
+        html_path = temp_path / "costing-template.html"
+        pdf_path = temp_path / "costing-template.pdf"
+        html_path.write_text(document_html, encoding="utf-8")
+
+        command = [
+            str(browser_path),
+            "--headless",
+            "--disable-gpu",
+            f"--print-to-pdf={pdf_path}",
+            "--print-to-pdf-no-header",
+            "--no-pdf-header-footer",
+            html_path.resolve().as_uri(),
+        ]
+
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or exc.stdout or "").strip()
+            raise RuntimeError(
+                f"Browser PDF generation failed: {stderr or 'browser render error'}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Browser PDF generation timed out.") from exc
+
+        if not pdf_path.exists():
+            raise RuntimeError("Browser PDF generation did not produce an output file.")
+
+        return pdf_path.read_bytes()
+
+
+@lru_cache(maxsize=1)
+def _find_wkhtmltopdf_executable() -> Path | None:
+    for candidate in _WKHTMLTOPDF_CANDIDATE_PATHS:
+        if candidate.exists():
+            return candidate
+    resolved = shutil.which("wkhtmltopdf")
+    if resolved:
+        return Path(resolved)
+    return None
+
+
+@lru_cache(maxsize=1)
+def _find_browser_executable() -> Path | None:
+    for candidate in _BROWSER_CANDIDATE_PATHS:
+        if candidate.exists():
+            return candidate
+    for executable in ("msedge", "msedge.exe", "chrome", "chrome.exe"):
+        resolved = shutil.which(executable)
+        if resolved:
+            return Path(resolved)
+    return None
+
+
+# ── ReportLab fallback ───────────────────────────────────────────────────────
+
+
 def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     from io import BytesIO
 
@@ -613,146 +758,23 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     )
 
     styles = getSampleStyleSheet()
-    eyebrow_style = ParagraphStyle(
-        "EyebrowStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=7.5,
-        leading=9,
-        textColor=text_soft,
-        spaceAfter=6,
-    )
-    hero_title_style = ParagraphStyle(
-        "HeroTitleStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=20,
-        leading=22,
-        textColor=colors.white,
-        spaceAfter=8,
-    )
-    hero_body_style = ParagraphStyle(
-        "HeroBodyStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9.4,
-        leading=14,
-        textColor=text_soft,
-    )
-    content_kicker_style = ParagraphStyle(
-        "ContentKickerStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=7.5,
-        leading=9,
-        textColor=text_soft,
-        spaceAfter=4,
-    )
-    content_title_style = ParagraphStyle(
-        "ContentTitleStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=15,
-        leading=18,
-        textColor=colors.white,
-        spaceAfter=6,
-    )
-    content_body_style = ParagraphStyle(
-        "ContentBodyStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9.2,
-        leading=13.5,
-        textColor=text_soft,
-        spaceAfter=8,
-    )
-    pill_style = ParagraphStyle(
-        "PillStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.8,
-        leading=9,
-        textColor=colors.white,
-    )
-    meta_label_style = ParagraphStyle(
-        "MetaLabelStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=7.2,
-        leading=8.4,
-        textColor=text_muted,
-    )
-    meta_value_style = ParagraphStyle(
-        "MetaValueStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=10,
-        leading=13,
-        textColor=ink,
-    )
-    meta_line_style = ParagraphStyle(
-        "MetaLineStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=8.5,
-        leading=11,
-        textColor=text_muted,
-    )
-    section_number_style = ParagraphStyle(
-        "SectionNumberStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=9,
-        leading=11,
-        alignment=1,
-        textColor=colors.white,
-    )
-    section_title_style = ParagraphStyle(
-        "SectionTitleStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=12,
-        leading=14,
-        textColor=ink,
-    )
-    field_label_style = ParagraphStyle(
-        "FieldLabelStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=7.3,
-        leading=10,
-        textColor=text_muted,
-    )
-    field_value_style = ParagraphStyle(
-        "FieldValueStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9.4,
-        leading=13,
-        textColor=ink,
-    )
-    field_empty_style = ParagraphStyle(
-        "FieldEmptyStyle",
-        parent=field_value_style,
-        textColor=colors.HexColor("#b8c9d6"),
-        fontName="Helvetica-Oblique",
-    )
-    note_style = ParagraphStyle(
-        "NoteStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9,
-        leading=13.5,
-        textColor=colors.HexColor("#7a5e38"),
-    )
-    footer_style = ParagraphStyle(
-        "FooterStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.8,
-        leading=10,
-        textColor=text_muted,
-    )
+    eyebrow_style = ParagraphStyle("EyebrowStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=text_soft, spaceAfter=6)
+    hero_title_style = ParagraphStyle("HeroTitleStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=20, leading=22, textColor=colors.white, spaceAfter=8)
+    hero_body_style = ParagraphStyle("HeroBodyStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9.4, leading=14, textColor=text_soft)
+    content_kicker_style = ParagraphStyle("ContentKickerStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=text_soft, spaceAfter=4)
+    content_title_style = ParagraphStyle("ContentTitleStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=15, leading=18, textColor=colors.white, spaceAfter=6)
+    content_body_style = ParagraphStyle("ContentBodyStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9.2, leading=13.5, textColor=text_soft, spaceAfter=8)
+    pill_style = ParagraphStyle("PillStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=7.8, leading=9, textColor=colors.white)
+    meta_label_style = ParagraphStyle("MetaLabelStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.2, leading=8.4, textColor=text_muted)
+    meta_value_style = ParagraphStyle("MetaValueStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=10, leading=13, textColor=ink)
+    meta_line_style = ParagraphStyle("MetaLineStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=11, textColor=text_muted)
+    section_number_style = ParagraphStyle("SectionNumberStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=9, leading=11, alignment=1, textColor=colors.white)
+    section_title_style = ParagraphStyle("SectionTitleStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=ink)
+    field_label_style = ParagraphStyle("FieldLabelStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.3, leading=10, textColor=text_muted)
+    field_value_style = ParagraphStyle("FieldValueStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9.4, leading=13, textColor=ink)
+    field_empty_style = ParagraphStyle("FieldEmptyStyle", parent=field_value_style, textColor=colors.HexColor("#b8c9d6"), fontName="Helvetica-Oblique")
+    note_style = ParagraphStyle("NoteStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9, leading=13.5, textColor=colors.HexColor("#7a5e38"))
+    footer_style = ParagraphStyle("FooterStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=7.8, leading=10, textColor=text_muted)
 
     story: list[Any] = []
 
@@ -764,34 +786,25 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         if getattr(logo, "imageWidth", 0):
             logo.drawHeight = logo.imageHeight * logo.drawWidth / logo.imageWidth
         brand_flowables.extend([logo, Spacer(1, 10)])
-    brand_flowables.extend(
-        [
-            Paragraph("COSTING HANDOFF", eyebrow_style),
-            Paragraph("Costing<br/>Feasibility<br/>Template", hero_title_style),
-            Paragraph(
-                "Structured RFQ snapshot prepared for the costing review phase.",
-                hero_body_style,
-            ),
-        ]
-    )
+    brand_flowables.extend([
+        Paragraph("COSTING HANDOFF", eyebrow_style),
+        Paragraph("Costing<br/>Feasibility<br/>Template", hero_title_style),
+        Paragraph("Structured RFQ snapshot prepared for the costing review phase.", hero_body_style),
+    ])
 
     pills_row = Table(
         [[_pill("Phase", phase, colors.HexColor("#2a86c2")), _pill("Sub-status", sub_status, sun)]],
         colWidths=[58 * mm, 58 * mm],
     )
-    pills_row.setStyle(
-        TableStyle(
-            [
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
+    pills_row.setStyle(TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
 
-    meta_cards = [
+    meta_cards_rl = [
         ("RFQ ID", systematic_rfq_id),
         ("Created by", rfq.created_by_email),
         ("Approved by", approved_by),
@@ -800,67 +813,49 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         ("Product line", product_line if product_line != "-" else None),
     ]
     meta_rows = []
-    for index in range(0, len(meta_cards), 2):
-        row = []
-        for label, value in meta_cards[index:index + 2]:
-            row.append(_meta_card(label, value))
+    for index in range(0, len(meta_cards_rl), 2):
+        row = [_meta_card(label, value) for label, value in meta_cards_rl[index:index + 2]]
         while len(row) < 2:
             row.append("")
         meta_rows.append(row)
 
     meta_grid = Table(meta_rows, colWidths=[58 * mm, 58 * mm])
-    meta_grid.setStyle(
-        TableStyle(
-            [
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
+    meta_grid.setStyle(TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
 
     content_flowables = [
         Paragraph("REVIEW SNAPSHOT", content_kicker_style),
         Paragraph("Commercial-to-costing handoff", content_title_style),
-        Paragraph(
-            "The RFQ information below is organized for feasibility assessment, costing preparation, and internal alignment.",
-            content_body_style,
-        ),
+        Paragraph("The RFQ information below is organized for feasibility assessment, costing preparation, and internal alignment.", content_body_style),
         pills_row,
         Spacer(1, 10),
         meta_grid,
     ]
 
     hero = Table([[brand_flowables, content_flowables]], colWidths=[56 * mm, 124 * mm])
-    hero.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), tide),
-                ("BACKGROUND", (0, 0), (0, 0), mint),
-                ("LINEABOVE", (0, 0), (-1, 0), 4, sun),
-                ("BOX", (0, 0), (-1, -1), 0.8, tide),
-                ("LEFTPADDING", (0, 0), (0, 0), 16),
-                ("RIGHTPADDING", (0, 0), (0, 0), 16),
-                ("TOPPADDING", (0, 0), (0, 0), 18),
-                ("BOTTOMPADDING", (0, 0), (0, 0), 18),
-                ("LEFTPADDING", (1, 0), (1, 0), 18),
-                ("RIGHTPADDING", (1, 0), (1, 0), 18),
-                ("TOPPADDING", (1, 0), (1, 0), 18),
-                ("BOTTOMPADDING", (1, 0), (1, 0), 18),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
+    hero.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), tide),
+        ("BACKGROUND", (0, 0), (0, 0), mint),
+        ("LINEABOVE", (0, 0), (-1, 0), 4, sun),
+        ("BOX", (0, 0), (-1, -1), 0.8, tide),
+        ("LEFTPADDING", (0, 0), (0, 0), 16),
+        ("RIGHTPADDING", (0, 0), (0, 0), 16),
+        ("TOPPADDING", (0, 0), (0, 0), 18),
+        ("BOTTOMPADDING", (0, 0), (0, 0), 18),
+        ("LEFTPADDING", (1, 0), (1, 0), 18),
+        ("RIGHTPADDING", (1, 0), (1, 0), 18),
+        ("TOPPADDING", (1, 0), (1, 0), 18),
+        ("BOTTOMPADDING", (1, 0), (1, 0), 18),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
     story.extend([hero, Spacer(1, 10)])
 
-    story.append(
-        Paragraph(
-            f"Generated on {escape(generated_at)}<br/>Internal document - Restricted use",
-            meta_line_style,
-        )
-    )
+    story.append(Paragraph(f"Generated on {escape(generated_at)}<br/>Internal document - Restricted use", meta_line_style))
     story.append(Spacer(1, 10))
 
     for index, (title, fields) in enumerate(FIELD_GROUPS):
@@ -869,230 +864,80 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         heading_bg = colors.HexColor(head_bg)
 
         header = Table(
-            [[
-                Paragraph(f"{index + 1:02d}", section_number_style),
-                Paragraph(escape(title), section_title_style),
-            ]],
+            [[Paragraph(f"{index + 1:02d}", section_number_style), Paragraph(escape(title), section_title_style)]],
             colWidths=[14 * mm, 166 * mm],
         )
-        header.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (0, 0), accent_color),
-                    ("BACKGROUND", (1, 0), (1, 0), heading_bg),
-                    ("BOX", (0, 0), (-1, -1), 0.8, border_color),
-                    ("LEFTPADDING", (0, 0), (0, 0), 0),
-                    ("RIGHTPADDING", (0, 0), (0, 0), 0),
-                    ("TOPPADDING", (0, 0), (0, 0), 7),
-                    ("BOTTOMPADDING", (0, 0), (0, 0), 7),
-                    ("LEFTPADDING", (1, 0), (1, 0), 12),
-                    ("RIGHTPADDING", (1, 0), (1, 0), 12),
-                    ("TOPPADDING", (1, 0), (1, 0), 7),
-                    ("BOTTOMPADDING", (1, 0), (1, 0), 7),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ]
-            )
-        )
+        header.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), accent_color),
+            ("BACKGROUND", (1, 0), (1, 0), heading_bg),
+            ("BOX", (0, 0), (-1, -1), 0.8, border_color),
+            ("LEFTPADDING", (0, 0), (0, 0), 0),
+            ("RIGHTPADDING", (0, 0), (0, 0), 0),
+            ("TOPPADDING", (0, 0), (0, 0), 7),
+            ("BOTTOMPADDING", (0, 0), (0, 0), 7),
+            ("LEFTPADDING", (1, 0), (1, 0), 12),
+            ("RIGHTPADDING", (1, 0), (1, 0), 12),
+            ("TOPPADDING", (1, 0), (1, 0), 7),
+            ("BOTTOMPADDING", (1, 0), (1, 0), 7),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
 
         field_rows = []
         for label, keys in fields:
             raw = _pick_first_value(data, keys)
             value_style = field_empty_style if raw == "-" else field_value_style
-            field_rows.append(
-                [
-                    Paragraph(escape(label.upper()), field_label_style),
-                    Paragraph(_paragraph_html(raw), value_style),
-                ]
-            )
+            field_rows.append([
+                Paragraph(escape(label.upper()), field_label_style),
+                Paragraph(_paragraph_html(raw), value_style),
+            ])
 
         body = Table(field_rows, colWidths=[56 * mm, 124 * mm])
-        body.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                    ("BOX", (0, 0), (-1, -1), 0.8, border_color),
-                    ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#eef3f7")),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 12),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 12),
-                    ("TOPPADDING", (0, 0), (-1, -1), 7),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-                ]
-            )
-        )
+        body.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+            ("BOX", (0, 0), (-1, -1), 0.8, border_color),
+            ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#eef3f7")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 12),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ]))
 
         story.extend([header, body, Spacer(1, 10)])
 
     note = Table(
-        [[Paragraph(
-            "<b>Note:</b> Empty fields are displayed as &mdash;. This document is generated automatically from the RFQ system and does not constitute a contractual commitment.",
-            note_style,
-        )]],
+        [[Paragraph("<b>Note:</b> Empty fields are displayed as &mdash;. This document is generated automatically from the RFQ system and does not constitute a contractual commitment.", note_style)]],
         colWidths=[180 * mm],
     )
-    note.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fffbf5")),
-                ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#f5d9a8")),
-                ("LINEBEFORE", (0, 0), (0, 0), 3, sun),
-                ("LEFTPADDING", (0, 0), (-1, -1), 12),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 12),
-                ("TOPPADDING", (0, 0), (-1, -1), 10),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-            ]
-        )
-    )
+    note.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fffbf5")),
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#f5d9a8")),
+        ("LINEBEFORE", (0, 0), (0, 0), 3, sun),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+    ]))
     story.extend([note, Spacer(1, 10)])
 
     footer = Table(
         [[Paragraph("AVO Carbon Group - Costing feasibility handoff", footer_style)]],
         colWidths=[180 * mm],
     )
-    footer.setStyle(
-        TableStyle(
-            [
-                ("LINEABOVE", (0, 0), (-1, -1), 0.7, page_bg),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-            ]
-        )
-    )
+    footer.setStyle(TableStyle([
+        ("LINEABOVE", (0, 0), (-1, -1), 0.7, page_bg),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
     story.append(footer)
 
     document.build(story)
     return buffer.getvalue()
 
-def _render_html_to_pdf(document_html: str) -> bytes:
-    try:
-        return _render_html_to_pdf_with_playwright(document_html)
-    except RuntimeError:
-        browser_path = _find_browser_executable()
-        if browser_path is not None:
-            return _render_html_to_pdf_with_browser(document_html, browser_path)
-        raise
 
-
-def _render_html_to_pdf_with_browser(document_html: str, browser_path: Path) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="costing-template-") as temp_dir:
-        temp_path = Path(temp_dir)
-        html_path = temp_path / "costing-template.html"
-        pdf_path = temp_path / "costing-template.pdf"
-        html_path.write_text(document_html, encoding="utf-8")
-
-        command = [
-            str(browser_path),
-            "--headless",
-            "--disable-gpu",
-            f"--print-to-pdf={pdf_path}",
-            "--print-to-pdf-no-header",
-            "--no-pdf-header-footer",
-            html_path.resolve().as_uri(),
-        ]
-
-        try:
-            subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or exc.stdout or "").strip()
-            raise RuntimeError(
-                f"PDF generation failed: {stderr or 'browser render error'}"
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("PDF generation timed out.") from exc
-
-        if not pdf_path.exists():
-            raise RuntimeError("PDF generation did not produce an output file.")
-
-        return pdf_path.read_bytes()
-
-
-def _render_html_to_pdf_with_playwright(document_html: str) -> bytes:
-    result: dict[str, Any] = {}
-
-    def _runner() -> None:
-        try:
-            result["pdf"] = asyncio.run(_render_html_to_pdf_with_playwright_async(document_html))
-        except Exception as exc:
-            result["error"] = exc
-
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-    thread.join(timeout=90)
-
-    if thread.is_alive():
-        raise RuntimeError("Playwright PDF generation timed out.")
-
-    if "error" in result:
-        error = result["error"]
-        raise RuntimeError(f"Playwright PDF generation failed: {error}") from error
-
-    return result["pdf"]
-
-
-async def _render_html_to_pdf_with_playwright_async(document_html: str) -> bytes:
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "No compatible browser was found for PDF generation. "
-            "Install Microsoft Edge, Google Chrome, or Playwright Chromium."
-        ) from exc
-
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_PATH))
-
-    with tempfile.TemporaryDirectory(prefix="costing-template-") as temp_dir:
-        temp_path = Path(temp_dir)
-        pdf_path = temp_path / "costing-template.pdf"
-
-        try:
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    headless=True,
-                    args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
-                )
-                page = await browser.new_page()
-                await page.set_content(document_html, wait_until="networkidle")
-                await page.emulate_media(media="screen")
-                await page.pdf(
-                    path=str(pdf_path),
-                    format="A4",
-                    print_background=True,
-                    margin={
-                        "top": "28pt",
-                        "right": "28pt",
-                        "bottom": "28pt",
-                        "left": "28pt",
-                    },
-                    display_header_footer=False,
-                )
-                await browser.close()
-        except Exception as exc:
-            raise RuntimeError(f"Playwright render error: {exc}") from exc
-
-        if not pdf_path.exists():
-            raise RuntimeError("Playwright PDF generation did not produce an output file.")
-
-        return pdf_path.read_bytes()
-
-
-@lru_cache(maxsize=1)
-def _find_browser_executable() -> Path | None:
-    for candidate in _BROWSER_CANDIDATE_PATHS:
-        if candidate.exists():
-            return candidate
-    for executable in ("msedge", "msedge.exe", "chrome", "chrome.exe"):
-        resolved = shutil.which(executable)
-        if resolved:
-            return Path(resolved)
-    return None
+# ── HTML helpers ─────────────────────────────────────────────────────────────
 
 
 def _render_field_group(
@@ -1174,6 +1019,9 @@ def _load_logo_data_uri() -> str:
         return ""
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+# ── Data helpers ─────────────────────────────────────────────────────────────
 
 
 def _pick_first_value(data: dict[str, Any], keys: tuple[str, ...]) -> str:
