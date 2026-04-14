@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
 import shutil
 import subprocess
@@ -126,8 +127,13 @@ _BROWSER_CANDIDATE_PATHS = (
     Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-FRONTEND_LOGO_PATH = PROJECT_ROOT / "Sales_App_Frontend" / "src" / "assets" / "logo.png"
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+DEPLOY_ROOT = BACKEND_ROOT.parent
+LOGO_CANDIDATE_PATHS = (
+    BACKEND_ROOT / "app" / "assets" / "logo.png",
+    DEPLOY_ROOT / "Sales_App_Frontend" / "src" / "assets" / "logo.png",
+)
+PLAYWRIGHT_BROWSERS_PATH = BACKEND_ROOT / ".playwright-browsers"
 
 
 def build_costing_template_filename(rfq: Rfq) -> str:
@@ -196,7 +202,7 @@ def render_costing_template_html(rfq: Rfq) -> str:
   <style>
     @page {{
       size: A4;
-      margin: 50pt 50pt 50pt 50pt;
+      margin: 28pt 28pt 28pt 28pt;
     }}
     body {{
       font-family: Calibri, Arial, sans-serif;
@@ -603,10 +609,10 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     document = SimpleDocTemplate(
         buffer,
         pagesize=A4,
-        leftMargin=15 * mm,
-        rightMargin=15 * mm,
-        topMargin=15 * mm,
-        bottomMargin=15 * mm,
+        leftMargin=10 * mm,
+        rightMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
         title="RFQ Costing Feasibility Template",
     )
 
@@ -755,8 +761,9 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     story: list[Any] = []
 
     brand_flowables: list[Any] = []
-    if FRONTEND_LOGO_PATH.exists():
-        logo = Image(str(FRONTEND_LOGO_PATH))
+    logo_path = _resolve_logo_path()
+    if logo_path:
+        logo = Image(str(logo_path))
         logo.drawWidth = 38 * mm
         if getattr(logo, "imageWidth", 0):
             logo.drawHeight = logo.imageHeight * logo.drawWidth / logo.imageWidth
@@ -964,12 +971,12 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
 
 def _render_html_to_pdf(document_html: str) -> bytes:
     browser_path = _find_browser_executable()
-    if browser_path is None:
-        raise RuntimeError(
-            "No compatible browser was found for PDF generation. "
-            "Install Microsoft Edge or Google Chrome."
-        )
+    if browser_path is not None:
+        return _render_html_to_pdf_with_browser(document_html, browser_path)
+    return _render_html_to_pdf_with_playwright(document_html)
 
+
+def _render_html_to_pdf_with_browser(document_html: str, browser_path: Path) -> bytes:
     with tempfile.TemporaryDirectory(prefix="costing-template-") as temp_dir:
         temp_path = Path(temp_dir)
         html_path = temp_path / "costing-template.html"
@@ -1004,6 +1011,52 @@ def _render_html_to_pdf(document_html: str) -> bytes:
 
         if not pdf_path.exists():
             raise RuntimeError("PDF generation did not produce an output file.")
+
+        return pdf_path.read_bytes()
+
+
+def _render_html_to_pdf_with_playwright(document_html: str) -> bytes:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "No compatible browser was found for PDF generation. "
+            "Install Microsoft Edge, Google Chrome, or Playwright Chromium."
+        ) from exc
+
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_PATH))
+
+    with tempfile.TemporaryDirectory(prefix="costing-template-") as temp_dir:
+        temp_path = Path(temp_dir)
+        pdf_path = temp_path / "costing-template.pdf"
+
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                page = browser.new_page()
+                page.set_content(document_html, wait_until="networkidle")
+                page.emulate_media(media="screen")
+                page.pdf(
+                    path=str(pdf_path),
+                    format="A4",
+                    print_background=True,
+                    margin={
+                        "top": "28pt",
+                        "right": "28pt",
+                        "bottom": "28pt",
+                        "left": "28pt",
+                    },
+                    display_header_footer=False,
+                )
+                browser.close()
+        except Exception as exc:
+            raise RuntimeError(f"Playwright PDF generation failed: {exc}") from exc
+
+        if not pdf_path.exists():
+            raise RuntimeError("Playwright PDF generation did not produce an output file.")
 
         return pdf_path.read_bytes()
 
@@ -1081,10 +1134,20 @@ def _render_logo_html() -> str:
     return f'<div class="logo-wrap"><img src="{data_uri}" alt="Avo Carbon Group" /></div>'
 
 
+def _resolve_logo_path() -> Path | None:
+    for candidate in LOGO_CANDIDATE_PATHS:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 @lru_cache(maxsize=1)
 def _load_logo_data_uri() -> str:
+    logo_path = _resolve_logo_path()
+    if not logo_path:
+        return ""
     try:
-        content = FRONTEND_LOGO_PATH.read_bytes()
+        content = logo_path.read_bytes()
     except OSError:
         return ""
     encoded = base64.b64encode(content).decode("ascii")
