@@ -145,13 +145,7 @@ def build_costing_template_filename(rfq: Rfq) -> str:
 
 def render_costing_template_pdf(rfq: Rfq) -> bytes:
     document_html = render_costing_template_html(rfq)
-    try:
-        return _render_html_to_pdf(document_html)
-    except RuntimeError as exc:
-        try:
-            return _render_reportlab_pdf(rfq)
-        except ImportError:
-            raise exc
+    return _render_html_to_pdf(document_html)
 
 
 def render_costing_template_html(rfq: Rfq) -> str:
@@ -970,10 +964,13 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     return buffer.getvalue()
 
 def _render_html_to_pdf(document_html: str) -> bytes:
-    browser_path = _find_browser_executable()
-    if browser_path is not None:
-        return _render_html_to_pdf_with_browser(document_html, browser_path)
-    return _render_html_to_pdf_with_playwright(document_html)
+    try:
+        return _render_html_to_pdf_with_playwright(document_html)
+    except RuntimeError:
+        browser_path = _find_browser_executable()
+        if browser_path is not None:
+            return _render_html_to_pdf_with_browser(document_html, browser_path)
+        raise
 
 
 def _render_html_to_pdf_with_browser(document_html: str, browser_path: Path) -> bytes:
