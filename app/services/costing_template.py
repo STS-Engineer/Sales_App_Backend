@@ -68,7 +68,7 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
         ],
     ),
     (
-        "Feasibility inputs",
+        "Commercial Questions",
         [
             (
                 "Design responsible",
@@ -153,13 +153,7 @@ def build_costing_template_filename(rfq: Rfq) -> str:
 
 
 def render_costing_template_pdf(rfq: Rfq) -> bytes:
-    document_html = render_costing_template_html(rfq)
-    try:
-        return _render_html_to_pdf(document_html)
-    except RuntimeError:
-        # Last-resort fallback: ReportLab (no external binary needed)
-        return _render_reportlab_pdf(rfq)
-
+    return _render_reportlab_pdf(rfq)
 
 def render_costing_template_html(rfq: Rfq) -> str:
     data = dict(rfq.rfq_data or {})
@@ -715,7 +709,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
     from reportlab.lib.utils import ImageReader
-    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Flowable, Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     def _paragraph_html(value: Any) -> str:
         text = _stringify_value(value)
@@ -806,11 +800,30 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     hero_title_style = ParagraphStyle("HeroTitleStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=20, leading=22, textColor=colors.white, spaceAfter=8)
     hero_body_style = ParagraphStyle("HeroBodyStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9.4, leading=14, textColor=text_soft)
     content_kicker_style = ParagraphStyle("ContentKickerStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=text_soft, spaceAfter=4)
-    content_title_style = ParagraphStyle("ContentTitleStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=15, leading=18, textColor=colors.white, spaceAfter=6)
-    content_body_style = ParagraphStyle("ContentBodyStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9.2, leading=13.5, textColor=text_soft, spaceAfter=8)
+    content_title_style = ParagraphStyle(
+        "ContentTitleStyle",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=14,
+        leading=16,
+        textColor=colors.white,
+        spaceAfter=5,
+    )
+
+    content_body_style = ParagraphStyle(
+        "ContentBodyStyle",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.7,
+        leading=12.4,
+        textColor=text_soft,
+        spaceAfter=6,
+    )
     pill_style = ParagraphStyle("PillStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=7.8, leading=9, textColor=colors.white)
     meta_label_style = ParagraphStyle("MetaLabelStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.2, leading=8.4, textColor=text_muted)
     meta_value_style = ParagraphStyle("MetaValueStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=10, leading=13, textColor=ink)
+    header_card_label_style = ParagraphStyle("HeaderCardLabelStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7, leading=8.2, textColor=text_muted)
+    header_card_value_style = ParagraphStyle("HeaderCardValueStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=8.8, leading=11.1, textColor=ink)
     meta_line_style = ParagraphStyle("MetaLineStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=11, textColor=text_muted)
     section_number_style = ParagraphStyle("SectionNumberStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=9, leading=11, alignment=1, textColor=colors.white)
     section_title_style = ParagraphStyle("SectionTitleStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=ink)
@@ -822,50 +835,6 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
 
     story: list[Any] = []
 
-    brand_flowables: list[Any] = []
-    logo_path = _resolve_logo_path()
-    if logo_path:
-        reader = ImageReader(str(logo_path))
-        image_width, image_height = reader.getSize()
-        max_logo_width = 40 * mm
-        max_logo_height = 14 * mm
-        scale = min(max_logo_width / image_width, max_logo_height / image_height)
-        logo = Image(
-            str(logo_path),
-            width=image_width * scale,
-            height=image_height * scale,
-            mask='auto',
-        )
-        logo.hAlign = 'LEFT'
-        logo_wrap = Table([[logo]], colWidths=[46 * mm])
-        logo_wrap.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#d7e5ef")),
-            ("LEFTPADDING", (0, 0), (-1, -1), 8),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        brand_flowables.extend([logo_wrap, Spacer(1, 10)])
-    brand_flowables.extend([
-        Paragraph("COSTING HANDOFF", eyebrow_style),
-        Paragraph("Costing<br/>Feasibility<br/>Template", hero_title_style),
-        Paragraph("Structured RFQ snapshot prepared for the costing review phase.", hero_body_style),
-    ])
-
-    pills_row = Table(
-        [[_pill("Phase", phase, colors.HexColor("#2a86c2")), _pill("Sub-status", sub_status, sun)]],
-        colWidths=[58 * mm, 58 * mm],
-    )
-    pills_row.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-
     meta_cards_rl = [
         ("RFQ ID", systematic_rfq_id),
         ("Created by", rfq.created_by_email),
@@ -874,48 +843,197 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         ("Customer", customer if customer != "-" else None),
         ("Product line", product_line if product_line != "-" else None),
     ]
-    meta_rows = []
-    for index in range(0, len(meta_cards_rl), 2):
-        row = [_meta_card(label, value) for label, value in meta_cards_rl[index:index + 2]]
-        while len(row) < 2:
-            row.append("")
-        meta_rows.append(row)
 
-    meta_grid = Table(meta_rows, colWidths=[58 * mm, 58 * mm])
-    meta_grid.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
+    class ReportLabHeroHeader(Flowable):
+        def __init__(self) -> None:
+            super().__init__()
+            self.width = document.width - 5 * mm
+            self.height = 116 * mm
 
-    content_flowables = [
-        Paragraph("REVIEW SNAPSHOT", content_kicker_style),
-        Paragraph("Commercial-to-costing handoff", content_title_style),
-        Paragraph("The RFQ information below is organized for feasibility assessment, costing preparation, and internal alignment.", content_body_style),
-        pills_row,
-        Spacer(1, 10),
-        meta_grid,
-    ]
+        def wrap(self, availWidth: float, availHeight: float) -> tuple[float, float]:
+            return self.width, self.height
 
-    hero = Table([[brand_flowables, content_flowables]], colWidths=[56 * mm, 124 * mm])
-    hero.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), tide),
-        ("BACKGROUND", (0, 0), (0, 0), mint),
-        ("LINEABOVE", (0, 0), (-1, 0), 4, sun),
-        ("BOX", (0, 0), (-1, -1), 0.8, tide),
-        ("LEFTPADDING", (0, 0), (0, 0), 16),
-        ("RIGHTPADDING", (0, 0), (0, 0), 16),
-        ("TOPPADDING", (0, 0), (0, 0), 18),
-        ("BOTTOMPADDING", (0, 0), (0, 0), 18),
-        ("LEFTPADDING", (1, 0), (1, 0), 18),
-        ("RIGHTPADDING", (1, 0), (1, 0), 18),
-        ("TOPPADDING", (1, 0), (1, 0), 18),
-        ("BOTTOMPADDING", (1, 0), (1, 0), 18),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    story.extend([hero, Spacer(1, 10)])
+        def draw(self) -> None:
+            canv = self.canv
+            width = self.width
+            height = self.height
+            left_width = 57 * mm
+            right_x = left_width
+            outer_radius = 5 * mm
+            panel_radius = 4 * mm
+            card_gap = 2.5 * mm
+            card_height = 29 * mm
+            card_width = (width - right_x - 11 * mm - (2 * card_gap)) / 3
+            cards_x = right_x + 5.5 * mm
+            row_gap = 4 * mm
+
+            # On descend légèrement tout le bloc des cards
+            bottom_cards_y = 5.0 * mm
+            top_cards_y = bottom_cards_y + card_height + row_gap
+            pills_y = top_cards_y + card_height + 4.2 * mm
+
+            def draw_paragraph(text_value: str, style: ParagraphStyle, x: float, top_y: float, max_width: float) -> float:
+                paragraph = Paragraph(text_value, style)
+                _, para_height = paragraph.wrap(max_width, 1000)
+                paragraph.drawOn(canv, x, top_y - para_height)
+                return para_height
+
+            def draw_pill(text_value: str, x: float, y: float, width_value: float, fill_color: Any, stroke_color: Any) -> None:
+                pill_height = 9.5 * mm
+                canv.saveState()
+                canv.setFillColor(fill_color)
+                canv.setStrokeColor(stroke_color)
+                canv.setLineWidth(1)
+                canv.roundRect(x, y, width_value, pill_height, 4.25 * mm, fill=1, stroke=1)
+                pill_paragraph = Paragraph(text_value, pill_style)
+                _, pill_text_height = pill_paragraph.wrap(width_value - 8 * mm, pill_height - 1 * mm)
+                pill_paragraph.drawOn(canv, x + 4 * mm, y + (pill_height - pill_text_height) / 2 - 0.3 * mm)
+                canv.restoreState()
+
+            def draw_card(label: str, value: Any, x: float, y: float) -> None:
+                canv.saveState()
+                canv.setFillColor(colors.white)
+                canv.setStrokeColor(colors.white)
+                canv.roundRect(x, y, card_width, card_height, 5 * mm, fill=1, stroke=0)
+                label_paragraph = Paragraph(escape(label.upper()), header_card_label_style)
+                _, label_height = label_paragraph.wrap(card_width - 10 * mm, 1000)
+                label_paragraph.drawOn(canv, x + 5 * mm, y + card_height - 6 * mm - label_height)
+                value_text = _paragraph_html(value)
+                value_paragraph = Paragraph(value_text, header_card_value_style)
+                _, value_height = value_paragraph.wrap(card_width - 10 * mm, card_height - 14 * mm)
+                value_paragraph.drawOn(canv, x + 5 * mm, y + card_height - 10 * mm - label_height - value_height)
+                canv.restoreState()
+
+            canv.saveState()
+            canv.setFillColor(tide)
+            canv.roundRect(0, 0, width, height, outer_radius, fill=1, stroke=0)
+
+            # Bloc gauche avec coins arrondis à gauche seulement
+            path = canv.beginPath()
+            r = outer_radius
+
+            path.moveTo(0, r)
+            path.arcTo(0, 0, 2 * r, 2 * r, startAng=180, extent=-90)              # bas gauche
+            path.lineTo(left_width, 0)                                             # bas droit
+            path.lineTo(left_width, height)                                        # haut droit
+            path.lineTo(r, height)                                                 # vers haut gauche
+            path.arcTo(0, height - 2 * r, 2 * r, height, startAng=90, extent=90)  # haut gauche
+            path.close()
+
+            canv.setFillColor(mint)
+            canv.drawPath(path, fill=1, stroke=0)
+
+            canv.setFillColor(sun)
+            canv.roundRect(7 * mm, height - 1.7 * mm, width - 14 * mm, 1.2 * mm, 0.6 * mm, fill=1, stroke=0)
+
+            logo_path = _resolve_logo_path()
+            if logo_path:
+                reader = ImageReader(str(logo_path))
+                image_width, image_height = reader.getSize()
+
+                logo_box_x = 7.0 * mm
+                logo_box_y = height - 15.0 * mm
+                logo_box_width = 50 * mm
+                logo_box_height = 12.0 * mm
+
+                canv.setFillColor(colors.white)
+                canv.roundRect(
+                    logo_box_x,
+                    logo_box_y,
+                    logo_box_width,
+                    logo_box_height,
+                    panel_radius,
+                    fill=1,
+                    stroke=0,
+                )
+
+                # marges internes plus confortables
+                padding_x = 4.0 * mm
+                padding_y = 1.4 * mm
+                available_w = logo_box_width - (2 * padding_x)
+                available_h = logo_box_height - (2 * padding_y)
+
+                scale = min(available_w / image_width, available_h / image_height)
+
+                # sécurité supplémentaire pour éviter tout débordement
+                scale *= 0.94
+
+                draw_w = image_width * scale
+                draw_h = image_height * scale
+
+                image_x = logo_box_x + (logo_box_width - draw_w) / 2
+                image_y = logo_box_y + (logo_box_height - draw_h) / 2
+
+                canv.drawImage(
+                    reader,
+                    image_x,
+                    image_y,
+                    width=draw_w,
+                    height=draw_h,
+                    mask="auto",
+                    preserveAspectRatio=True,
+                    anchor="sw",
+                )
+            left_text_x = 8 * mm
+            left_current_top = height - 22 * mm
+            left_current_top -= draw_paragraph('COSTING HANDOFF', eyebrow_style, left_text_x, left_current_top, left_width - 16 * mm)
+            left_current_top -= 4 * mm
+            left_current_top -= draw_paragraph('Costing<br/>Feasibility<br/>Template', hero_title_style, left_text_x, left_current_top, left_width - 16 * mm)
+            left_current_top -= 5 * mm
+            draw_paragraph('Structured RFQ snapshot prepared for the costing review phase.', hero_body_style, left_text_x, left_current_top, left_width - 16 * mm)
+
+            right_text_x = right_x + 6.5 * mm
+            right_content_width = width - right_text_x - 8 * mm
+
+            current_top = height - 8.5 * mm
+            current_top -= draw_paragraph(
+                'REVIEW SNAPSHOT',
+                content_kicker_style,
+                right_text_x,
+                current_top,
+                right_content_width,
+            )
+            current_top -= 1.5 * mm
+
+            current_top -= draw_paragraph(
+                'Commercial-to-costing handoff',
+                content_title_style,
+                right_text_x,
+                current_top,
+                right_content_width,
+            )
+            current_top -= 3 * mm
+
+            current_top -= draw_paragraph(
+                'The RFQ information below is organized for feasibility assessment, costing preparation, and internal alignment.',
+                content_body_style,
+                right_text_x,
+                current_top,
+                right_content_width,
+            )
+
+            # Les badges se placent maintenant juste sous le texte
+            pills_y = current_top - 10 * mm
+
+            draw_pill(
+                f'<b>Phase :</b> {escape(phase)}',
+                right_text_x,
+                pills_y,
+                34 * mm,
+                colors.HexColor('#315f88'),
+                sun,
+            )
+            draw_pill(f'<b>Sub-status :</b> {escape(sub_status)}', right_text_x + 37 * mm, pills_y, 41 * mm, colors.HexColor('#3f78b0'), colors.HexColor('#76a8d6'))
+            for idx, (label, value) in enumerate(meta_cards_rl):
+                row = idx // 3
+                col = idx % 3
+                x = cards_x + col * (card_width + card_gap)
+                y = top_cards_y - row * (card_height + row_gap)
+                draw_card(label, value, x, y)
+
+            canv.restoreState()
+
+    story.extend([ReportLabHeroHeader(), Spacer(1, 10)])
 
     story.append(Paragraph(f"Generated on {escape(generated_at)}<br/>Internal document - Restricted use", meta_line_style))
     story.append(Spacer(1, 10))
@@ -926,7 +1044,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         heading_bg = colors.HexColor(head_bg)
 
         header = Table(
-            [[Paragraph(f"{index + 1:02d}", section_number_style), Paragraph(escape(title), section_title_style)]],
+            [[Paragraph(f"{index + 1}", section_number_style), Paragraph(escape(title), section_title_style)]],
             colWidths=[14 * mm, 166 * mm],
         )
         header.setStyle(TableStyle([
@@ -981,19 +1099,6 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
     ]))
     story.extend([note, Spacer(1, 10)])
-
-    footer = Table(
-        [[Paragraph("AVO Carbon Group - Costing feasibility handoff", footer_style)]],
-        colWidths=[180 * mm],
-    )
-    footer.setStyle(TableStyle([
-        ("LINEABOVE", (0, 0), (-1, -1), 0.7, page_bg),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    story.append(footer)
 
     document.build(story)
     return buffer.getvalue()

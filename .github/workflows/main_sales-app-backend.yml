@@ -31,16 +31,6 @@ jobs:
           python -m venv antenv
           source antenv/bin/activate
           pip install -r requirements.txt
-      - name: Package wkhtmltopdf for Azure
-        run: |
-          WKHTML_VERSION=0.12.6.1-3
-          WKHTML_DEB=wkhtmltox_${WKHTML_VERSION}.bookworm_amd64.deb
-          WKHTML_URL=https://github.com/wkhtmltopdf/packaging/releases/download/${WKHTML_VERSION}/${WKHTML_DEB}
-          mkdir -p vendor/wkhtmltopdf
-          curl -L --fail "$WKHTML_URL" -o "/tmp/${WKHTML_DEB}"
-          dpkg-deb -x "/tmp/${WKHTML_DEB}" vendor/wkhtmltopdf
-          chmod +x vendor/wkhtmltopdf/usr/local/bin/wkhtmltopdf || true
-          LD_LIBRARY_PATH=vendor/wkhtmltopdf/usr/local/lib vendor/wkhtmltopdf/usr/local/bin/wkhtmltopdf --version
                 
       # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
       - name: Upload artifact for deployment jobs
