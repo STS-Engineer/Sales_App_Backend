@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from datetime import datetime, timezone
 from functools import lru_cache
 from html import escape
@@ -1013,8 +1015,31 @@ def _render_html_to_pdf_with_browser(document_html: str, browser_path: Path) -> 
 
 
 def _render_html_to_pdf_with_playwright(document_html: str) -> bytes:
+    result: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            result["pdf"] = asyncio.run(_render_html_to_pdf_with_playwright_async(document_html))
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join(timeout=90)
+
+    if thread.is_alive():
+        raise RuntimeError("Playwright PDF generation timed out.")
+
+    if "error" in result:
+        error = result["error"]
+        raise RuntimeError(f"Playwright PDF generation failed: {error}") from error
+
+    return result["pdf"]
+
+
+async def _render_html_to_pdf_with_playwright_async(document_html: str) -> bytes:
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.async_api import async_playwright
     except ImportError as exc:
         raise RuntimeError(
             "No compatible browser was found for PDF generation. "
@@ -1028,15 +1053,15 @@ def _render_html_to_pdf_with_playwright(document_html: str) -> bytes:
         pdf_path = temp_path / "costing-template.pdf"
 
         try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(
                     headless=True,
                     args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
                 )
-                page = browser.new_page()
-                page.set_content(document_html, wait_until="networkidle")
-                page.emulate_media(media="screen")
-                page.pdf(
+                page = await browser.new_page()
+                await page.set_content(document_html, wait_until="networkidle")
+                await page.emulate_media(media="screen")
+                await page.pdf(
                     path=str(pdf_path),
                     format="A4",
                     print_background=True,
@@ -1048,9 +1073,9 @@ def _render_html_to_pdf_with_playwright(document_html: str) -> bytes:
                     },
                     display_header_footer=False,
                 )
-                browser.close()
+                await browser.close()
         except Exception as exc:
-            raise RuntimeError(f"Playwright PDF generation failed: {exc}") from exc
+            raise RuntimeError(f"Playwright render error: {exc}") from exc
 
         if not pdf_path.exists():
             raise RuntimeError("Playwright PDF generation did not produce an output file.")
