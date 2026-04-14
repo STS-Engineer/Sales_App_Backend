@@ -17,9 +17,11 @@ from app.config import settings
 from app.database import get_db
 from app.middleware.auth import get_current_user, require_role
 from app.models.audit_log import AuditLog
+from app.models.discussion import DiscussionMessage
 from app.models.potential import Potential
 from app.models.rfq import ALLOWED_TRANSITIONS, Rfq, RfqPhase, RfqSubStatus, VALID_PHASE_SUBSTATUS
 from app.models.user import User, UserRole
+from app.schemas.discussion import DiscussionMessageCreateRequest, DiscussionMessageOut
 from app.schemas.rfq import (
     AdvanceStatusRequest,
     AuditLogOut,
@@ -186,6 +188,23 @@ async def _get_rfq_or_404(db: AsyncSession, rfq_id: str) -> Rfq:
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found.")
     return rfq
+
+
+def _build_discussion_message_out(
+    message: DiscussionMessage,
+    author: User,
+) -> DiscussionMessageOut:
+    return DiscussionMessageOut(
+        id=message.id,
+        rfq_id=message.rfq_id,
+        phase=message.phase,
+        message=message.message,
+        created_at=message.created_at,
+        user_id=author.user_id,
+        author_name=author.full_name,
+        author_email=author.email,
+        author_role=author.role,
+    )
 
 
 def _allowed_transitions_for(rfq: Rfq) -> set[tuple[RfqPhase, RfqSubStatus]]:
@@ -709,6 +728,54 @@ async def get_rfq(
     rfq = await _get_rfq_or_404(db, rfq_id)
     _assert_can_view_rfq(current_user, rfq)
     return rfq
+
+
+@router.get("/{rfq_id}/discussion", response_model=list[DiscussionMessageOut])
+async def get_rfq_discussion(
+    rfq_id: str,
+    phase: RfqSubStatus,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_view_rfq(current_user, rfq)
+
+    result = await db.execute(
+        select(DiscussionMessage, User)
+        .join(User, DiscussionMessage.user_id == User.user_id)
+        .where(
+            DiscussionMessage.rfq_id == rfq_id,
+            DiscussionMessage.phase == phase,
+        )
+        .order_by(DiscussionMessage.created_at.asc(), DiscussionMessage.id.asc())
+    )
+    return [
+        _build_discussion_message_out(message, author)
+        for message, author in result.all()
+    ]
+
+
+@router.post("/{rfq_id}/discussion", response_model=DiscussionMessageOut, status_code=201)
+async def create_rfq_discussion_message(
+    rfq_id: str,
+    body: DiscussionMessageCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_view_rfq(current_user, rfq)
+
+    message = DiscussionMessage(
+        rfq_id=rfq_id,
+        user_id=current_user.user_id,
+        phase=body.phase,
+        message=body.message,
+    )
+    db.add(message)
+    await db.commit()
+    await db.refresh(message)
+
+    return _build_discussion_message_out(message, current_user)
 
 
 @router.get("/{rfq_id}/costing-template")
