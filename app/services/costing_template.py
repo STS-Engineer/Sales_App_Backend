@@ -120,7 +120,16 @@ SECTION_ACCENTS: tuple[tuple[str, str, str, str], ...] = (
     ("#585858", "#f4f5f7", "#e2e4e8", "#444444"),
 )
 
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+DEPLOY_ROOT = BACKEND_ROOT.parent
+LOGO_CANDIDATE_PATHS = (
+    BACKEND_ROOT / "app" / "assets" / "logo.png",
+    DEPLOY_ROOT / "Sales_App_Frontend" / "src" / "assets" / "logo.png",
+)
+
 _WKHTMLTOPDF_CANDIDATE_PATHS = (
+    BACKEND_ROOT / "vendor" / "wkhtmltopdf" / "usr" / "local" / "bin" / "wkhtmltopdf",
+    BACKEND_ROOT / "vendor" / "wkhtmltopdf" / "usr" / "bin" / "wkhtmltopdf",
     Path("/usr/bin/wkhtmltopdf"),
     Path("/usr/local/bin/wkhtmltopdf"),
     Path(r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe"),
@@ -134,12 +143,6 @@ _BROWSER_CANDIDATE_PATHS = (
     Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
 )
 
-BACKEND_ROOT = Path(__file__).resolve().parents[2]
-DEPLOY_ROOT = BACKEND_ROOT.parent
-LOGO_CANDIDATE_PATHS = (
-    BACKEND_ROOT / "app" / "assets" / "logo.png",
-    DEPLOY_ROOT / "Sales_App_Frontend" / "src" / "assets" / "logo.png",
-)
 
 
 def build_costing_template_filename(rfq: Rfq) -> str:
@@ -584,6 +587,7 @@ def _render_html_to_pdf_with_wkhtmltopdf(document_html: str, wkhtmltopdf_path: P
                 capture_output=True,
                 text=True,
                 timeout=60,
+                env=_build_wkhtmltopdf_env(wkhtmltopdf_path, temp_path),
             )
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or exc.stdout or "").strip()
@@ -638,6 +642,45 @@ def _render_html_to_pdf_with_browser(document_html: str, browser_path: Path) -> 
         return pdf_path.read_bytes()
 
 
+def _build_wkhtmltopdf_env(wkhtmltopdf_path: Path, temp_path: Path) -> dict[str, str]:
+    env = os.environ.copy()
+
+    candidate_lib_dirs: list[str] = []
+    for parent in wkhtmltopdf_path.parents:
+        for relative in (
+            Path("../lib"),
+            Path("../../lib"),
+            Path("../lib/x86_64-linux-gnu"),
+            Path("../../lib/x86_64-linux-gnu"),
+            Path("../../usr/local/lib"),
+            Path("../../usr/lib"),
+        ):
+            try:
+                resolved = (parent / relative).resolve()
+            except OSError:
+                continue
+            if resolved.exists() and resolved.is_dir():
+                candidate_lib_dirs.append(str(resolved))
+
+    seen: set[str] = set()
+    ordered_lib_dirs: list[str] = []
+    for item in candidate_lib_dirs:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered_lib_dirs.append(item)
+
+    existing_ld = env.get("LD_LIBRARY_PATH", "")
+    ld_parts = ordered_lib_dirs + ([existing_ld] if existing_ld else [])
+    if ld_parts:
+        env["LD_LIBRARY_PATH"] = ":".join(part for part in ld_parts if part)
+
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    env.setdefault("XDG_RUNTIME_DIR", str(temp_path))
+    env.setdefault("HOME", str(temp_path))
+    return env
+
+
 @lru_cache(maxsize=1)
 def _find_wkhtmltopdf_executable() -> Path | None:
     for candidate in _WKHTMLTOPDF_CANDIDATE_PATHS:
@@ -671,6 +714,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
     from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     def _paragraph_html(value: Any) -> str:
@@ -781,11 +825,29 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     brand_flowables: list[Any] = []
     logo_path = _resolve_logo_path()
     if logo_path:
-        logo = Image(str(logo_path))
-        logo.drawWidth = 38 * mm
-        if getattr(logo, "imageWidth", 0):
-            logo.drawHeight = logo.imageHeight * logo.drawWidth / logo.imageWidth
-        brand_flowables.extend([logo, Spacer(1, 10)])
+        reader = ImageReader(str(logo_path))
+        image_width, image_height = reader.getSize()
+        max_logo_width = 40 * mm
+        max_logo_height = 14 * mm
+        scale = min(max_logo_width / image_width, max_logo_height / image_height)
+        logo = Image(
+            str(logo_path),
+            width=image_width * scale,
+            height=image_height * scale,
+            mask='auto',
+        )
+        logo.hAlign = 'LEFT'
+        logo_wrap = Table([[logo]], colWidths=[46 * mm])
+        logo_wrap.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#d7e5ef")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        brand_flowables.extend([logo_wrap, Spacer(1, 10)])
     brand_flowables.extend([
         Paragraph("COSTING HANDOFF", eyebrow_style),
         Paragraph("Costing<br/>Feasibility<br/>Template", hero_title_style),
