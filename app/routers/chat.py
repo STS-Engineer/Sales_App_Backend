@@ -144,6 +144,7 @@ POTENTIAL_ALLOWED_FIELDS = {
 RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "product_name",
     "product_line_acronym",
+    "project_name",
     "costing_data",
     "customer_pn",
     "revision_level",
@@ -159,6 +160,7 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "target_price_eur",
     "expected_delivery_conditions",
     "expected_payment_terms",
+    "type_of_packaging",
     "business_trigger",
     "customer_tooling_conditions",
     "entry_barriers",
@@ -179,6 +181,7 @@ UPDATE_FORM_FIELD_ALIASES = {
     "customerName": "customer_name",
     "productName": "product_name",
     "productLineAcronym": "product_line_acronym",
+    "projectName": "project_name",
     "customerPn": "customer_pn",
     "revisionLevel": "revision_level",
     "deliveryZone": "delivery_zone",
@@ -190,6 +193,7 @@ UPDATE_FORM_FIELD_ALIASES = {
     "targetPriceEur": "target_price_eur",
     "expectedDeliveryConditions": "expected_delivery_conditions",
     "expectedPaymentTerms": "expected_payment_terms",
+    "typeOfPackaging": "type_of_packaging",
     "businessTrigger": "business_trigger",
     "customerToolingConditions": "customer_tooling_conditions",
     "entryBarriers": "entry_barriers",
@@ -235,6 +239,7 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "application",
             "product_name",
             "product_line_acronym",
+            "project_name",
             "rfq_files",
             "customer_pn",
             "revision_level",
@@ -259,6 +264,7 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "target_price_eur",
             "expected_delivery_conditions",
             "expected_payment_terms",
+            "type_of_packaging",
             "business_trigger",
             "customer_tooling_conditions",
             "entry_barriers",
@@ -995,6 +1001,7 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - application
 - product_name
 - product_line_acronym
+- project_name
 - costing_data (Format ALL costing parameters as a single formatted string/list here)
 - customer_pn
 - revision_level
@@ -1014,6 +1021,7 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - target_price_eur
 - expected_delivery_conditions
 - expected_payment_terms
+- type_of_packaging
 - business_trigger
 - customer_tooling_conditions
 - entry_barriers
@@ -1082,8 +1090,9 @@ You must strictly follow this exact sequential checklist to collect data. Do not
 3. CRITICAL RULE: Once the user answers the application question, you MUST immediately call `updateFormFields` with {"fields_to_update": {"application": "<user_answer>"}}. You are FORBIDDEN from calling `retrieveProducts` until the application is either already present in the state or has just been successfully saved.
 4. ONLY AFTER the application is saved or already present, call `retrieveProducts` with an empty string ("") to fetch the catalog IF `product_name` is still missing.
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save both `product_name` and the authorized `product_line_acronym` with `updateFormFields` to lock them in.
-6. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-7. Ask only for the remaining missing Step 1 fields among P/N, Revision level, Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user. Extract them using `updateFormFields`.
+6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
+7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
+8. Ask only for the remaining missing Step 1 fields among P/N, Revision level, Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user. Extract them using `updateFormFields`.
 
 STEP 1 VALIDATION RULE:
 Before moving to Step 2 (Commercial Expectations), you MUST verify Step 1 completeness using the CURRENT RFQ DATABASE STATE and the dynamically injected MISSING_FIELDS_PROMPT.
@@ -1103,9 +1112,15 @@ Ask sequentially for:
 - Target Price
 - Delivery Conditions
 - Payment Terms
+- Type of Packaging
 - Business Trigger
 - Tooling Conditions
 - Entry Barriers
+CRITICAL PACKAGING RULE: When `type_of_packaging` is missing, you MUST ask the user to choose exactly one of these 3 options:
+1. carboard divider
+2. one way tray
+3. returnable plastic tray
+As soon as the user chooses one option, you MUST immediately call `updateFormFields` with {"fields_to_update": {"type_of_packaging": "<chosen_option>"}} using exactly the chosen option text.
 CRITICAL RULE: The moment the user provides these commercial expectations, you MUST immediately call `updateFormFields` using the exact JSON keys listed above. DO NOT move to the Strategic Alignment questions until you have successfully called the tool to save these fields.
 
 ### Step 3: Strategic Alignment
@@ -1158,6 +1173,7 @@ You MUST ONLY collect and save these fields:
 
 You MUST NOT ask about or save any of these fields in Potential mode:
 - product_name
+- project_name
 - costing_data
 - customer_pn
 - revision_level
@@ -1171,6 +1187,7 @@ You MUST NOT ask about or save any of these fields in Potential mode:
 - target_price_eur
 - expected_delivery_conditions
 - expected_payment_terms
+- type_of_packaging
 - business_trigger
 - customer_tooling_conditions
 - entry_barriers
