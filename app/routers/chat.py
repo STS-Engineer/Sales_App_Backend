@@ -824,6 +824,76 @@ def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
     return text
 
 
+def _sanitize_chat_history(history: list[dict] | None) -> list[dict]:
+    raw_history = list(history or [])
+    valid_tc_ids = {
+        message.get("tool_call_id")
+        for message in raw_history
+        if isinstance(message, dict) and message.get("role") == "tool"
+    }
+
+    sanitized_history = []
+    for message in raw_history:
+        if not isinstance(message, dict):
+            continue
+
+        next_message = dict(message)
+        content = next_message.get("content")
+
+        if (
+            next_message.get("role") == "assistant"
+            and isinstance(content, str)
+            and _is_crash_message(content)
+        ):
+            continue
+
+        if (
+            next_message.get("role") == "assistant"
+            and isinstance(content, str)
+            and _is_internal_tool_payload_text(content)
+        ):
+            continue
+
+        tool_calls = next_message.get("tool_calls")
+        if next_message.get("role") == "assistant" and tool_calls:
+            filtered_tool_calls = [
+                tool_call
+                for tool_call in list(tool_calls)
+                if tool_call.get("id") in valid_tc_ids
+            ]
+            if filtered_tool_calls:
+                next_message["tool_calls"] = filtered_tool_calls
+            else:
+                next_message.pop("tool_calls", None)
+                if not next_message.get("content"):
+                    continue
+
+        sanitized_history.append(next_message)
+
+    return sanitized_history
+
+
+def _map_visible_chat_entries(history: list[dict]) -> list[dict]:
+    visible_entries = []
+    for raw_index, entry in enumerate(history):
+        role = entry.get("role")
+        content = entry.get("content")
+        if role not in {"assistant", "user"}:
+            continue
+        if role == "assistant" and entry.get("tool_calls"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        visible_entries.append(
+            {
+                "raw_index": raw_index,
+                "role": role,
+                "content": content,
+            }
+        )
+    return visible_entries
+
+
 async def _execute_tool_calls(
     *,
     tool_calls: list[dict],
@@ -1097,6 +1167,13 @@ class ChatRequest(BaseModel):
     rfq_id: str
     message: str
     chat_mode: str = "rfq"
+
+
+class ChatEditRequest(BaseModel):
+    rfq_id: str
+    visible_message_index: int
+    message: str
+
 
 class ChatResponse(BaseModel):
     response: str
@@ -1457,6 +1534,53 @@ TOOLS = [
 
 ALLOWED_TOOL_NAMES = {tool["function"]["name"] for tool in TOOLS}
 
+@router.post("/edit", response_model=ChatResponse)
+async def edit_chat_message(
+    req: ChatEditRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Rfq).where(Rfq.rfq_id == req.rfq_id))
+    rfq = result.scalar_one_or_none()
+
+    if not rfq:
+        raise HTTPException(status_code=404, detail="RFQ not found")
+
+    if rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.POTENTIAL:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only formal RFQ chat messages can be edited from this view."
+            ),
+        )
+
+    edited_message = str(req.message or "").strip()
+    if not edited_message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    if req.visible_message_index < 0:
+        raise HTTPException(status_code=400, detail="Invalid chat message index.")
+
+    sanitized_history = _sanitize_chat_history(rfq.chat_history or [])
+    visible_history = _map_visible_chat_entries(sanitized_history)
+
+    if req.visible_message_index >= len(visible_history):
+        raise HTTPException(status_code=404, detail="Chat message not found.")
+
+    target_entry = visible_history[req.visible_message_index]
+    if target_entry["role"] != "user":
+        raise HTTPException(status_code=400, detail="Only user messages can be edited.")
+
+    rfq.chat_history = list(sanitized_history[: target_entry["raw_index"]])
+    await db.flush()
+
+    return await handle_chat(
+        ChatRequest(rfq_id=req.rfq_id, message=edited_message, chat_mode="rfq"),
+        db=db,
+        current_user=current_user,
+    )
+
+
 @router.post("", response_model=ChatResponse)
 async def handle_chat(
     req: ChatRequest,
@@ -1465,7 +1589,7 @@ async def handle_chat(
 ):
     result = await db.execute(select(Rfq).where(Rfq.rfq_id == req.rfq_id))
     rfq = result.scalar_one_or_none()
-    
+
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
 
@@ -1492,40 +1616,8 @@ async def handle_chat(
         history = list(extracted_data.get("potential_chat_history") or [])
     else:
         history = list(rfq.chat_history or [])
-    
-    # Self-Healing: Scrub orphaned tool_calls and error logs from history
-    valid_tc_ids = {m.get("tool_call_id") for m in history if m.get("role") == "tool"}
-    
-    sanitized_history = []
-    for msg in history:
-        # Remove crash errors
-        if (
-            msg.get("role") == "assistant"
-            and isinstance(msg.get("content"), str)
-            and _is_crash_message(msg.get("content"))
-        ):
-            continue
-        if (
-            msg.get("role") == "assistant"
-            and isinstance(msg.get("content"), str)
-            and _is_internal_tool_payload_text(msg.get("content"))
-        ):
-            continue
-            
-        # If it's an assistant message with tool calls, filter out the ones without valid tool responses
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            # Create a mutable copy of the tool_calls list
-            msg_tool_calls = list(msg["tool_calls"]) 
-            msg["tool_calls"] = [tc for tc in msg_tool_calls if tc.get("id") in valid_tc_ids]
-            if not msg["tool_calls"]:
-                del msg["tool_calls"]
-                # If it has no content and no tool calls, drop it entirely
-                if not msg.get("content"):
-                    continue
-                    
-        sanitized_history.append(msg)
-        
-    history = sanitized_history
+
+    history = _sanitize_chat_history(history)
 
     if not history:
         initial_greeting = (

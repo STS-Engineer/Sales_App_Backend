@@ -322,10 +322,11 @@ async def _upload_costing_action_file(
     rfq_id: str,
     file: UploadFile,
     current_user_email: str,
+    folder_name: str = "costing",
 ) -> dict[str, str]:
     safe_name = _safe_upload_filename(file.filename)
     file_id = str(uuid.uuid4())
-    blob_name = f"{rfq_id}/costing/{file_id}-{safe_name}"
+    blob_name = f"{rfq_id}/{folder_name}/{file_id}-{safe_name}"
 
     try:
         await file.seek(0)
@@ -1371,6 +1372,68 @@ async def submit_costing_file_action(
         db,
         rfq_id,
         f"{action_label}: {trimmed_note}",
+        current_user.email,
+    )
+    await db.commit()
+    return await _get_rfq_or_404(db, rfq_id)
+
+
+@router.post("/{rfq_id}/pricing-bom", response_model=RfqOut)
+async def upload_pricing_bom_file(
+    rfq_id: str,
+    note: str = Form(...),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if rfq.phase != RfqPhase.COSTING or rfq.sub_status not in {
+        RfqSubStatus.FEASIBILITY,
+        RfqSubStatus.PRICING,
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Pricing BOM uploads are only allowed during COSTING/FEASIBILITY "
+                "or COSTING/PRICING. "
+                f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
+            ),
+        )
+
+    if not _costing_file_state_allows_progression(rfq):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Complete the feasibility handoff first by uploading the feasibility "
+                "file or marking it as not applicable."
+            ),
+        )
+
+    trimmed_note = str(note or "").strip()
+    if not trimmed_note:
+        raise HTTPException(status_code=400, detail="note is required.")
+
+    file_meta = await _upload_costing_action_file(
+        rfq_id=rfq_id,
+        file=file,
+        current_user_email=current_user.email,
+        folder_name="pricing",
+    )
+
+    rfq_data = dict(rfq.rfq_data or {})
+    rfq_data["pricing_bom_upload"] = {
+        "note": trimmed_note,
+        "uploaded_by": current_user.email,
+        "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "file": file_meta,
+    }
+    rfq.rfq_data = rfq_data
+
+    await log_action(
+        db,
+        rfq_id,
+        f"Pricing BOM file uploaded: {trimmed_note}",
         current_user.email,
     )
     await db.commit()
