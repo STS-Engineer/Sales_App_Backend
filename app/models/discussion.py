@@ -39,6 +39,7 @@ class DiscussionMessage(Base):
         nullable=False,
     )
     message: Mapped[str] = mapped_column(Text, nullable=False)
+    recipient_email: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

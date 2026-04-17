@@ -18,8 +18,10 @@ class RfqOut(BaseModel):
     rfq_data: dict[str, Any] | None
     chat_history: list[dict[str, Any]] | None
     costing_files: list[dict[str, Any]] | None
+    costing_file_state: dict[str, Any] | None
     potential: PotentialOut | None = None
     rejection_reason: str | None
+    revision_notes: str | None
     autopsy_notes: str | None
     approved_at: datetime | None
     rejected_at: datetime | None
@@ -90,6 +92,10 @@ class ValidateRfqRequest(BaseModel):
         if not self.approved and not self.rejection_reason:
             raise ValueError("rejection_reason is required when approved=False")
         return self
+
+
+class RequestRevisionRequest(BaseModel):
+    comment: str
 
 
 class CostingReviewRequest(BaseModel):

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import httpx
 
 from fastapi import APIRouter, Depends, HTTPException
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +22,12 @@ from app.services.potential import POTENTIAL_ALLOWED_FIELDS, update_potential_fi
 
 router = APIRouter(prefix="/api/chat/potential", tags=["chat"])
 
-client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY or "dummy_key")
+OPENAI_TIMEOUT_SECONDS = 180.0
+
+client = AsyncOpenAI(
+    api_key=settings.OPENAI_API_KEY or "dummy_key",
+    http_client=httpx.AsyncClient(timeout=httpx.Timeout(OPENAI_TIMEOUT_SECONDS)),
+)
 
 POTENTIAL_INITIAL_GREETING = (
     "Hello, I'm your potential opportunity assistant. "
@@ -499,6 +505,13 @@ Current Potential database state:
                 "I've saved the latest Potential details. "
                 "Please continue with the next missing information."
             )
+        _append_assistant_text_if_new(history, final_text)
+    except (httpx.TimeoutException, APITimeoutError):
+        final_text = (
+            "**System error**\n\n"
+            "- The Potential assistant took too long to respond.\n"
+            "- Please try again in a moment."
+        )
         _append_assistant_text_if_new(history, final_text)
     except Exception as exc:
         final_text = (

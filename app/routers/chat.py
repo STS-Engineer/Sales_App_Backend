@@ -3,7 +3,7 @@ import datetime
 import re
 import unicodedata
 import httpx
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -22,8 +22,14 @@ from app.models.validation_matrix import ValidationMatrix
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
+OPENAI_TIMEOUT_SECONDS = 180.0
+INTERNAL_TOOL_TIMEOUT_SECONDS = 90.0
+
 # Async OpenAI client
-client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY or "dummy_key")
+client = AsyncOpenAI(
+    api_key=settings.OPENAI_API_KEY or "dummy_key",
+    http_client=httpx.AsyncClient(timeout=httpx.Timeout(OPENAI_TIMEOUT_SECONDS)),
+)
 
 BASE_URL = "https://rfq-api.azurewebsites.net"
 INITIAL_GREETING = (
@@ -54,6 +60,10 @@ ENGLISH_INITIAL_GREETING = (
     "How would you like to proceed?\n"
     "1. Guide me step by step\n"
     "2. I will provide a whole paragraph"
+)
+SELF_REVISION_REQUEST_COMMENT = "Self-update initiated by assigned validator."
+SELF_REVISION_GREETING = (
+    "Welcome back! Please tell me what fields you would like to update."
 )
 ENGLISH_ONLY_RULE = (
     "CRITICAL RULE: The conversation MUST be strictly in English. Whenever you give "
@@ -380,6 +390,77 @@ def _normalize_chat_mode(rfq: Rfq, requested_mode: str) -> str:
     return "rfq"
 
 
+def _is_revision_requested(rfq: Rfq) -> bool:
+    return (
+        rfq.phase == RfqPhase.RFQ
+        and rfq.sub_status == RfqSubStatus.REVISION_REQUESTED
+    )
+
+
+def _is_self_revision_note(revision_notes: str | None) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(revision_notes or "").casefold()).strip()
+    return normalized == "self update initiated by assigned validator"
+
+
+def _build_revision_greeting(revision_notes: str | None) -> str:
+    notes = str(revision_notes or "").strip()
+    if _is_self_revision_note(notes) or not notes:
+        return SELF_REVISION_GREETING
+    return (
+        "The validator has requested the following updates: "
+        f"{notes}. What would you like me to change?"
+    )
+
+
+def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
+    revision_notes = str(rfq.revision_notes or "").strip()
+    if not _is_revision_requested(rfq):
+        return (
+            "REVISION MODE CONTEXT:\n"
+            "- The RFQ is not in revision mode.\n"
+            "- Follow the normal RFQ workflow rules.\n"
+        )
+
+    if _is_self_revision_note(revision_notes):
+        return f"""REVISION MODE CONTEXT:
+- The RFQ sub_status is REVISION_REQUESTED.
+- revision_notes: {json.dumps(revision_notes)}
+- The RFQ is in Revision Mode and remains fully editable through updateFormFields.
+- DO NOT say that updates are limited to NEW_RFQ. REVISION_REQUESTED is also a valid editable RFQ state.
+- The user may update fields that are already populated. Treat the revision request as permission to overwrite existing values.
+- Self-update rule: greet the user with exactly "{SELF_REVISION_GREETING}"
+- Do NOT mention the validator in this self-update flow.
+- When the RFQ is in REVISION_REQUESTED, you are ONLY responsible for updating requested fields.
+- DO NOT call submitValidation or any other tool that changes RFQ status.
+- When the user says the updates are complete, instruct them to click the physical "Submit Updates" button at the top of their screen to send the RFQ back to the validator.
+"""
+
+    if revision_notes:
+        return f"""REVISION MODE CONTEXT:
+- The RFQ sub_status is REVISION_REQUESTED.
+- revision_notes: {json.dumps(revision_notes)}
+- The RFQ is in Revision Mode and remains fully editable through updateFormFields.
+- DO NOT say that updates are limited to NEW_RFQ. REVISION_REQUESTED is also a valid editable RFQ state.
+- The user may update fields that are already populated. Treat the validator feedback as permission to overwrite existing values.
+- External revision rule: summarize the validator feedback and greet the user with exactly "{_build_revision_greeting(revision_notes)}"
+- You must guide the user based on the validator feedback above, even when the referenced fields are already populated in the database state.
+- When the RFQ is in REVISION_REQUESTED, you are ONLY responsible for updating requested fields.
+- DO NOT call submitValidation or any other tool that changes RFQ status.
+- When the user says the updates are complete, instruct them to click the physical "Submit Updates" button at the top of their screen to send the RFQ back to the validator.
+"""
+
+    return f"""REVISION MODE CONTEXT:
+- The RFQ sub_status is REVISION_REQUESTED.
+- revision_notes: {json.dumps(revision_notes)}
+- The RFQ is in Revision Mode and remains fully editable through updateFormFields.
+- DO NOT say that updates are limited to NEW_RFQ. REVISION_REQUESTED is also a valid editable RFQ state.
+- Greet the user with exactly "{SELF_REVISION_GREETING}"
+- When the RFQ is in REVISION_REQUESTED, you are ONLY responsible for updating requested fields.
+- DO NOT call submitValidation or any other tool that changes RFQ status.
+- When the user says the updates are complete, instruct them to click the physical "Submit Updates" button at the top of their screen to send the RFQ back to the validator.
+"""
+
+
 def _is_field_filled(data: dict, field_name: str) -> bool:
     if field_name == "rfq_files":
         value = (
@@ -571,10 +652,15 @@ def _normalize_tool_calls(tool_calls) -> list[dict]:
     return normalized_calls
 
 
-def _extract_tool_calls_from_text(content: str) -> list[dict]:
+def _extract_tool_calls_from_text(
+    content: str,
+    allowed_tool_names: set[str] | None = None,
+) -> list[dict]:
     parsed_payload = _try_load_json_payload(content)
     if parsed_payload is None:
         return []
+
+    allowed_names = allowed_tool_names or ALLOWED_TOOL_NAMES
 
     if isinstance(parsed_payload, dict) and "tool_calls" in parsed_payload:
         raw_calls = parsed_payload.get("tool_calls") or []
@@ -601,7 +687,7 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
         if not func_name and isinstance(item.get("function"), dict):
             func_name = item["function"].get("name")
 
-        if func_name not in ALLOWED_TOOL_NAMES:
+        if func_name not in allowed_names:
             continue
 
         raw_arguments = (
@@ -652,6 +738,16 @@ def _payload_contains_internal_tool_markers(payload) -> bool:
     if isinstance(payload, list):
         return any(_payload_contains_internal_tool_markers(item) for item in payload)
     return False
+
+
+def _get_available_tools(rfq: Rfq) -> list[dict]:
+    if _is_revision_requested(rfq):
+        return [
+            tool
+            for tool in TOOLS
+            if tool["function"]["name"] != "submitValidation"
+        ]
+    return TOOLS
 
 
 def _is_internal_tool_payload_text(content: str) -> bool:
@@ -853,6 +949,28 @@ async def _execute_tool_calls(
                 tool_response_text = json.dumps({"error": str(e)})
 
         elif func_name == "submitValidation":
+            if _is_revision_requested(rfq):
+                tool_response_text = json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "submitValidation is not available while the RFQ is in "
+                            "REVISION_REQUESTED. Update the requested fields only, then ask "
+                            "the user to click the physical 'Submit Updates' button at the "
+                            "top of the screen."
+                        ),
+                        "status_code": 409,
+                    }
+                )
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": func_name,
+                        "content": tool_response_text,
+                    }
+                )
+                continue
             try:
                 saved_data = _normalize_rfq_data_fields(rfq.rfq_data)
                 validator_email = str(saved_data.get("zone_manager_email") or rfq.zone_manager_email or "").strip()
@@ -994,6 +1112,10 @@ DO NOT generate a text response confirming or denying the customer until you hav
 
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information (e.g., Application, chosen Product Name, Contact Info, Target Price, Quantities, Dates, etc.), you MUST immediately call the 'updateFormFields' tool to save that specific data point to the database. You can call 'updateFormFields' at the exact same time as you ask your next question. If you fail to call 'updateFormFields', the UI will break.
 USER-FACING TERMINOLOGY RULE: When speaking to the user, you MUST always say 'Validator' and NEVER say 'Zone Manager'. This terminology rule applies to every user-facing sentence, confirmation, and question.
+DATE FORMAT RULE: When updating date fields, you must output the strict YYYY-MM-DD format. If the user only provides a month and year (for example, "June 2025"), default to the 1st of the month (for example, "2025-06-01"). This applies to po_date, ppap_date, rfq_reception_date, and quotation_expected_date.
+NUMBERED OPTION FORMATTING RULE: When asking the user a question with multiple choices, you MUST NEVER number the question itself. You must ask the question on a new line, and then start the numbered list of choices starting at number 1. (Example: "Shall I submit this now?\n1. Yes\n2. No")
+NUMBERED OPTION PARSING RULE: When you provide a numbered list of options and the user replies with a single number, you MUST internally substitute that number with the exact text of the corresponding option before taking any further action or making tool calls. Never treat numeric replies as generic booleans.
+NUMERIC EXTRACTION RULE: When extracting numerical values (like volumes, prices, or quantities) from user text that contain spaces or commas (for example, "500 000" or "500,000"), you MUST remove all spaces and commas and output the continuous number in your tool calls. Preserve decimals for pricing fields when they are present.
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
@@ -1092,7 +1214,7 @@ You must strictly follow this exact sequential checklist to collect data. Do not
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save both `product_name` and the authorized `product_line_acronym` with `updateFormFields` to lock them in.
 6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
 7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-8. Ask only for the remaining missing Step 1 fields among P/N, Revision level, Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be saved as free text exactly as provided by the user. Extract them using `updateFormFields`.
+8. Ask only for the remaining missing Step 1 fields among P/N, Revision level, Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be normalized before saving by removing embedded spaces and commas (for example, "500 000" becomes "500000"). Extract it using `updateFormFields`.
 
 STEP 1 VALIDATION RULE:
 Before moving to Step 2 (Commercial Expectations), you MUST verify Step 1 completeness using the CURRENT RFQ DATABASE STATE and the dynamically injected MISSING_FIELDS_PROMPT.
@@ -1141,12 +1263,12 @@ CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormF
 ### Step 4: Final Calculation & Routing
 CRITICAL STEP 4 RULES:
 1. Look at the missing fields list. If `to_total` or `zone_manager_email` are missing, DO NOT ask the user for them.
-2. You MUST autonomously calculate the TO Total using the formula: (target_price_eur * pure_number_of_annual_volume) / 1000. CRITICAL MATH RULE: `annual_volume` is stored as text, so you must first strip all text, spaces, and commas from `annual_volume` to convert it to a pure number.
+2. You MUST autonomously calculate the TO Total using the formula: (target_price_eur * pure_number_of_annual_volume) / 1000. CRITICAL MATH RULE: `annual_volume` must follow the same normalization rule above, so strip spaces and commas from `annual_volume` to convert it to a pure number before calculating.
 3. Once calculated, you MUST autonomously use the `retrieveZoneManager` tool to query the validation matrix and retrieve the Validator Email and Validator Role.
 4. You MUST call `updateFormFields` to save these AI-generated values to the database, including `to_total`, `zone_manager_email`, and `validator_role`.
-5. ONLY AFTER the missing fields state shows that `to_total` and `zone_manager_email` are no longer missing, you will ask the user exactly this question in English: 'The Validator assigned to this RFQ is [Email]. Shall I submit this RFQ for validation?'
+5. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the RFQ for validation.
 6. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-7. If the user confirms (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
+7. If the user confirms the single submission question at the end of your Step 4 response (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
 8. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the validation workflow has started.
 """
 
@@ -1276,7 +1398,8 @@ TOOLS = [
             "description": (
                 "Submits the RFQ for validation, transitions it to PENDING_FOR_VALIDATION, "
                 "and sends the notification email to the assigned Validator when needed. Call "
-                "this only after the user explicitly confirms submission."
+                "this only after the user explicitly confirms submission, and never use it "
+                "while the RFQ is in REVISION_REQUESTED."
             ),
             "parameters": {
                 "type": "object",
@@ -1312,7 +1435,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "updateFormFields",
-            "description": "Extracts and updates general form fields from user conversation into the database.",
+            "description": (
+                "Extracts and updates general form fields from user conversation into the "
+                "database. This tool is allowed during normal RFQ drafting and also when the "
+                "RFQ sub_status is REVISION_REQUESTED."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1401,7 +1528,12 @@ async def handle_chat(
     history = sanitized_history
 
     if not history:
-        history.append({"role": "assistant", "content": ENGLISH_INITIAL_GREETING})
+        initial_greeting = (
+            _build_revision_greeting(rfq.revision_notes)
+            if _is_revision_requested(rfq)
+            else ENGLISH_INITIAL_GREETING
+        )
+        history.append({"role": "assistant", "content": initial_greeting})
 
     # We append the user's message to the DB array
     history.append({"role": "user", "content": req.message})
@@ -1422,14 +1554,20 @@ async def handle_chat(
     current_rfq_state.pop("potential_chat_history", None)
     current_rfq_state["phase"] = rfq.phase.value
     current_rfq_state["sub_status"] = rfq.sub_status.value
+    current_rfq_state["revision_notes"] = rfq.revision_notes
     base_system_prompt = POTENTIAL_SYSTEM_PROMPT if chat_mode == "potential" else SYSTEM_PROMPT
     missing_fields_prompt = _build_missing_fields_prompt(chat_mode, current_rfq_state)
+    revision_mode_prompt = _build_revision_mode_prompt_context(rfq)
+    available_tools = _get_available_tools(rfq)
 
     # Create a dynamic system message containing the database state
     DYNAMIC_SYSTEM_PROMPT = f"""{base_system_prompt}
 
 === MISSING_FIELDS_PROMPT ===
 {missing_fields_prompt}
+
+=== REVISION_MODE_CONTEXT ===
+{revision_mode_prompt}
 
 === CURRENT RFQ DATABASE STATE ===
 Review this JSON to know exactly what has already been collected:
@@ -1450,6 +1588,9 @@ CRITICAL INSTRUCTION:
 12. Combine missing-fields guidance into ONE single concise message. Do not repeat the same section header or send two separate text blocks for the same turn.
 13. NEVER type raw JSON, `tooluses`, or function-call payloads in your visible response. Use native tool calling only.
 14. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
+15. If the RFQ sub_status is REVISION_REQUESTED, treat it as an editable RFQ revision workflow. Do NOT claim the user must return to NEW_RFQ before updates can be saved.
+16. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
+17. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen.
 """
 
     # Prep messages for OpenAI
@@ -1468,7 +1609,7 @@ CRITICAL INSTRUCTION:
         completion = await client.chat.completions.create(
             model="gpt-5.2",
             messages=messages_for_llm,
-            tools=TOOLS,
+            tools=available_tools,
             tool_choice="auto",
             temperature=0.2,
         )
@@ -1482,7 +1623,8 @@ CRITICAL INSTRUCTION:
             )
         else:
             normalized_tool_calls = _extract_tool_calls_from_text(
-                ai_message.content or ""
+                ai_message.content or "",
+                {tool["function"]["name"] for tool in available_tools},
             )
             if normalized_tool_calls:
                 assistant_tool_message = _build_tool_call_assistant_message(
@@ -1494,7 +1636,9 @@ CRITICAL INSTRUCTION:
             history.append(assistant_tool_message)
             messages_for_llm.append(assistant_tool_message)
 
-            async with httpx.AsyncClient() as http_client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(INTERNAL_TOOL_TIMEOUT_SECONDS)
+            ) as http_client:
                 tool_messages, redirect_requested = await _execute_tool_calls(
                     tool_calls=normalized_tool_calls,
                     http_client=http_client,
@@ -1515,7 +1659,7 @@ CRITICAL INSTRUCTION:
             follow_up_completion = await client.chat.completions.create(
                 model="gpt-5.2",
                 messages=messages_for_llm,
-                tools=TOOLS,
+                tools=available_tools,
                 tool_choice="auto",
                 temperature=0.2,
             )
@@ -1524,7 +1668,8 @@ CRITICAL INSTRUCTION:
 
             if not follow_up_tool_calls:
                 follow_up_tool_calls = _extract_tool_calls_from_text(
-                    follow_up_message.content or ""
+                    follow_up_message.content or "",
+                    {tool["function"]["name"] for tool in available_tools},
                 )
 
             if follow_up_tool_calls:
@@ -1534,7 +1679,9 @@ CRITICAL INSTRUCTION:
                 history.append(synthetic_assistant_message)
                 messages_for_llm.append(synthetic_assistant_message)
 
-                async with httpx.AsyncClient() as http_client:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(INTERNAL_TOOL_TIMEOUT_SECONDS)
+                ) as http_client:
                     follow_up_tool_messages, redirect_requested = await _execute_tool_calls(
                         tool_calls=follow_up_tool_calls,
                         http_client=http_client,
@@ -1581,6 +1728,12 @@ CRITICAL INSTRUCTION:
                 )
             final_text = _append_assistant_text_if_new(history, final_text)
 
+    except (httpx.TimeoutException, APITimeoutError):
+        final_text = (
+            "**System error.**\n\n"
+            "- The assistant took too long to respond.\n"
+            "- Please try again in a moment.\n"
+        )
     except Exception as e:
         error_detail = str(e).strip() or e.__class__.__name__
         print(f"Chat router error: {e.__class__.__name__}: {error_detail}")

@@ -29,6 +29,7 @@ class RfqSubStatus(str, enum.Enum):
     POTENTIAL = "POTENTIAL"
     NEW_RFQ = "NEW_RFQ"
     PENDING_FOR_VALIDATION = "PENDING_FOR_VALIDATION"
+    REVISION_REQUESTED = "REVISION_REQUESTED"
     # COSTING phase
     FEASIBILITY = "FEASIBILITY"
     PRICING = "PRICING"
@@ -50,31 +51,38 @@ class RfqSubStatus(str, enum.Enum):
     PO_SECURED = "PO_SECURED"
 
 
+# ── Terminal sub-statuses that can occur in any phase ────────────────
+_TERMINAL_ANYWHERE: set[RfqSubStatus] = {
+    RfqSubStatus.LOST,
+    RfqSubStatus.CANCELED,
+}
+
 # ── Valid (phase, sub_status) pairs ──────────────────────────────────
 VALID_PHASE_SUBSTATUS: dict[RfqPhase, set[RfqSubStatus]] = {
     RfqPhase.RFQ: {
         RfqSubStatus.POTENTIAL,
         RfqSubStatus.NEW_RFQ,
         RfqSubStatus.PENDING_FOR_VALIDATION,
-    },
+        RfqSubStatus.REVISION_REQUESTED,
+    } | _TERMINAL_ANYWHERE,
     RfqPhase.COSTING: {
         RfqSubStatus.FEASIBILITY,
         RfqSubStatus.PRICING,
-    },
+    } | _TERMINAL_ANYWHERE,
     RfqPhase.OFFER: {
         RfqSubStatus.PREPARATION,
         RfqSubStatus.VALIDATION,
-    },
+    } | _TERMINAL_ANYWHERE,
     RfqPhase.PO: {
         RfqSubStatus.GET_PO,
         RfqSubStatus.PO_ACCEPTED,
         RfqSubStatus.MISSION_ACCEPTED,
         RfqSubStatus.MISSION_NOT_ACCEPTED,
-    },
+    } | _TERMINAL_ANYWHERE,
     RfqPhase.PROTOTYPE: {
         RfqSubStatus.GET_PROTOTYPE,
         RfqSubStatus.PROTOTYPE_ONGOING,
-    },
+    } | _TERMINAL_ANYWHERE,
     RfqPhase.CLOSED: {
         RfqSubStatus.PO_SECURED,
         RfqSubStatus.LOST,
@@ -96,42 +104,46 @@ ALLOWED_TRANSITIONS: dict[
     # ── RFQ phase ────────────────────────────────────────────────────
     (RfqPhase.RFQ, RfqSubStatus.POTENTIAL): {
         (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ): {
         (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION): {
         (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),  # approved
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
+    },
+    (RfqPhase.RFQ, RfqSubStatus.REVISION_REQUESTED): {
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),
+        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     # ── COSTING phase ────────────────────────────────────────────────
     (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY): {
         (RfqPhase.COSTING, RfqSubStatus.PRICING),       # feasible
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.COSTING, RfqSubStatus.CANCELED),
     },
     (RfqPhase.COSTING, RfqSubStatus.PRICING): {
         (RfqPhase.OFFER, RfqSubStatus.PREPARATION),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.COSTING, RfqSubStatus.CANCELED),
     },
     # ── OFFER phase ──────────────────────────────────────────────────
     (RfqPhase.OFFER, RfqSubStatus.PREPARATION): {
         (RfqPhase.OFFER, RfqSubStatus.VALIDATION),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.OFFER, RfqSubStatus.LOST),
+        (RfqPhase.OFFER, RfqSubStatus.CANCELED),
     },
     (RfqPhase.OFFER, RfqSubStatus.VALIDATION): {
         (RfqPhase.PO, RfqSubStatus.GET_PO),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.OFFER, RfqSubStatus.LOST),
+        (RfqPhase.OFFER, RfqSubStatus.CANCELED),
     },
     # ── PO phase ─────────────────────────────────────────────────────
     (RfqPhase.PO, RfqSubStatus.GET_PO): {
         (RfqPhase.PO, RfqSubStatus.PO_ACCEPTED),
         (RfqPhase.PROTOTYPE, RfqSubStatus.GET_PROTOTYPE),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.PO, RfqSubStatus.LOST),
+        (RfqPhase.PO, RfqSubStatus.CANCELED),
     },
     (RfqPhase.PO, RfqSubStatus.PO_ACCEPTED): {
         (RfqPhase.PO, RfqSubStatus.MISSION_ACCEPTED),
@@ -142,20 +154,20 @@ ALLOWED_TRANSITIONS: dict[
     },
     # MISSION_NOT_ACCEPTED → auto-locks to LOST/CANCELED
     (RfqPhase.PO, RfqSubStatus.MISSION_NOT_ACCEPTED): {
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.PO, RfqSubStatus.LOST),
+        (RfqPhase.PO, RfqSubStatus.CANCELED),
     },
     # ── PROTOTYPE phase ──────────────────────────────────────────────
     (RfqPhase.PROTOTYPE, RfqSubStatus.GET_PROTOTYPE): {
         (RfqPhase.PROTOTYPE, RfqSubStatus.PROTOTYPE_ONGOING),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.PROTOTYPE, RfqSubStatus.LOST),
+        (RfqPhase.PROTOTYPE, RfqSubStatus.CANCELED),
     },
     (RfqPhase.PROTOTYPE, RfqSubStatus.PROTOTYPE_ONGOING): {
         (RfqPhase.PO, RfqSubStatus.PO_ACCEPTED),
         (RfqPhase.CLOSED, RfqSubStatus.PO_SECURED),
-        (RfqPhase.CLOSED, RfqSubStatus.LOST),
-        (RfqPhase.CLOSED, RfqSubStatus.CANCELED),
+        (RfqPhase.PROTOTYPE, RfqSubStatus.LOST),
+        (RfqPhase.PROTOTYPE, RfqSubStatus.CANCELED),
     },
 }
 
@@ -200,6 +212,7 @@ class Rfq(Base):
     chat_history: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # Set only when sub_status = LOST / CANCELED
     rejection_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    revision_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     autopsy_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -211,6 +224,7 @@ class Rfq(Base):
     )
     # Files uploaded by the costing team
     costing_files: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    costing_file_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

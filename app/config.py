@@ -25,12 +25,19 @@ _DEFAULT_FRONTEND_ORIGINS = (
 
 class Settings(BaseSettings):
     DATABASE_URL: str
+    DATABASE_URL2: str | None = None
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     OPENAI_API_KEY: str | None = None
     FRONTEND_URL: str = "http://localhost:5173"
     FRONTEND_URLS: str | None = None
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int = 587
+    SMTP_USE_TLS: bool = False
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: str | None = None
+    FROM_EMAIL: str | None = None
     AZURE_CONNECTION_STRING: str | None = None
     AZURE_RFQ_FILES_CONTAINER: str = "rfq-files"
 
@@ -57,6 +64,30 @@ class Settings(BaseSettings):
         return normalized
 
     @property
+    def smtp_host(self) -> str:
+        return (self.SMTP_HOST or "").strip("\"' ")
+
+    @property
+    def smtp_port(self) -> int:
+        return int(self.SMTP_PORT or 587)
+
+    @property
+    def smtp_use_tls(self) -> bool:
+        return bool(self.SMTP_USE_TLS)
+
+    @property
+    def smtp_user(self) -> str:
+        return (self.SMTP_USER or "").strip("\"' ")
+
+    @property
+    def smtp_password(self) -> str:
+        return (self.SMTP_PASSWORD or "").strip("\"' ")
+
+    @property
+    def from_email(self) -> str:
+        return (self.FROM_EMAIL or "").strip("\"' ")
+
+    @property
     def azure_connection_string(self) -> str:
         return (self.AZURE_CONNECTION_STRING or "").strip("\"' ")
 
@@ -64,9 +95,11 @@ class Settings(BaseSettings):
     def azure_rfq_files_container(self) -> str:
         return (self.AZURE_RFQ_FILES_CONTAINER or "rfq-files").strip().lower()
 
-    @property
-    def async_db_url(self) -> URL:
-        raw = self.DATABASE_URL.strip("\"'")
+    @staticmethod
+    def _build_async_db_url(raw_url: str | None) -> URL | None:
+        raw = str(raw_url or "").strip("\"' ")
+        if not raw:
+            return None
         parsed = urlparse(raw)
         return URL.create(
             drivername="postgresql+asyncpg",
@@ -76,6 +109,17 @@ class Settings(BaseSettings):
             port=parsed.port or 5432,
             database=(parsed.path or "").lstrip("/"),
         )
+
+    @property
+    def async_db_url(self) -> URL:
+        url = self._build_async_db_url(self.DATABASE_URL)
+        if url is None:
+            raise ValueError("DATABASE_URL is not configured.")
+        return url
+
+    @property
+    def async_db_url2(self) -> URL | None:
+        return self._build_async_db_url(self.DATABASE_URL2)
 
 
 settings = Settings()
