@@ -39,9 +39,9 @@ def test_normalize_tool_arguments_maps_retrieve_zone_manager_delivery_zone_alias
         {"toTotal": 500, "productLine": "BRU", "deliveryZone": "Europe"},
     )
 
-    assert normalized["to_total"] == 500
     assert normalized["product_line_acronym"] == "BRU"
     assert normalized["delivery_zone"] == "Europe"
+    assert "to_total" not in normalized
 
 
 @pytest.mark.asyncio
@@ -137,14 +137,17 @@ def _build_matrix():
 
 @pytest.mark.asyncio
 async def test_execute_tool_calls_returns_zone_manager_payload_with_canonical_zone():
-    extracted_data = {}
+    extracted_data = {
+        "annual_volume": "500000",
+        "target_price_eur": "1.25",
+        "to_total": "10",
+    }
     tool_messages, auto_redirect = await chat._execute_tool_calls(
         tool_calls=[
             {
                 "id": "zone-1",
                 "name": "retrieveZoneManager",
                 "arguments": {
-                    "to_total": 500,
                     "product_line_acronym": "BRU",
                     "delivery_zone": "America",
                 },
@@ -165,19 +168,23 @@ async def test_execute_tool_calls_returns_zone_manager_payload_with_canonical_zo
     assert payload["validator_role"] == "Zone Manager"
     assert payload["zone_manager_email"] == "dean.hayward@avocarbon.com"
     assert payload["delivery_zone"] == "amerique"
+    assert payload["to_total"] == 625.0
     assert extracted_data["delivery_zone"] == "amerique"
+    assert extracted_data["to_total"] == "625.0"
 
 
 @pytest.mark.asyncio
 async def test_execute_tool_calls_returns_error_for_unknown_zone_manager_zone():
-    extracted_data = {}
+    extracted_data = {
+        "annual_volume": "400000",
+        "target_price_eur": "1.25",
+    }
     tool_messages, _ = await chat._execute_tool_calls(
         tool_calls=[
             {
                 "id": "zone-2",
                 "name": "retrieveZoneManager",
                 "arguments": {
-                    "to_total": 500,
                     "product_line_acronym": "BRU",
                     "delivery_zone": "antarctica",
                 },
@@ -201,7 +208,37 @@ async def test_execute_tool_calls_returns_error_for_unknown_zone_manager_zone():
         "europe",
         "amerique",
     ]
-    assert extracted_data == {}
+    assert payload["to_total"] == 500.0
+    assert extracted_data["to_total"] == "500.0"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_calls_returns_error_when_turnover_inputs_are_missing():
+    extracted_data = {"target_price_eur": "1.25"}
+    tool_messages, _ = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "zone-3",
+                "name": "retrieveZoneManager",
+                "arguments": {
+                    "product_line_acronym": "BRU",
+                    "delivery_zone": "Europe",
+                },
+            }
+        ],
+        http_client=None,
+        db=_FakeDb(_build_matrix()),
+        rfq=SimpleNamespace(created_by_email="owner@example.com"),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert payload["error"] == "annual_volume must be saved before validator routing."
+    assert "to_total" not in extracted_data
 
 
 def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
@@ -209,6 +246,8 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Target Price and quoted currency" in chat.SYSTEM_PROMPT
     assert "MUST call `get_eur_exchange_rate`" in chat.SYSTEM_PROMPT
     assert "Ask the user to restate the Target Price directly in EUR" in chat.SYSTEM_PROMPT
+    assert "MUST NEVER calculate the TO Total yourself" in chat.SYSTEM_PROMPT
+    assert "return the calculated `to_total` to you" in chat.SYSTEM_PROMPT
     assert "exactly one of these 4 approved `delivery_zone` strings" in chat.SYSTEM_PROMPT
     assert "France -> europe, Mexico -> amerique, China -> asie est, India -> asie sud" in chat.SYSTEM_PROMPT
     assert "Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 4 approved strings" in chat.SYSTEM_PROMPT

@@ -594,11 +594,6 @@ def _normalize_tool_arguments(func_name: str, args: dict | None) -> dict:
             or normalized.get("email")
         )
     elif func_name == "retrieveZoneManager":
-        normalized["to_total"] = (
-            normalized.get("to_total")
-            or normalized.get("toTotal")
-            or normalized.get("to_total_keur")
-        )
         normalized["product_line_acronym"] = (
             normalized.get("product_line_acronym")
             or normalized.get("productLineAcronym")
@@ -991,8 +986,14 @@ async def _execute_tool_calls(
             )
 
         elif func_name == "retrieveZoneManager":
-            to_total_val = args.get("to_total")
-            acronym = args.get("product_line_acronym")
+            acronym = (
+                str(
+                    args.get("product_line_acronym")
+                    or extracted_data.get("product_line_acronym")
+                    or rfq.product_line_acronym
+                    or ""
+                ).strip()
+            )
             raw_delivery_zone = (
                 args.get("delivery_zone")
                 or extracted_data.get("delivery_zone")
@@ -1000,7 +1001,21 @@ async def _execute_tool_calls(
             )
 
             try:
-                to_total_float = _coerce_numeric_value(to_total_val)
+                annual_volume_value = extracted_data.get("annual_volume")
+                target_price_value = extracted_data.get("target_price_eur")
+                if annual_volume_value in (None, ""):
+                    raise ValueError(
+                        "annual_volume must be saved before validator routing."
+                    )
+                if target_price_value in (None, ""):
+                    raise ValueError(
+                        "target_price_eur must be saved before validator routing."
+                    )
+
+                volume = _coerce_numeric_value(annual_volume_value)
+                price = _coerce_numeric_value(target_price_value)
+                to_total_float = (volume * price) / 1000.0
+                extracted_data["to_total"] = str(to_total_float)
                 query = select(ValidationMatrix).where(
                     ValidationMatrix.acronym == acronym
                 )
@@ -1036,10 +1051,11 @@ async def _execute_tool_calls(
                             tool_response_text = json.dumps(
                                 {
                                     "error": (
-                                        f"Unknown delivery zone '{raw_delivery_zone}'. ",
-                                        "delivery_zone must be one of: asie est, ",
-                                        "asie sud, europe, amerique.",
+                                        f"Unknown delivery zone '{raw_delivery_zone}'. "
+                                        "delivery_zone must be one of: asie est, "
+                                        "asie sud, europe, amerique."
                                     ),
+                                    "to_total": to_total_float,
                                     "delivery_zone": raw_delivery_zone,
                                     "approved_delivery_zones": list(
                                         APPROVED_DELIVERY_ZONES
@@ -1068,12 +1084,14 @@ async def _execute_tool_calls(
                             "validator_role": required_role,
                             "validator_email": zone_manager_email,
                             "zone_manager_email": zone_manager_email,
+                            "to_total": to_total_float,
                             "delivery_zone": canonical_delivery_zone,
                         }
                     )
                 else:
                     tool_response_text = json.dumps(
                         {
+                            "to_total": to_total_float,
                             "error": (
                                 f"Product line '{acronym}' not found in validation matrix."
                             )
@@ -1413,11 +1431,11 @@ CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormF
 ### Step 4: Final Calculation & Routing
 CRITICAL STEP 4 RULES:
 1. Look at the missing fields list. If `to_total` or `zone_manager_email` are missing, DO NOT ask the user for them.
-2. Before calculating the TO Total or checking the validation matrix, if the user provided the Target Price in a non-EUR currency, you MUST call `get_eur_exchange_rate` to get the live EUR conversion rate, convert the target price into EUR, and save the converted EUR value into `target_price_eur` with `updateFormFields`.
-3. If `get_eur_exchange_rate` returns `fallback_used: true` for a non-EUR currency, do NOT finalize the TO calculation or validator routing. Ask the user to restate the Target Price directly in EUR, then wait for their answer.
-4. You MUST autonomously calculate the TO Total using the formula: (target_price_eur * pure_number_of_annual_volume) / 1000. CRITICAL MATH RULE: `annual_volume` must follow the same normalization rule above, so strip spaces and commas from `annual_volume` to convert it to a pure number before calculating. The final TO Total must remain in kEUR for validator routing.
-5. Once calculated, you MUST autonomously use the `retrieveZoneManager` tool with `to_total`, `product_line_acronym`, and the canonical `delivery_zone` to query the validation matrix and retrieve the Validator Email and Validator Role.
-6. You MUST call `updateFormFields` to save these AI-generated values to the database, including `to_total`, `zone_manager_email`, and `validator_role`.
+2. Before validator routing, if the user provided the Target Price in a non-EUR currency, you MUST call `get_eur_exchange_rate` to get the live EUR conversion rate, convert the target price into EUR, and save the converted EUR value into `target_price_eur` with `updateFormFields`.
+3. If `get_eur_exchange_rate` returns `fallback_used: true` for a non-EUR currency, do NOT finalize validator routing. Ask the user to restate the Target Price directly in EUR, then wait for their answer.
+4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate the strict kEUR turnover using the saved `annual_volume` and `target_price_eur`, perform the matrix routing, and return the calculated `to_total` to you.
+5. You MUST use the `retrieveZoneManager` tool with `product_line_acronym` and the canonical `delivery_zone` to query the validation matrix and retrieve the backend-calculated `to_total`, Validator Email, and Validator Role.
+6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `to_total`, `zone_manager_email`, and `validator_role`.
 7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the RFQ for validation.
 8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
 9. If the user confirms the single submission question at the end of your Step 4 response (for example: 'Yes', 'Submit', 'Go ahead'), you MUST call the `submitValidation` tool.
@@ -1549,18 +1567,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "retrieveZoneManager",
-            "description": "Queries the validation matrix in the database to find the correct Validator email based on the TO Total, Product Line, and canonical delivery zone.",
+            "description": "Queries the validation matrix in the database to find the correct Validator email. The backend calculates the strict kEUR TO Total from the saved annual volume and target price before routing.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "to_total": {"type": "number", "description": "The calculated TO Total in Keur."},
                     "product_line_acronym": {"type": "string", "description": "The acronym of the product line (e.g., ASS, BRU)."},
                     "delivery_zone": {
                         "type": "string",
                         "description": "The canonical delivery zone. It MUST be exactly one of: asie est, asie sud, europe, amerique."
                     }
                 },
-                "required": ["to_total", "product_line_acronym", "delivery_zone"]
+                "required": ["product_line_acronym", "delivery_zone"]
             }
         }
     },
