@@ -45,7 +45,6 @@ def test_rfq_step_3_includes_strategic_note_and_final_recommendation():
         "pays_for_development": "Customer",
         "capacity_available": "Yes",
         "scope": "In scope",
-        "customer_status": "Existing customer",
     }
 
     current_step, missing_fields = _get_current_step_and_missing_fields("rfq", rfq_state)
@@ -57,4 +56,5 @@ def test_rfq_step_3_includes_strategic_note_and_final_recommendation():
 
     assert "strategic_note" in prompt
     assert "final_recommendation" in prompt
+    assert "customer_status" not in prompt
     assert "Missing fields you must ASK THE USER for" in prompt

@@ -1,3 +1,3 @@
-from . import emails
+from . import currency, emails
 
-__all__ = ["emails"]
+__all__ = ["currency", "emails"]
