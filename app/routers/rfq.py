@@ -64,6 +64,7 @@ PRODUCT_LINE_MATRIX = {
 COSTING_FILE_STATUS_PENDING = "PENDING"
 COSTING_FILE_STATUS_UPLOADED = "UPLOADED"
 COSTING_FILE_STATUS_NA = "NA"
+PRICING_COSTING_FILE_ROLES = {"PRICING_BOM", "PRICING_FINAL_PRICE"}
 
 
 @lru_cache(maxsize=1)
@@ -267,6 +268,34 @@ def _default_costing_file_state() -> dict[str, str | None]:
     }
 
 
+def _build_costing_file_entry(
+    file_meta: dict[str, str] | None,
+    *,
+    file_role: str,
+    phase: RfqSubStatus,
+    note: str | None = None,
+) -> dict[str, str]:
+    entry = dict(file_meta or {})
+    entry["file_role"] = file_role
+    entry["phase"] = phase.value
+    if note is not None:
+        entry["note"] = note
+    return entry
+
+
+def _find_latest_costing_file_by_role(rfq: Rfq, file_role: str) -> dict | None:
+    target_role = str(file_role or "").strip().upper()
+    if not target_role:
+        return None
+
+    entries = [
+        entry
+        for entry in list(rfq.costing_files or [])
+        if str(entry.get("file_role") or "").strip().upper() == target_role
+    ]
+    return entries[-1] if entries else None
+
+
 def _effective_costing_file_state(rfq: Rfq) -> dict:
     state = dict(rfq.costing_file_state or {})
     status = str(state.get("file_status") or "").strip().upper()
@@ -277,7 +306,12 @@ def _effective_costing_file_state(rfq: Rfq) -> dict:
     }:
         return state
 
-    legacy_files = list(rfq.costing_files or [])
+    legacy_files = [
+        entry
+        for entry in list(rfq.costing_files or [])
+        if str(entry.get("file_role") or "").strip().upper()
+        not in PRICING_COSTING_FILE_ROLES
+    ]
     if legacy_files:
         latest_file = legacy_files[-1]
         return {
@@ -1357,7 +1391,14 @@ async def submit_costing_file_action(
             file=file,
             current_user_email=current_user.email,
         )
-        rfq.costing_files = list(rfq.costing_files or []) + [file_meta]
+        rfq.costing_files = list(rfq.costing_files or []) + [
+            _build_costing_file_entry(
+                file_meta,
+                file_role="FEASIBILITY",
+                phase=rfq.sub_status,
+                note=trimmed_note,
+            )
+        ]
 
     rfq.costing_file_state = {
         "file_status": normalized_action,
@@ -1420,20 +1461,85 @@ async def upload_pricing_bom_file(
         current_user_email=current_user.email,
         folder_name="pricing",
     )
+    costing_file_entry = _build_costing_file_entry(
+        file_meta,
+        file_role="PRICING_BOM",
+        phase=RfqSubStatus.PRICING,
+        note=trimmed_note,
+    )
 
     rfq_data = dict(rfq.rfq_data or {})
-    rfq_data["pricing_bom_upload"] = {
-        "note": trimmed_note,
-        "uploaded_by": current_user.email,
-        "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "file": file_meta,
-    }
+    rfq_data.pop("pricing_bom_upload", None)
     rfq.rfq_data = rfq_data
+    rfq.costing_files = list(rfq.costing_files or []) + [costing_file_entry]
 
     await log_action(
         db,
         rfq_id,
         f"Pricing BOM file uploaded: {trimmed_note}",
+        current_user.email,
+    )
+    await db.commit()
+    return await _get_rfq_or_404(db, rfq_id)
+
+
+@router.post("/{rfq_id}/pricing-final-price", response_model=RfqOut)
+async def upload_pricing_final_price_file(
+    rfq_id: str,
+    note: str = Form(...),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if rfq.phase != RfqPhase.COSTING or rfq.sub_status != RfqSubStatus.PRICING:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Final price uploads are only allowed during COSTING/PRICING. "
+                f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
+            ),
+        )
+
+    rfq_data = dict(rfq.rfq_data or {})
+    legacy_pricing_bom_upload = rfq_data.get("pricing_bom_upload")
+    has_pricing_bom_file = _find_latest_costing_file_by_role(rfq, "PRICING_BOM") is not None
+    if not has_pricing_bom_file and not (
+        isinstance(legacy_pricing_bom_upload, dict) and legacy_pricing_bom_upload.get("file")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Upload the costing file with BOM data before adding the final price file."
+            ),
+        )
+
+    trimmed_note = str(note or "").strip()
+    if not trimmed_note:
+        raise HTTPException(status_code=400, detail="note is required.")
+
+    file_meta = await _upload_costing_action_file(
+        rfq_id=rfq_id,
+        file=file,
+        current_user_email=current_user.email,
+        folder_name="pricing-final-price",
+    )
+    costing_file_entry = _build_costing_file_entry(
+        file_meta,
+        file_role="PRICING_FINAL_PRICE",
+        phase=RfqSubStatus.PRICING,
+        note=trimmed_note,
+    )
+
+    rfq_data.pop("pricing_final_price_upload", None)
+    rfq.rfq_data = rfq_data
+    rfq.costing_files = list(rfq.costing_files or []) + [costing_file_entry]
+
+    await log_action(
+        db,
+        rfq_id,
+        f"Pricing final price file uploaded: {trimmed_note}",
         current_user.email,
     )
     await db.commit()

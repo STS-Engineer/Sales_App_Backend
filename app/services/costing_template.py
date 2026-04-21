@@ -22,6 +22,7 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
             ("Application", ("application",)),
             ("Product name", ("product_name", "productName")),
             ("Product line", ("product_line_acronym", "productLine")),
+            ("Project name", ("project_name", "projectName")),
             ("Costing data", ("costing_data", "costingData")),
             ("Customer PN", ("customer_pn", "customerPn")),
             ("Revision level", ("revision_level", "revisionLevel")),
@@ -59,6 +60,7 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
                 ("expected_delivery_conditions", "expectedDeliveryConditions"),
             ),
             ("Expected payment terms", ("expected_payment_terms", "expectedPaymentTerms")),
+            ("Type of packaging", ("type_of_packaging", "typeOfPackaging")),
             ("Business trigger", ("business_trigger", "businessTrigger")),
             (
                 "Customer tooling conditions",
@@ -92,7 +94,6 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
                 ("capacity_available", "technical_capacity", "technicalCapacity"),
             ),
             ("Scope", ("scope",)),
-            ("Customer status", ("customer_status", "customerStatus")),
             ("Strategic note", ("strategic_note", "strategicNote")),
             (
                 "Final recommendation",

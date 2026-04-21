@@ -596,3 +596,143 @@ async def test_costing_messages_store_recipient_and_unify_costing_thread(
         )
     )
     assert stored.scalar_one().phase == RfqSubStatus.PRICING
+
+
+@pytest.mark.asyncio
+async def test_pricing_bom_upload_persists_file_in_costing_files(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="pricing-bom-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Pricing BOM Creator",
+    )
+    costing_user = await _create_user(
+        db_session,
+        prefix="pricing-bom-user",
+        role=UserRole.COSTING_TEAM,
+        full_name="Pricing BOM User",
+    )
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.PRICING,
+        costing_file_state={"file_status": "UPLOADED"},
+    )
+
+    async def _fake_upload_costing_action_file(
+        *, rfq_id, file, current_user_email, folder_name="costing"
+    ):
+        return {
+            "id": f"{rfq_id}-pricing-bom",
+            "filename": "pricing-bom.xlsx",
+            "name": "pricing-bom.xlsx",
+            "download_url": "https://example.com/pricing-bom.xlsx",
+            "url": "https://example.com/pricing-bom.xlsx",
+            "uploaded_by": current_user_email,
+            "uploaded_at": "2026-04-16T12:00:00+00:00",
+            "folder_name": folder_name,
+        }
+
+    monkeypatch.setattr(
+        rfq_router,
+        "_upload_costing_action_file",
+        _fake_upload_costing_action_file,
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/pricing-bom",
+        data={"note": "BOM package ready for pricing."},
+        files={"file": ("pricing-bom.xlsx", b"dummy-bytes", "application/vnd.ms-excel")},
+        headers=_headers_for(costing_user),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "pricing_bom_upload" not in (payload["rfq_data"] or {})
+    assert payload["costing_files"][-1]["filename"] == "pricing-bom.xlsx"
+    assert payload["costing_files"][-1]["file_role"] == "PRICING_BOM"
+    assert payload["costing_files"][-1]["phase"] == "PRICING"
+    assert payload["costing_files"][-1]["note"] == "BOM package ready for pricing."
+
+
+@pytest.mark.asyncio
+async def test_pricing_final_price_upload_requires_bom_and_persists_file(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="pricing-final-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Pricing Creator",
+    )
+    costing_user = await _create_user(
+        db_session,
+        prefix="pricing-final-user",
+        role=UserRole.COSTING_TEAM,
+        full_name="Pricing User",
+    )
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.PRICING,
+        costing_file_state={"file_status": "UPLOADED"},
+    )
+
+    rfq.costing_files = [
+        {
+            "id": f"{rfq.rfq_id}-bom",
+            "filename": "pricing-bom.xlsx",
+            "name": "pricing-bom.xlsx",
+            "url": "https://example.com/pricing-bom.xlsx",
+            "uploaded_by": costing_user.email,
+            "uploaded_at": "2026-04-16T12:00:00+00:00",
+            "file_role": "PRICING_BOM",
+            "phase": "PRICING",
+            "note": "BOM package uploaded",
+        }
+    ]
+    await db_session.commit()
+
+    async def _fake_upload_costing_action_file(
+        *, rfq_id, file, current_user_email, folder_name="costing"
+    ):
+        return {
+            "id": f"{rfq_id}-final-price",
+            "filename": "final-price.xlsx",
+            "name": "final-price.xlsx",
+            "download_url": "https://example.com/final-price.xlsx",
+            "url": "https://example.com/final-price.xlsx",
+            "uploaded_by": current_user_email,
+            "uploaded_at": "2026-04-16T13:00:00+00:00",
+            "folder_name": folder_name,
+        }
+
+    monkeypatch.setattr(
+        rfq_router,
+        "_upload_costing_action_file",
+        _fake_upload_costing_action_file,
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/pricing-final-price",
+        data={"note": "Final customer price validated."},
+        files={"file": ("final-price.xlsx", b"dummy-bytes", "application/vnd.ms-excel")},
+        headers=_headers_for(costing_user),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "pricing_final_price_upload" not in (payload["rfq_data"] or {})
+    assert payload["costing_files"][-1]["filename"] == "final-price.xlsx"
+    assert payload["costing_files"][-1]["file_role"] == "PRICING_FINAL_PRICE"
+    assert payload["costing_files"][-1]["phase"] == "PRICING"
+    assert payload["costing_files"][-1]["folder_name"] == "pricing-final-price"
+    assert payload["costing_files"][-1]["note"] == "Final customer price validated."
