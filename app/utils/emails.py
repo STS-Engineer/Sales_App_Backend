@@ -448,6 +448,163 @@ Please download the templates and open the RFQ here:
     return send_email(recipient_email, subject, text_body, html_body=html_body)
 
 
+def send_bom_ready_email(
+    costing_agent_email: str,
+    systematic_rfq_id: str,
+    rfq_link: str,
+) -> bool:
+    rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
+    rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    subject = f"BOM Data Ready For Pricing{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+The BOM data is ready for this RFQ. Please complete the final pricing.
+
+{rfq_id_line}Open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "BOM Data Ready For Pricing",
+        f"""
+          <p>Hello,</p>
+          <p>The BOM data is ready for this RFQ. Please complete the final pricing.</p>
+          <ul>
+            {rfq_id_html}
+          </ul>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+        """,
+    )
+    return send_email(costing_agent_email, subject, text_body, html_body=html_body)
+
+
+def send_pricing_ready_email(
+    plm_email: str,
+    systematic_rfq_id: str,
+    rfq_link: str,
+) -> bool:
+    rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
+    rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    subject = f"Pricing Ready For Validation{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+Pricing is complete for this RFQ. Please validate it.
+
+{rfq_id_line}Open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "Pricing Ready For Validation",
+        f"""
+          <p>Hello,</p>
+          <p>Pricing is complete for this RFQ. Please validate it.</p>
+          <ul>
+            {rfq_id_html}
+          </ul>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+        """,
+    )
+    return send_email(plm_email, subject, text_body, html_body=html_body)
+
+
+def send_costing_approved_email(
+    kam_email: str,
+    systematic_rfq_id: str,
+    rfq_link: str,
+) -> bool:
+    rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
+    rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    subject = f"Costing Approved{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+Costing is approved for this RFQ. You can now start offer preparation.
+
+{rfq_id_line}Open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "Costing Approved",
+        f"""
+          <p>Hello,</p>
+          <p>Costing is approved for this RFQ. You can now start offer preparation.</p>
+          <ul>
+            {rfq_id_html}
+          </ul>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+        """,
+    )
+    return send_email(kam_email, subject, text_body, html_body=html_body)
+
+
+def send_costing_rejected_email(
+    costing_agent_email: str,
+    kam_email: str,
+    systematic_rfq_id: str,
+    rfq_link: str,
+    rejection_reason: str,
+) -> bool:
+    rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
+    rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    normalized_reason = str(rejection_reason or "-").strip() or "-"
+    subject = f"Costing Rejected{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+Costing was rejected for this RFQ.
+
+{rfq_id_line}Rejection reason: {normalized_reason}
+
+Open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "Costing Rejected",
+        f"""
+          <p>Hello,</p>
+          <p>Costing was rejected for this RFQ.</p>
+          <ul>
+            {rfq_id_html}
+            <li><strong>Rejection reason:</strong> {normalized_reason}</li>
+          </ul>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+        """,
+    )
+
+    to_recipients = _normalize_email_list(costing_agent_email)
+    cc_recipients = _normalize_email_list(kam_email)
+
+    if not to_recipients and cc_recipients:
+        to_recipients = cc_recipients
+        cc_recipients = []
+    elif to_recipients and cc_recipients:
+        primary_lookup = {recipient.casefold() for recipient in to_recipients}
+        cc_recipients = [
+            recipient for recipient in cc_recipients if recipient.casefold() not in primary_lookup
+        ]
+
+    return send_email(
+        to_recipients,
+        subject,
+        text_body,
+        cc=cc_recipients or None,
+        html_body=html_body,
+    )
+
+
 def send_costing_message_email(
     recipient_email: str,
     systematic_rfq_id: str,

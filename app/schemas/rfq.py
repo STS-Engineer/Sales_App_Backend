@@ -110,6 +110,18 @@ class CostingReviewRequest(BaseModel):
         return self
 
 
+class CostingValidationRequest(BaseModel):
+    """Body for POST /api/rfq/{id}/costing_validation - Pricing approval step."""
+    is_approved: bool
+    rejection_reason: str | None = None
+
+    @model_validator(mode="after")
+    def rejection_required_if_rejected(self) -> "CostingValidationRequest":
+        if not self.is_approved and not self.rejection_reason:
+            raise ValueError("rejection_reason is required when is_approved=False")
+        return self
+
+
 class AdvanceStatusRequest(BaseModel):
     """Advance an RFQ through the state machine."""
     target_phase: RfqPhase

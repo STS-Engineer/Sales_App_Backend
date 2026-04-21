@@ -28,6 +28,7 @@ from app.schemas.discussion import (
 from app.schemas.rfq import (
     AdvanceStatusRequest,
     AuditLogOut,
+    CostingValidationRequest,
     AutopsyRequest,
     CostingReviewRequest,
     PhaseStatusUpdateRequest,
@@ -55,16 +56,65 @@ TERMINAL_SUBSTATUSES = {RfqSubStatus.LOST, RfqSubStatus.CANCELED}
 RFQ_FILES_CONTAINER = "rfq-files"
 COSTING_DISCUSSION_PHASES = {RfqSubStatus.FEASIBILITY, RfqSubStatus.PRICING}
 PRODUCT_LINE_MATRIX = {
-    "Chokes": {"email": "mohamedlaith.benmabrouk@avocarbon.com", "code": "CHO"},
-    "Brushes": {"email": "mohamedlaith.benmabrouk@avocarbon.com", "code": "BRU"},
-    "Seals": {"email": "mohamedlaith.benmabrouk@avocarbon.com", "code": "SEA"},
-    "Assembly": {"email": "mohamedlaith.benmabrouk@avocarbon.com", "code": "ASS"},
-    "Advanced material": {"email": "mohamedlaith.benmabrouk@avocarbon.com", "code": "ADM"},
+    "Chokes": {
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "code": "CHO",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
+    },
+    "Brushes": {
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "code": "BRU",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
+    },
+    "Seals": {
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "code": "SEA",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
+    },
+    "Assembly": {
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "code": "ASS",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
+    },
+    "Advanced material": {
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "code": "ADM",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
+    },
+    "Friction": {
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "code": "FRI",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
+    },
 }
 COSTING_FILE_STATUS_PENDING = "PENDING"
 COSTING_FILE_STATUS_UPLOADED = "UPLOADED"
 COSTING_FILE_STATUS_NA = "NA"
 PRICING_COSTING_FILE_ROLES = {"PRICING_BOM", "PRICING_FINAL_PRICE"}
+PRICING_WORKFLOW_STATE_WAITING_BOM = "WAITING_BOM"
+PRICING_WORKFLOW_STATE_BOM_UPLOADED = "BOM_UPLOADED"
+PRICING_WORKFLOW_STATE_PRICING_UPLOADED = "PRICING_UPLOADED"
+PRICING_WORKFLOW_STATE_APPROVED = "APPROVED"
+PRICING_WORKFLOW_STATE_REJECTED = "REJECTED"
+PRICING_WORKFLOW_STATES = {
+    PRICING_WORKFLOW_STATE_WAITING_BOM,
+    PRICING_WORKFLOW_STATE_BOM_UPLOADED,
+    PRICING_WORKFLOW_STATE_PRICING_UPLOADED,
+    PRICING_WORKFLOW_STATE_APPROVED,
+    PRICING_WORKFLOW_STATE_REJECTED,
+}
 
 
 @lru_cache(maxsize=1)
@@ -182,6 +232,7 @@ def _can_view_rfq(current_user: User, rfq: Rfq) -> bool:
     return (
         current_user.role == UserRole.OWNER
         or (current_user.role == UserRole.COSTING_TEAM and rfq.phase == RfqPhase.COSTING)
+        or (current_user.role == UserRole.PLM and _is_assigned_plm(current_user, rfq))
         or rfq.created_by_email == current_user.email
         or rfq.zone_manager_email == current_user.email
     )
@@ -228,6 +279,154 @@ def _normalize_email(value: str | None) -> str:
 
 def _normalize_product_line_key(value: str | None) -> str:
     return str(value or "").strip().casefold()
+
+
+def get_costing_agent_email(acronym: str) -> str | None:
+    normalized_acronym = str(acronym or "").strip().casefold()
+    if not normalized_acronym:
+        return None
+
+    for entry in PRODUCT_LINE_MATRIX.values():
+        entry_code = str(entry.get("code") or "").strip().casefold()
+        if entry_code == normalized_acronym:
+            return str(entry.get("costing_agent_email") or "").strip() or None
+
+    return None
+
+
+def get_plm_email(acronym: str) -> str | None:
+    normalized_acronym = str(acronym or "").strip().casefold()
+    if not normalized_acronym:
+        return None
+
+    for entry in PRODUCT_LINE_MATRIX.values():
+        entry_code = str(entry.get("code") or "").strip().casefold()
+        if entry_code == normalized_acronym:
+            return str(entry.get("plm_email") or "").strip() or None
+
+    return None
+
+
+def get_rnd_email(acronym: str) -> str | None:
+    normalized_acronym = str(acronym or "").strip().casefold()
+    if not normalized_acronym:
+        return None
+
+    for entry in PRODUCT_LINE_MATRIX.values():
+        entry_code = str(entry.get("code") or "").strip().casefold()
+        if entry_code == normalized_acronym:
+            return str(entry.get("rnd_email") or "").strip() or None
+
+    return None
+
+
+def _default_pricing_workflow_state() -> dict[str, object | None]:
+    return {
+        "workflow_state": PRICING_WORKFLOW_STATE_WAITING_BOM,
+        "bom_file": None,
+        "pricing_file": None,
+        "validation_by": None,
+        "validation_at": None,
+        "rejection_reason": None,
+    }
+
+
+def _normalize_pricing_workflow_state(value: str | None) -> str:
+    normalized_value = str(value or "").strip().upper()
+    if normalized_value in PRICING_WORKFLOW_STATES:
+        return normalized_value
+    return ""
+
+
+def _legacy_pricing_upload_from_rfq_data(rfq: Rfq, key: str) -> dict | None:
+    rfq_data = dict(rfq.rfq_data or {})
+    value = rfq_data.get(key)
+    return value if isinstance(value, dict) else None
+
+
+def _effective_pricing_workflow_state(rfq: Rfq) -> dict[str, object | None]:
+    state = dict(rfq.costing_file_state or {})
+    defaults = _default_pricing_workflow_state()
+    bom_file = state.get("bom_file")
+    pricing_file = state.get("pricing_file")
+
+    if not isinstance(bom_file, dict):
+        bom_file = _find_latest_costing_file_by_role(rfq, "PRICING_BOM")
+    if not isinstance(bom_file, dict):
+        bom_file = _legacy_pricing_upload_from_rfq_data(rfq, "pricing_bom_upload")
+
+    if not isinstance(pricing_file, dict):
+        pricing_file = _find_latest_costing_file_by_role(rfq, "PRICING_FINAL_PRICE")
+    if not isinstance(pricing_file, dict):
+        pricing_file = _legacy_pricing_upload_from_rfq_data(rfq, "pricing_final_price_upload")
+
+    workflow_state = _normalize_pricing_workflow_state(state.get("workflow_state"))
+    if not workflow_state:
+        if state.get("rejection_reason") and pricing_file:
+            workflow_state = PRICING_WORKFLOW_STATE_REJECTED
+        elif (
+            rfq.phase == RfqPhase.OFFER
+            and rfq.sub_status == RfqSubStatus.PREPARATION
+            and pricing_file
+        ):
+            workflow_state = PRICING_WORKFLOW_STATE_APPROVED
+        elif pricing_file:
+            workflow_state = PRICING_WORKFLOW_STATE_PRICING_UPLOADED
+        elif bom_file:
+            workflow_state = PRICING_WORKFLOW_STATE_BOM_UPLOADED
+        elif rfq.phase == RfqPhase.COSTING and rfq.sub_status == RfqSubStatus.PRICING:
+            workflow_state = PRICING_WORKFLOW_STATE_WAITING_BOM
+
+    return {
+        **defaults,
+        **{key: state.get(key) for key in defaults.keys() if key != "workflow_state"},
+        "workflow_state": workflow_state or None,
+        "bom_file": bom_file,
+        "pricing_file": pricing_file,
+    }
+
+
+def _set_pricing_workflow_state(rfq: Rfq, **updates: object | None) -> None:
+    next_state = dict(rfq.costing_file_state or {})
+    effective_state = _effective_pricing_workflow_state(rfq)
+    defaults = _default_pricing_workflow_state()
+
+    for key in defaults.keys():
+        next_state[key] = effective_state.get(key)
+
+    next_state.update(updates)
+    rfq.costing_file_state = next_state
+
+
+def _get_product_line_acronyms_for_email(contact_key: str, email: str | None) -> list[str]:
+    normalized_email = _normalize_email(email)
+    if not normalized_email:
+        return []
+
+    acronyms: list[str] = []
+    for entry in PRODUCT_LINE_MATRIX.values():
+        if _normalize_email(entry.get(contact_key)) != normalized_email:
+            continue
+        code = str(entry.get("code") or "").strip().upper()
+        if code:
+            acronyms.append(code)
+    return acronyms
+
+
+def _is_assigned_plm(current_user: User, rfq: Rfq) -> bool:
+    return _normalize_email(current_user.email) == _normalize_email(
+        get_plm_email(rfq.product_line_acronym or "")
+    )
+
+
+def _append_revision_note(existing_notes: str | None, prefix: str, detail: str | None) -> str:
+    note_line = f"{prefix}{str(detail or '').strip()}".strip()
+    current_notes = str(existing_notes or "").strip()
+    if not note_line:
+        return current_notes
+    if not current_notes:
+        return note_line
+    return f"{current_notes}\n{note_line}"
 
 
 def _resolve_product_line_route(rfq: Rfq) -> dict[str, str] | None:
@@ -833,12 +1032,18 @@ async def list_rfqs(
     query = _rfq_query().order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
 
     if current_user.role != UserRole.OWNER:
-        query = query.where(
-            or_(
-                Rfq.created_by_email == current_user.email,
-                Rfq.zone_manager_email == current_user.email,
+        visibility_filters = [
+            Rfq.created_by_email == current_user.email,
+            Rfq.zone_manager_email == current_user.email,
+        ]
+        if current_user.role == UserRole.PLM:
+            assigned_acronyms = _get_product_line_acronyms_for_email(
+                "plm_email", current_user.email
             )
-        )
+            if assigned_acronyms:
+                visibility_filters.append(Rfq.product_line_acronym.in_(assigned_acronyms))
+
+        query = query.where(or_(*visibility_filters))
 
     result = await db.execute(query)
     return result.scalars().all()
@@ -1429,25 +1634,21 @@ async def upload_pricing_bom_file(
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
 
-    if rfq.phase != RfqPhase.COSTING or rfq.sub_status not in {
-        RfqSubStatus.FEASIBILITY,
-        RfqSubStatus.PRICING,
-    }:
+    if rfq.phase != RfqPhase.COSTING or rfq.sub_status != RfqSubStatus.PRICING:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Pricing BOM uploads are only allowed during COSTING/FEASIBILITY "
-                "or COSTING/PRICING. "
+                "Pricing BOM uploads are only allowed during COSTING/PRICING. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
 
-    if not _costing_file_state_allows_progression(rfq):
+    pricing_workflow_state = _effective_pricing_workflow_state(rfq)
+    if pricing_workflow_state.get("workflow_state") != PRICING_WORKFLOW_STATE_WAITING_BOM:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Complete the feasibility handoff first by uploading the feasibility "
-                "file or marking it as not applicable."
+                "BOM upload is only allowed when the pricing workflow is waiting for BOM data."
             ),
         )
 
@@ -1472,6 +1673,15 @@ async def upload_pricing_bom_file(
     rfq_data.pop("pricing_bom_upload", None)
     rfq.rfq_data = rfq_data
     rfq.costing_files = list(rfq.costing_files or []) + [costing_file_entry]
+    _set_pricing_workflow_state(
+        rfq,
+        workflow_state=PRICING_WORKFLOW_STATE_BOM_UPLOADED,
+        bom_file=costing_file_entry,
+        pricing_file=None,
+        validation_by=None,
+        validation_at=None,
+        rejection_reason=None,
+    )
 
     await log_action(
         db,
@@ -1480,7 +1690,14 @@ async def upload_pricing_bom_file(
         current_user.email,
     )
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
+    refreshed_data = dict(refreshed_rfq.rfq_data or {})
+    emails.send_bom_ready_email(
+        get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or "",
+        str(refreshed_data.get("systematic_rfq_id") or ""),
+        _build_rfq_link(refreshed_rfq.rfq_id),
+    )
+    return refreshed_rfq
 
 
 @router.post("/{rfq_id}/pricing-final-price", response_model=RfqOut)
@@ -1502,12 +1719,21 @@ async def upload_pricing_final_price_file(
             ),
         )
 
-    rfq_data = dict(rfq.rfq_data or {})
-    legacy_pricing_bom_upload = rfq_data.get("pricing_bom_upload")
-    has_pricing_bom_file = _find_latest_costing_file_by_role(rfq, "PRICING_BOM") is not None
-    if not has_pricing_bom_file and not (
-        isinstance(legacy_pricing_bom_upload, dict) and legacy_pricing_bom_upload.get("file")
-    ):
+    pricing_workflow_state = _effective_pricing_workflow_state(rfq)
+    workflow_state = pricing_workflow_state.get("workflow_state")
+    if workflow_state not in {
+        PRICING_WORKFLOW_STATE_BOM_UPLOADED,
+        PRICING_WORKFLOW_STATE_REJECTED,
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Final price uploads are only allowed after the BOM upload or after a rejection."
+            ),
+        )
+
+    has_pricing_bom_file = isinstance(pricing_workflow_state.get("bom_file"), dict)
+    if not has_pricing_bom_file:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1532,9 +1758,18 @@ async def upload_pricing_final_price_file(
         note=trimmed_note,
     )
 
+    rfq_data = dict(rfq.rfq_data or {})
     rfq_data.pop("pricing_final_price_upload", None)
     rfq.rfq_data = rfq_data
     rfq.costing_files = list(rfq.costing_files or []) + [costing_file_entry]
+    _set_pricing_workflow_state(
+        rfq,
+        workflow_state=PRICING_WORKFLOW_STATE_PRICING_UPLOADED,
+        pricing_file=costing_file_entry,
+        validation_by=None,
+        validation_at=None,
+        rejection_reason=None,
+    )
 
     await log_action(
         db,
@@ -1543,7 +1778,107 @@ async def upload_pricing_final_price_file(
         current_user.email,
     )
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
+    refreshed_data = dict(refreshed_rfq.rfq_data or {})
+    emails.send_pricing_ready_email(
+        get_plm_email(refreshed_rfq.product_line_acronym or "") or "",
+        str(refreshed_data.get("systematic_rfq_id") or ""),
+        _build_rfq_link(refreshed_rfq.rfq_id),
+    )
+    return refreshed_rfq
+
+
+@router.post("/{rfq_id}/costing_validation", response_model=RfqOut)
+async def costing_validation(
+    rfq_id: str,
+    body: CostingValidationRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.PLM, UserRole.OWNER)),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if current_user.role != UserRole.OWNER and not _is_assigned_plm(current_user, rfq):
+        raise HTTPException(
+            status_code=403,
+            detail="You are not assigned as the PLM for this RFQ.",
+        )
+
+    if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.PRICING):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Costing validation is only allowed during COSTING/PRICING. "
+                f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
+            ),
+        )
+
+    pricing_workflow_state = _effective_pricing_workflow_state(rfq)
+    if pricing_workflow_state.get("workflow_state") != PRICING_WORKFLOW_STATE_PRICING_UPLOADED:
+        raise HTTPException(
+            status_code=400,
+            detail="The pricing workflow is not ready for validation.",
+        )
+
+    validation_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    refreshed_data = dict(rfq.rfq_data or {})
+    systematic_rfq_id = str(refreshed_data.get("systematic_rfq_id") or "")
+    rfq_link = _build_rfq_link(rfq.rfq_id)
+
+    if body.is_approved:
+        _set_pricing_workflow_state(
+            rfq,
+            workflow_state=PRICING_WORKFLOW_STATE_APPROVED,
+            validation_by=current_user.email,
+            validation_at=validation_at,
+            rejection_reason=None,
+        )
+        _set_phase_sub_status(rfq, RfqPhase.OFFER, RfqSubStatus.PREPARATION)
+        await log_action(
+            db,
+            rfq_id,
+            f"Pricing file approved -> {RfqPhase.OFFER.value}/{RfqSubStatus.PREPARATION.value}",
+            current_user.email,
+        )
+    else:
+        rejection_reason = str(body.rejection_reason or "").strip()
+        _set_pricing_workflow_state(
+            rfq,
+            workflow_state=PRICING_WORKFLOW_STATE_REJECTED,
+            validation_by=current_user.email,
+            validation_at=validation_at,
+            rejection_reason=rejection_reason,
+        )
+        rfq.revision_notes = _append_revision_note(
+            rfq.revision_notes,
+            "Costing pricing rejection: ",
+            rejection_reason,
+        )
+        await log_action(
+            db,
+            rfq_id,
+            f"Pricing file rejected: {rejection_reason}",
+            current_user.email,
+        )
+
+    await db.commit()
+    refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if body.is_approved:
+        emails.send_costing_approved_email(
+            refreshed_rfq.created_by_email,
+            systematic_rfq_id,
+            rfq_link,
+        )
+    else:
+        emails.send_costing_rejected_email(
+            get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or "",
+            refreshed_rfq.created_by_email,
+            systematic_rfq_id,
+            rfq_link,
+            str(body.rejection_reason or ""),
+        )
+
+    return refreshed_rfq
 
 
 @router.post("/{rfq_id}/advance", response_model=RfqOut)
@@ -1611,6 +1946,10 @@ async def advance_status(
                     "or marking it as not applicable."
                 ),
             )
+        _set_pricing_workflow_state(
+            rfq,
+            **_default_pricing_workflow_state(),
+        )
 
     _set_phase_sub_status(rfq, effective_phase, body.target_sub_status)
 

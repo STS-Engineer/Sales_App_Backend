@@ -955,6 +955,7 @@ async def _execute_tool_calls(
             tool_response_text = json.dumps(
                 {"files_uploaded": True, "db_status": "synced"}
             )
+            extracted_data["rfq_files"] = True
 
         elif func_name == "checkContactExistence":
             email = args.get("contact_email")
@@ -1331,6 +1332,7 @@ If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combin
 
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
+STRICT CHECKLIST RULE: You MUST ONLY ask the user for the exact fields explicitly listed in the injected MISSING_FIELDS_PROMPT. You are strictly FORBIDDEN from inventing new questions, fields, or requirements (such as "delivery city", "full address", or "zip code"). If it is not in the missing fields array, do not ask for it.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
 CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
 
@@ -1754,19 +1756,30 @@ async def handle_chat(
         
     sliced_history = list(history)[start_idx:]
 
-    # Get the current state of the RFQ
-    current_rfq_state = dict(extracted_data)
-    current_rfq_state.pop("potential_chat_history", None)
-    current_rfq_state["phase"] = rfq.phase.value
-    current_rfq_state["sub_status"] = rfq.sub_status.value
-    current_rfq_state["revision_notes"] = rfq.revision_notes
     base_system_prompt = POTENTIAL_SYSTEM_PROMPT if chat_mode == "potential" else SYSTEM_PROMPT
-    missing_fields_prompt = _build_missing_fields_prompt(chat_mode, current_rfq_state)
     revision_mode_prompt = _build_revision_mode_prompt_context(rfq)
     available_tools = _get_available_tools(rfq)
 
-    # Create a dynamic system message containing the database state
-    DYNAMIC_SYSTEM_PROMPT = f"""{base_system_prompt}
+    def _build_dynamic_system_prompt() -> str:
+        current_rfq_state = dict(extracted_data)
+        current_rfq_state.pop("potential_chat_history", None)
+        current_rfq_state["phase"] = rfq.phase.value
+        current_rfq_state["sub_status"] = rfq.sub_status.value
+        current_rfq_state["revision_notes"] = rfq.revision_notes
+
+        if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+            missing_fields_prompt = (
+                "The RFQ has been successfully submitted and is currently "
+                "PENDING_FOR_VALIDATION. The data entry phase is completely finished. "
+                "DO NOT ask the user for any more fields or missing information. "
+                "Simply inform them that the RFQ is waiting for validator approval."
+            )
+        else:
+            missing_fields_prompt = _build_missing_fields_prompt(
+                chat_mode, current_rfq_state
+            )
+
+        return f"""{base_system_prompt}
 
 === MISSING_FIELDS_PROMPT ===
 {missing_fields_prompt}
@@ -1801,6 +1814,9 @@ CRITICAL INSTRUCTION:
 20. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
 21. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen.
 """
+
+    # Create a dynamic system message containing the database state
+    DYNAMIC_SYSTEM_PROMPT = _build_dynamic_system_prompt()
 
     # Prep messages for OpenAI
     messages_for_llm = [
@@ -1864,6 +1880,10 @@ CRITICAL INSTRUCTION:
                     messages_for_llm.append(tool_message)
 
             rfq.rfq_data = extracted_data
+            messages_for_llm[0] = {
+                "role": "system",
+                "content": _build_dynamic_system_prompt(),
+            }
 
             follow_up_completion = await client.chat.completions.create(
                 model="gpt-5.2",
@@ -1907,6 +1927,10 @@ CRITICAL INSTRUCTION:
                         messages_for_llm.append(tool_message)
 
                 rfq.rfq_data = extracted_data
+                messages_for_llm[0] = {
+                    "role": "system",
+                    "content": _build_dynamic_system_prompt(),
+                }
 
                 final_completion = await client.chat.completions.create(
                     model="gpt-5.2",
