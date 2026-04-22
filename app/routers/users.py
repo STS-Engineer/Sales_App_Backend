@@ -6,6 +6,7 @@ from app.database import get_db
 from app.middleware.auth import require_role
 from app.models.user import User, UserRole
 from app.schemas.user import RoleUpdateRequest, UserOut
+from app.services.user_admin import apply_user_role_update
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -29,13 +30,14 @@ async def update_user_role(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_role(UserRole.OWNER)),
 ):
-    """Approve a pending user and assign their role. Owner only."""
+    """Update a user's role and approval state. Owner only."""
     result = await db.execute(select(User).where(User.user_id == user_id))
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    user.role = body.role
-    user.is_approved = True
-    await db.commit()
-    await db.refresh(user)
-    return user
+    return await apply_user_role_update(
+        user,
+        body.role,
+        db,
+        is_approved=body.is_approved,
+    )

@@ -19,3 +19,4 @@ class UserOut(BaseModel):
 
 class RoleUpdateRequest(BaseModel):
     role: UserRole
+    is_approved: bool | None = None
