@@ -107,7 +107,7 @@ async def test_validation_approval_initializes_costing_file_state_and_sends_entr
         _rfq_link: str,
     ) -> bool:
         email_calls.append(
-            (systematic_rfq_id, "mohamedlaith.benmabrouk@avocarbon.com")
+            (systematic_rfq_id, "ons.ghariani@avocarbon.com")
         )
         return True
 
@@ -131,7 +131,7 @@ async def test_validation_approval_initializes_costing_file_state_and_sends_entr
     assert email_calls == [
         (
             str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
-            "mohamedlaith.benmabrouk@avocarbon.com",
+            "ons.ghariani@avocarbon.com",
         )
     ]
 
@@ -224,7 +224,7 @@ async def test_costing_review_approval_sends_reception_and_handoff_emails(
     assert handoff_calls == [
         (
             str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
-            "mohamedlaith.benmabrouk@avocarbon.com",
+            "ons.ghariani@avocarbon.com",
             "BRU",
         )
     ]
