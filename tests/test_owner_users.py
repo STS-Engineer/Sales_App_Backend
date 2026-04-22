@@ -41,6 +41,11 @@ async def _get_user(db_session: AsyncSession, user_id: str) -> User:
     return result.scalar_one()
 
 
+async def _find_user(db_session: AsyncSession, user_id: str) -> User | None:
+    result = await db_session.execute(select(User).where(User.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
 @pytest.mark.asyncio
 async def test_owner_can_list_all_users_including_owners(
     client: AsyncClient,
@@ -267,10 +272,17 @@ async def test_owner_update_returns_404_for_unknown_user(
 
 
 @pytest.mark.asyncio
-async def test_owner_cannot_assign_owner_role_or_edit_owner_accounts(
+async def test_owner_can_promote_user_to_owner_and_auto_approve_account(
     client: AsyncClient,
     db_session: AsyncSession,
+    monkeypatch,
 ):
+    email_calls = []
+    monkeypatch.setattr(
+        "app.services.user_admin.emails.send_approval_email",
+        lambda *args, **kwargs: email_calls.append((args, kwargs)),
+    )
+
     owner = await _create_user(
         db_session,
         prefix="owner-security",
@@ -282,8 +294,37 @@ async def test_owner_cannot_assign_owner_role_or_edit_owner_accounts(
         db_session,
         prefix="commercial-security",
         role=UserRole.COMMERCIAL,
-        is_approved=True,
+        is_approved=False,
         full_name="Commercial User",
+    )
+
+    response = await client.put(
+        f"/api/owner/users/{commercial_user.user_id}/role",
+        headers=_headers_for(owner),
+        json={"role": "OWNER", "is_approved": False},
+    )
+
+    assert response.status_code == 200
+    updated_user = await _get_user(db_session, commercial_user.user_id)
+
+    assert updated_user.role == UserRole.OWNER
+    assert updated_user.is_approved is True
+    assert len(email_calls) == 1
+    assert email_calls[0][0][0] == commercial_user.email
+    assert email_calls[0][0][1] == "Owner"
+
+
+@pytest.mark.asyncio
+async def test_owner_can_edit_owner_accounts_when_another_owner_exists(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    owner = await _create_user(
+        db_session,
+        prefix="owner-edit-owner",
+        role=UserRole.OWNER,
+        is_approved=True,
+        full_name="Owner User",
     )
     owner_target = await _create_user(
         db_session,
@@ -293,21 +334,148 @@ async def test_owner_cannot_assign_owner_role_or_edit_owner_accounts(
         full_name="Owner Target",
     )
 
-    assign_owner_response = await client.put(
-        f"/api/owner/users/{commercial_user.user_id}/role",
-        headers=_headers_for(owner),
-        json={"role": "OWNER"},
-    )
-    edit_owner_response = await client.put(
+    response = await client.put(
         f"/api/owner/users/{owner_target.user_id}/role",
         headers=_headers_for(owner),
         json={"role": "COMMERCIAL"},
     )
 
-    assert assign_owner_response.status_code == 400
-    assert "Owner role cannot be assigned" in assign_owner_response.json()["detail"]
-    assert edit_owner_response.status_code == 400
-    assert "Owner accounts cannot be edited" in edit_owner_response.json()["detail"]
+    assert response.status_code == 200
+    updated_user = await _get_user(db_session, owner_target.user_id)
+
+    assert updated_user.role == UserRole.COMMERCIAL
+    assert updated_user.is_approved is True
+
+
+@pytest.mark.asyncio
+async def test_owner_cannot_demote_last_remaining_owner(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    owner = await _create_user(
+        db_session,
+        prefix="owner-last-role",
+        role=UserRole.OWNER,
+        is_approved=True,
+        full_name="Only Owner",
+    )
+
+    response = await client.put(
+        f"/api/owner/users/{owner.user_id}/role",
+        headers=_headers_for(owner),
+        json={"role": "COMMERCIAL"},
+    )
+
+    assert response.status_code == 400
+    assert "At least one owner account must remain active." in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_owner_can_delete_approved_user(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    owner = await _create_user(
+        db_session,
+        prefix="owner-delete-approved",
+        role=UserRole.OWNER,
+        is_approved=True,
+        full_name="Owner User",
+    )
+    approved_user = await _create_user(
+        db_session,
+        prefix="approved-delete",
+        role=UserRole.PLM,
+        is_approved=True,
+        full_name="Approved User",
+    )
+
+    response = await client.delete(
+        f"/api/owner/users/{approved_user.user_id}",
+        headers=_headers_for(owner),
+    )
+
+    assert response.status_code == 204
+    assert await _find_user(db_session, approved_user.user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_owner_can_delete_owner_when_another_owner_exists(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    owner = await _create_user(
+        db_session,
+        prefix="owner-delete-owner",
+        role=UserRole.OWNER,
+        is_approved=True,
+        full_name="Owner User",
+    )
+    owner_target = await _create_user(
+        db_session,
+        prefix="owner-delete-target",
+        role=UserRole.OWNER,
+        is_approved=True,
+        full_name="Owner Target",
+    )
+
+    response = await client.delete(
+        f"/api/owner/users/{owner_target.user_id}",
+        headers=_headers_for(owner),
+    )
+
+    assert response.status_code == 204
+    assert await _find_user(db_session, owner_target.user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_owner_cannot_delete_last_remaining_owner(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    owner = await _create_user(
+        db_session,
+        prefix="owner-delete-last",
+        role=UserRole.OWNER,
+        is_approved=True,
+        full_name="Only Owner",
+    )
+
+    response = await client.delete(
+        f"/api/owner/users/{owner.user_id}",
+        headers=_headers_for(owner),
+    )
+
+    assert response.status_code == 400
+    assert "At least one owner account must remain active." in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_non_owner_cannot_delete_user(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    commercial_user = await _create_user(
+        db_session,
+        prefix="commercial-delete-actor",
+        role=UserRole.COMMERCIAL,
+        is_approved=True,
+        full_name="Commercial User",
+    )
+    target_user = await _create_user(
+        db_session,
+        prefix="delete-target",
+        role=UserRole.PLM,
+        is_approved=True,
+        full_name="Target User",
+    )
+
+    response = await client.delete(
+        f"/api/owner/users/{target_user.user_id}",
+        headers=_headers_for(commercial_user),
+    )
+
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -349,3 +517,25 @@ async def test_legacy_users_role_route_uses_same_approval_behavior(
     assert updated_user.role == UserRole.ZONE_MANAGER
     assert updated_user.is_approved is False
     assert len(email_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_users_delete_route_uses_same_owner_guard(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    owner = await _create_user(
+        db_session,
+        prefix="owner-legacy-delete",
+        role=UserRole.OWNER,
+        is_approved=True,
+        full_name="Only Owner",
+    )
+
+    response = await client.delete(
+        f"/api/users/{owner.user_id}",
+        headers=_headers_for(owner),
+    )
+
+    assert response.status_code == 400
+    assert "At least one owner account must remain active." in response.json()["detail"]

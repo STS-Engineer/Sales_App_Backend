@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -7,7 +7,7 @@ from app.middleware.auth import require_role
 from app.models.user import User, UserRole
 from app.schemas.auth import ApproveUserRequest, UserOut
 from app.schemas.user import RoleUpdateRequest, UserOut as UserOutFull
-from app.services.user_admin import apply_user_role_update
+from app.services.user_admin import apply_user_role_update, delete_user_account
 
 router = APIRouter(prefix="/api/owner", tags=["owner"])
 
@@ -64,3 +64,18 @@ async def update_user_role(
         db,
         is_approved=body.is_approved,
     )
+
+
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(UserRole.OWNER)),
+):
+    result = await db.execute(select(User).where(User.user_id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    await delete_user_account(user, db)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
