@@ -4,6 +4,10 @@ os.environ.setdefault(
     "DATABASE_URL",
     "postgresql://user:password@localhost:5432/rfq_test",
 )
+os.environ.setdefault(
+    "DATABASE_URL3",
+    "postgresql://user:password@localhost:5432/rfq_fx_test",
+)
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.routers.chat import _build_missing_fields_prompt, _get_current_step_and_missing_fields

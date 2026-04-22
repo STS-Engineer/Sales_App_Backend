@@ -12,8 +12,18 @@ import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql://user:password@localhost:5432/rfq_test",
+)
+os.environ.setdefault(
+    "DATABASE_URL3",
+    "postgresql://user:password@localhost:5432/rfq_fx_test",
+)
+os.environ.setdefault("SECRET_KEY", "test-secret")
+
 from app.main import app
-from app.database import Base, get_db
+from app.database import Base, get_db, get_db3
 
 TEST_DB_URL = os.getenv(
     "TEST_DATABASE_URL",
@@ -53,7 +63,11 @@ async def client(db_session: AsyncSession):
     async def _override_get_db():
         yield db_session
 
+    async def _override_get_db3():
+        yield db_session
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_db3] = _override_get_db3
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()

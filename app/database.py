@@ -18,6 +18,21 @@ async_session_maker = async_sessionmaker(
     expire_on_commit=False,
 )
 
+engine3 = create_async_engine(
+    settings.async_db_url3,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    pool_timeout=30,
+)
+
+AsyncSessionLocal3 = async_sessionmaker(
+    engine3,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
 
 class Base(DeclarativeBase):
     pass
@@ -25,4 +40,9 @@ class Base(DeclarativeBase):
 
 async def get_db() -> AsyncSession:
     async with async_session_maker() as session:
+        yield session
+
+
+async def get_db3() -> AsyncSession:
+    async with AsyncSessionLocal3() as session:
         yield session

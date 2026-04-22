@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import get_db
+from app.database import get_db, get_db3
 from app.middleware.auth import get_current_user
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
 from app.routers.rfq import (
@@ -917,6 +917,7 @@ async def _execute_tool_calls(
     tool_calls: list[dict],
     http_client: httpx.AsyncClient,
     db: AsyncSession,
+    db3: AsyncSession,
     rfq: Rfq,
     current_user: User,
     extracted_data: dict,
@@ -969,7 +970,7 @@ async def _execute_tool_calls(
 
         elif func_name == "get_eur_exchange_rate":
             currency_code = str(args.get("currency_code") or "").strip().upper()
-            eur_rate = await get_eur_exchange_rate(currency_code)
+            eur_rate = await get_eur_exchange_rate(currency_code, db3=db3)
             fallback_used = bool(
                 currency_code and currency_code != "EUR" and eur_rate == 1.0
             )
@@ -1553,7 +1554,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_eur_exchange_rate",
-            "description": "Fetches the live exchange rate needed to convert a quoted currency into EUR before turnover and validator routing.",
+            "description": "Fetches the latest ECB exchange rate from the FX database to convert a quoted currency into EUR before turnover and validator routing.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1654,6 +1655,7 @@ ALLOWED_TOOL_NAMES = {tool["function"]["name"] for tool in TOOLS}
 async def edit_chat_message(
     req: ChatEditRequest,
     db: AsyncSession = Depends(get_db),
+    db3: AsyncSession = Depends(get_db3),
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(Rfq).where(Rfq.rfq_id == req.rfq_id))
@@ -1693,6 +1695,7 @@ async def edit_chat_message(
     return await handle_chat(
         ChatRequest(rfq_id=req.rfq_id, message=edited_message, chat_mode="rfq"),
         db=db,
+        db3=db3,
         current_user=current_user,
     )
 
@@ -1701,6 +1704,7 @@ async def edit_chat_message(
 async def handle_chat(
     req: ChatRequest,
     db: AsyncSession = Depends(get_db),
+    db3: AsyncSession = Depends(get_db3),
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(Rfq).where(Rfq.rfq_id == req.rfq_id))
@@ -1869,6 +1873,7 @@ CRITICAL INSTRUCTION:
                     tool_calls=normalized_tool_calls,
                     http_client=http_client,
                     db=db,
+                    db3=db3,
                     rfq=rfq,
                     current_user=current_user,
                     extracted_data=extracted_data,
@@ -1916,6 +1921,7 @@ CRITICAL INSTRUCTION:
                         tool_calls=follow_up_tool_calls,
                         http_client=http_client,
                         db=db,
+                        db3=db3,
                         rfq=rfq,
                         current_user=current_user,
                         extracted_data=extracted_data,

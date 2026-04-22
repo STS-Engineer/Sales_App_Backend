@@ -1,115 +1,75 @@
-import httpx
 import pytest
 
 from app.utils import currency as currency_utils
 
 
-class _FakeResponse:
-    def __init__(self, payload=None, *, raise_error=None):
-        self._payload = payload or {}
-        self._raise_error = raise_error
+class _FakeResult:
+    def __init__(self, rate):
+        self._rate = rate
 
-    def raise_for_status(self):
-        if self._raise_error:
-            raise self._raise_error
-
-    def json(self):
-        return self._payload
+    def scalar_one_or_none(self):
+        return self._rate
 
 
-class _FakeAsyncClient:
-    def __init__(self, *args, response=None, seen_urls=None, **kwargs):
-        self._response = response
-        self._seen_urls = seen_urls
+class _FakeDb:
+    def __init__(self, rate=None, *, error=None):
+        self._rate = rate
+        self._error = error
+        self.executed = False
+        self.statement = None
+        self.params = None
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def get(self, url):
-        if self._seen_urls is not None:
-            self._seen_urls.append(url)
-        return self._response
+    async def execute(self, statement, params):
+        self.executed = True
+        self.statement = statement
+        self.params = params
+        if self._error is not None:
+            raise self._error
+        return _FakeResult(self._rate)
 
 
 @pytest.mark.asyncio
-async def test_get_eur_exchange_rate_short_circuits_for_eur(monkeypatch):
-    class _ExplodingAsyncClient:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("AsyncClient should not be called for EUR")
+async def test_get_eur_exchange_rate_short_circuits_for_eur():
+    db3 = _FakeDb(error=AssertionError("db3 should not be queried for EUR"))
 
-    monkeypatch.setattr(currency_utils.httpx, "AsyncClient", _ExplodingAsyncClient)
-
-    assert await currency_utils.get_eur_exchange_rate("eur") == 1.0
+    assert await currency_utils.get_eur_exchange_rate("eur", db3=db3) == 1.0
+    assert db3.executed is False
 
 
 @pytest.mark.asyncio
-async def test_get_eur_exchange_rate_fetches_live_rate(monkeypatch):
-    seen_urls = []
-    response = _FakeResponse({"rates": {"EUR": 0.92}})
+async def test_get_eur_exchange_rate_reads_latest_rate_from_db():
+    db3 = _FakeDb(rate=1.25)
 
-    def _client_factory(*args, **kwargs):
-        return _FakeAsyncClient(
-            *args,
-            response=response,
-            seen_urls=seen_urls,
-            **kwargs,
-        )
+    rate = await currency_utils.get_eur_exchange_rate("usd", db3=db3)
 
-    monkeypatch.setattr(currency_utils.httpx, "AsyncClient", _client_factory)
-
-    rate = await currency_utils.get_eur_exchange_rate("usd")
-
-    assert rate == 0.92
-    assert seen_urls == [
-        "https://api.frankfurter.app/latest?from=USD&to=EUR"
-    ]
+    assert rate == pytest.approx(0.8)
+    assert db3.executed is True
+    assert "SELECT rate" in str(db3.statement)
+    assert "FROM public.ecb_exchange_rates" in str(db3.statement)
+    assert db3.params == {"currency": "USD"}
 
 
 @pytest.mark.asyncio
-async def test_get_eur_exchange_rate_returns_fallback_and_logs_warning(
-    monkeypatch,
+async def test_get_eur_exchange_rate_returns_fallback_and_logs_warning_when_missing(
     caplog,
 ):
-    response = _FakeResponse(
-        raise_error=httpx.HTTPStatusError(
-            "boom",
-            request=httpx.Request(
-                "GET",
-                "https://api.frankfurter.app/latest?from=ZZZ&to=EUR",
-            ),
-            response=httpx.Response(404),
-        )
-    )
-
-    def _client_factory(*args, **kwargs):
-        return _FakeAsyncClient(*args, response=response, **kwargs)
-
-    monkeypatch.setattr(currency_utils.httpx, "AsyncClient", _client_factory)
+    db3 = _FakeDb(rate=None)
 
     with caplog.at_level("WARNING"):
-        rate = await currency_utils.get_eur_exchange_rate("zzz")
+        rate = await currency_utils.get_eur_exchange_rate("zzz", db3=db3)
 
     assert rate == 1.0
-    assert "Failed to fetch EUR exchange rate for ZZZ" in caplog.text
+    assert "FX DB lookup returned no rate for ZZZ" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_get_eur_exchange_rate_returns_fallback_for_malformed_payload(
-    monkeypatch,
+async def test_get_eur_exchange_rate_returns_fallback_and_logs_warning_on_db_error(
     caplog,
 ):
-    response = _FakeResponse({"rates": {}})
-
-    def _client_factory(*args, **kwargs):
-        return _FakeAsyncClient(*args, response=response, **kwargs)
-
-    monkeypatch.setattr(currency_utils.httpx, "AsyncClient", _client_factory)
+    db3 = _FakeDb(error=RuntimeError("secondary db unavailable"))
 
     with caplog.at_level("WARNING"):
-        rate = await currency_utils.get_eur_exchange_rate("gbp")
+        rate = await currency_utils.get_eur_exchange_rate("gbp", db3=db3)
 
     assert rate == 1.0
-    assert "Failed to fetch EUR exchange rate for GBP" in caplog.text
+    assert "FX DB lookup failed for GBP" in caplog.text

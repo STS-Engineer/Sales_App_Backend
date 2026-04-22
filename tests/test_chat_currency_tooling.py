@@ -9,6 +9,10 @@ os.environ.setdefault(
     "DATABASE_URL",
     "postgresql://user:password@localhost:5432/rfq_test",
 )
+os.environ.setdefault(
+    "DATABASE_URL3",
+    "postgresql://user:password@localhost:5432/rfq_fx_test",
+)
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
 from app.routers import chat
@@ -46,8 +50,11 @@ def test_normalize_tool_arguments_maps_retrieve_zone_manager_delivery_zone_alias
 
 @pytest.mark.asyncio
 async def test_execute_tool_calls_returns_fx_payload(monkeypatch):
-    async def _fake_get_rate(currency_code):
+    fx_db = object()
+
+    async def _fake_get_rate(currency_code, db3):
         assert currency_code == "USD"
+        assert db3 is fx_db
         return 0.91
 
     monkeypatch.setattr(chat, "get_eur_exchange_rate", _fake_get_rate)
@@ -62,6 +69,7 @@ async def test_execute_tool_calls_returns_fx_payload(monkeypatch):
         ],
         http_client=None,
         db=None,
+        db3=fx_db,
         rfq=SimpleNamespace(created_by_email="owner@example.com"),
         current_user=SimpleNamespace(email="user@example.com"),
         extracted_data={},
@@ -81,8 +89,11 @@ async def test_execute_tool_calls_returns_fx_payload(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_tool_calls_flags_fx_fallback(monkeypatch):
-    async def _fake_get_rate(currency_code):
+    fx_db = object()
+
+    async def _fake_get_rate(currency_code, db3):
         assert currency_code == "MXN"
+        assert db3 is fx_db
         return 1.0
 
     monkeypatch.setattr(chat, "get_eur_exchange_rate", _fake_get_rate)
@@ -97,6 +108,7 @@ async def test_execute_tool_calls_flags_fx_fallback(monkeypatch):
         ],
         http_client=None,
         db=None,
+        db3=fx_db,
         rfq=SimpleNamespace(created_by_email="owner@example.com"),
         current_user=SimpleNamespace(email="user@example.com"),
         extracted_data={},
@@ -155,6 +167,7 @@ async def test_execute_tool_calls_returns_zone_manager_payload_with_canonical_zo
         ],
         http_client=None,
         db=_FakeDb(_build_matrix()),
+        db3=None,
         rfq=SimpleNamespace(created_by_email="owner@example.com"),
         current_user=SimpleNamespace(email="user@example.com"),
         extracted_data=extracted_data,
@@ -192,6 +205,7 @@ async def test_execute_tool_calls_returns_error_for_unknown_zone_manager_zone():
         ],
         http_client=None,
         db=_FakeDb(_build_matrix()),
+        db3=None,
         rfq=SimpleNamespace(created_by_email="owner@example.com"),
         current_user=SimpleNamespace(email="user@example.com"),
         extracted_data=extracted_data,
@@ -228,6 +242,7 @@ async def test_execute_tool_calls_returns_error_when_turnover_inputs_are_missing
         ],
         http_client=None,
         db=_FakeDb(_build_matrix()),
+        db3=None,
         rfq=SimpleNamespace(created_by_email="owner@example.com"),
         current_user=SimpleNamespace(email="user@example.com"),
         extracted_data=extracted_data,

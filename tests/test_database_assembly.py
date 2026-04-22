@@ -11,6 +11,7 @@ def test_settings_async_db_url2_defaults_to_none():
     settings = Settings(
         _env_file=None,
         DATABASE_URL="postgresql+asyncpg://user:password@localhost:5432/rfq_db",
+        DATABASE_URL3="postgresql+asyncpg://fx:secret@localhost:5432/ecb_rates",
         SECRET_KEY="test-secret",
     )
 
@@ -22,6 +23,7 @@ def test_settings_async_db_url2_parses_secondary_database_url():
         _env_file=None,
         DATABASE_URL="postgresql+asyncpg://user:password@localhost:5432/rfq_db",
         DATABASE_URL2="postgresql+asyncpg://assembly:secret@localhost:5432/pl_assembly",
+        DATABASE_URL3="postgresql+asyncpg://fx:secret@localhost:5432/ecb_rates",
         SECRET_KEY="test-secret",
     )
 
@@ -30,6 +32,20 @@ def test_settings_async_db_url2_parses_secondary_database_url():
     assert parsed.drivername == "postgresql+asyncpg"
     assert parsed.database == "pl_assembly"
     assert parsed.username == "assembly"
+
+
+def test_settings_async_db_url3_parses_third_database_url():
+    settings = Settings(
+        _env_file=None,
+        DATABASE_URL="postgresql+asyncpg://user:password@localhost:5432/rfq_db",
+        DATABASE_URL3="postgresql+asyncpg://fx:secret@localhost:5432/ecb_rates",
+        SECRET_KEY="test-secret",
+    )
+
+    parsed = settings.async_db_url3
+    assert parsed.drivername == "postgresql+asyncpg"
+    assert parsed.database == "ecb_rates"
+    assert parsed.username == "fx"
 
 
 @pytest.mark.asyncio
