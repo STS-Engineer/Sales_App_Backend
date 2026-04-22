@@ -898,7 +898,12 @@ async def upload_rfq_file(
         "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     extracted_data = dict(rfq.rfq_data or {})
-    existing_files = list(extracted_data.get("rfq_files") or [])
+    raw_files = extracted_data.get("rfq_files")
+    if isinstance(raw_files, list):
+        existing_files = list(raw_files)
+    else:
+        # If it's a boolean placeholder or missing, start a fresh metadata list.
+        existing_files = []
     existing_files.append(file_meta)
     extracted_data["rfq_files"] = existing_files
     extracted_data["rfq_file_path"] = file_meta["path"]
