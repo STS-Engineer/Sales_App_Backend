@@ -258,8 +258,12 @@ async def test_execute_tool_calls_returns_error_when_turnover_inputs_are_missing
 
 def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Always store dimension data in mm." in chat.SYSTEM_PROMPT
+    assert "CRITICAL NO-ROUNDING RULE" in chat.SYSTEM_PROMPT
+    assert "Keep at most 5 digits after the decimal point." in chat.SYSTEM_PROMPT
+    assert "save 0.19879 into the database" in chat.SYSTEM_PROMPT
     assert "Target Price and quoted currency" in chat.SYSTEM_PROMPT
     assert "MUST call `get_eur_exchange_rate`" in chat.SYSTEM_PROMPT
+    assert "truncate extra digits instead of rounding" in chat.SYSTEM_PROMPT
     assert "Ask the user to restate the Target Price directly in EUR" in chat.SYSTEM_PROMPT
     assert "MUST NEVER calculate the TO Total yourself" in chat.SYSTEM_PROMPT
     assert "return the calculated `to_total` to you" in chat.SYSTEM_PROMPT
