@@ -932,7 +932,8 @@ async def delete_rfq_file(
         raise HTTPException(status_code=403, detail="Not authorized to delete files from this RFQ.")
 
     extracted_data = dict(rfq.rfq_data or {})
-    existing_files = list(extracted_data.get("rfq_files") or [])
+    raw_files = extracted_data.get("rfq_files")
+    existing_files = list(raw_files) if isinstance(raw_files, list) else []
 
     target_index = next(
         (
@@ -985,7 +986,8 @@ async def delete_rfq_file_by_name(
         raise HTTPException(status_code=403, detail="Not authorized to delete files from this RFQ.")
 
     extracted_data = dict(rfq.rfq_data or {})
-    existing_files = list(extracted_data.get("rfq_files") or [])
+    raw_files = extracted_data.get("rfq_files")
+    existing_files = list(raw_files) if isinstance(raw_files, list) else []
 
     target_index = next(
         (
