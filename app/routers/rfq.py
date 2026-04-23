@@ -793,6 +793,12 @@ async def update_rfq_data(
         raise HTTPException(status_code=403, detail="Not authorized to update this RFQ.")
 
     incoming_data = rfq_data_payload_to_dict(body.rfq_data)
+    if "target_price_is_estimated" in incoming_data:
+        val = incoming_data["target_price_is_estimated"]
+        incoming_data["target_price_is_estimated"] = (
+            val if isinstance(val, bool)
+            else str(val).strip().lower() in ("true", "1", "yes")
+        )
     next_data = dict(rfq.rfq_data or {})
     next_data.update(incoming_data)
     rfq.rfq_data = next_data

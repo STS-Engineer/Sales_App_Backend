@@ -138,6 +138,9 @@ class _FakeDb:
     async def execute(self, query):
         return _FakeResult(self._matrix)
 
+    async def flush(self):
+        return None
+
 
 def _build_matrix():
     return SimpleNamespace(
@@ -254,6 +257,46 @@ async def test_execute_tool_calls_returns_error_when_turnover_inputs_are_missing
 
     assert payload["error"] == "annual_volume must be saved before validator routing."
     assert "to_total" not in extracted_data
+
+
+@pytest.mark.asyncio
+async def test_update_form_fields_preserves_target_price_estimated_as_boolean():
+    extracted_data = {}
+    tool_messages, auto_redirect = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "update-flag-1",
+                "name": "updateFormFields",
+                "arguments": {
+                    "fields_to_update": {
+                        "target_price_is_estimated": True,
+                        "target_price_local": "1.25",
+                    }
+                },
+            }
+        ],
+        http_client=None,
+        db=_FakeDb(_build_matrix()),
+        db3=None,
+        rfq=SimpleNamespace(
+            created_by_email="owner@example.com",
+            sub_status=chat.RfqSubStatus.POTENTIAL,
+            product_line_acronym=None,
+            zone_manager_email=None,
+        ),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert auto_redirect is False
+    assert payload["success"] is True
+    assert extracted_data["target_price_is_estimated"] is True
+    assert isinstance(extracted_data["target_price_is_estimated"], bool)
+    assert extracted_data["target_price_local"] == "1.25"
 
 
 def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():

@@ -1237,7 +1237,14 @@ async def _execute_tool_calls(
                 )
 
         elif func_name == "updateFormFields":
-            fields = args.get("fields_to_update", {})
+            raw_fields = args.get("fields_to_update", {})
+            fields = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+            if "target_price_is_estimated" in fields:
+                val = fields["target_price_is_estimated"]
+                fields["target_price_is_estimated"] = (
+                    val if isinstance(val, bool)
+                    else str(val).strip().lower() in ("true", "1", "yes")
+                )
             filtered_fields = _filter_update_fields(chat_mode, fields)
             if "delivery_zone" in filtered_fields:
                 canonical_delivery_zone = normalize_delivery_zone(
@@ -1246,7 +1253,10 @@ async def _execute_tool_calls(
                 if canonical_delivery_zone:
                     filtered_fields["delivery_zone"] = canonical_delivery_zone
             for key, value in filtered_fields.items():
-                extracted_data[key] = str(value)
+                if key == "target_price_is_estimated":
+                    extracted_data[key] = bool(value)
+                else:
+                    extracted_data[key] = str(value)
             if "zone_manager_email" in filtered_fields:
                 rfq.zone_manager_email = str(filtered_fields.get("zone_manager_email") or "").strip() or None
             if "product_line_acronym" in filtered_fields:

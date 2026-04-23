@@ -348,3 +348,44 @@ async def test_submit_revision_rejects_non_creator_and_wrong_state(
         headers={"Authorization": f"Bearer {create_access_token(creator.email, creator.role.value)}"},
     )
     assert wrong_state_response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_rfq_data_normalizes_target_price_is_estimated_boolean(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    creator, creator_headers = await _create_user_and_headers(
+        db_session,
+        role=UserRole.COMMERCIAL,
+        email_prefix="creator-bool",
+    )
+    validator, _ = await _create_user_and_headers(
+        db_session,
+        role=UserRole.ZONE_MANAGER,
+        email_prefix="validator-bool",
+    )
+    rfq = await _create_rfq(
+        db_session,
+        creator_email=creator.email,
+        validator_email=validator.email,
+        sub_status=RfqSubStatus.NEW_RFQ,
+    )
+
+    true_response = await client.put(
+        f"/api/rfq/{rfq.rfq_id}/data",
+        json={"rfq_data": {"target_price_is_estimated": "yes"}},
+        headers=creator_headers,
+    )
+
+    assert true_response.status_code == 200
+    assert true_response.json()["rfq_data"]["target_price_is_estimated"] is True
+
+    false_response = await client.put(
+        f"/api/rfq/{rfq.rfq_id}/data",
+        json={"rfq_data": {"target_price_is_estimated": "false"}},
+        headers=creator_headers,
+    )
+
+    assert false_response.status_code == 200
+    assert false_response.json()["rfq_data"]["target_price_is_estimated"] is False
