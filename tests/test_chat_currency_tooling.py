@@ -261,7 +261,10 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "CRITICAL NO-ROUNDING RULE" in chat.SYSTEM_PROMPT
     assert "Keep at most 5 digits after the decimal point." in chat.SYSTEM_PROMPT
     assert "save 0.19879 into the database" in chat.SYSTEM_PROMPT
-    assert "Target Price and quoted currency" in chat.SYSTEM_PROMPT
+    assert "Target Price" in chat.SYSTEM_PROMPT
+    assert "target_price_local" in chat.SYSTEM_PROMPT
+    assert "target_price_currency" in chat.SYSTEM_PROMPT
+    assert "target_price_is_estimated" in chat.SYSTEM_PROMPT
     assert "MUST call `get_eur_exchange_rate`" in chat.SYSTEM_PROMPT
     assert "truncate extra digits instead of rounding" in chat.SYSTEM_PROMPT
     assert "Ask the user to restate the Target Price directly in EUR" in chat.SYSTEM_PROMPT

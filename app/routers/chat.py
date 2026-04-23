@@ -178,6 +178,10 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "rfq_reception_date",
     "quotation_expected_date",
     "target_price_eur",
+    "target_price_local",
+    "target_price_currency",
+    "target_price_is_estimated",
+    "target_price_note",
     "expected_delivery_conditions",
     "expected_payment_terms",
     "type_of_packaging",
@@ -193,6 +197,7 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "strategic_note",
     "final_recommendation",
     "to_total",
+    "to_total_local",
     "zone_manager_email",
     "validator_role",
 }
@@ -210,6 +215,10 @@ UPDATE_FORM_FIELD_ALIASES = {
     "contactRole": "contact_role",
     "contactPhone": "contact_phone",
     "targetPriceEur": "target_price_eur",
+    "targetPriceLocal": "target_price_local",
+    "targetPriceCurrency": "target_price_currency",
+    "targetPriceIsEstimated": "target_price_is_estimated",
+    "targetPriceNote": "target_price_note",
     "expectedDeliveryConditions": "expected_delivery_conditions",
     "expectedPaymentTerms": "expected_payment_terms",
     "typeOfPackaging": "type_of_packaging",
@@ -224,6 +233,7 @@ UPDATE_FORM_FIELD_ALIASES = {
     "strategicNote": "strategic_note",
     "finalRecommendation": "final_recommendation",
     "toTotal": "to_total",
+    "toTotalLocal": "to_total_local",
     "zoneManagerEmail": "zone_manager_email",
     "validatorRole": "validator_role",
     "poDate": "po_date",
@@ -238,6 +248,8 @@ UPDATE_FORM_FIELD_PROPERTIES = {
     for field_name in sorted(RFQ_ALLOWED_FIELDS)
 }
 UPDATE_FORM_FIELD_PROPERTIES["to_total"] = {"type": "number"}
+UPDATE_FORM_FIELD_PROPERTIES["to_total_local"] = {"type": "number"}
+UPDATE_FORM_FIELD_PROPERTIES["target_price_is_estimated"] = {"type": "boolean"}
 AI_GENERATED_STEP_FIELDS = [
     "to_total",
     "zone_manager_email",
@@ -956,7 +968,12 @@ async def _execute_tool_calls(
             tool_response_text = json.dumps(
                 {"files_uploaded": True, "db_status": "synced"}
             )
-            extracted_data["rfq_files"] = True
+            # Only use the boolean True as a fallback if the array is empty.
+            # If the upload endpoint already populated the array, DO NOT
+            # overwrite it so the Azure metadata survives.
+            current_files = extracted_data.get("rfq_files")
+            if not isinstance(current_files, list) or len(current_files) == 0:
+                extracted_data["rfq_files"] = True
 
         elif func_name == "checkContactExistence":
             email = args.get("contact_email")
@@ -1018,6 +1035,16 @@ async def _execute_tool_calls(
                 price = _coerce_numeric_value(target_price_value)
                 to_total_float = (volume * price) / 1000.0
                 extracted_data["to_total"] = str(to_total_float)
+
+                # Also compute to_total_local for the user-facing UI
+                local_price_value = extracted_data.get("target_price_local")
+                if local_price_value not in (None, ""):
+                    try:
+                        local_price = _coerce_numeric_value(local_price_value)
+                        to_total_local_float = (volume * local_price) / 1000.0
+                        extracted_data["to_total_local"] = str(to_total_local_float)
+                    except (ValueError, TypeError):
+                        pass
                 query = select(ValidationMatrix).where(
                     ValidationMatrix.acronym == acronym
                 )
@@ -1087,6 +1114,7 @@ async def _execute_tool_calls(
                             "validator_email": zone_manager_email,
                             "zone_manager_email": zone_manager_email,
                             "to_total": to_total_float,
+                            "to_total_local": extracted_data.get("to_total_local"),
                             "delivery_zone": canonical_delivery_zone,
                         }
                     )
@@ -1272,6 +1300,15 @@ class ChatResponse(BaseModel):
 
 SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """
 
+CRITICAL CONVERSATION RULES:
+1. NO CHATTER: Never say 'Update saved', 'I have processed your request', or 'Got it'. Just ask the exact next missing question.
+2. NO UNSOLICITED SUMMARIES: Never print out a summary of the RFQ fields unless the user explicitly types 'summary'.
+3. STRICT ENGLISH TRANSLATION: You must seamlessly translate all delivery zones, regions, and countries into English before saving them. You MUST adhere to the following exact mappings for delivery zones:
+   - "asie sud" MUST be saved as "South Asia"
+   - "asie est" MUST be saved as "East Asia"
+   - "amerique" MUST be saved as "America"
+   - "europe" MUST be saved as "Europe"
+
 STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer, Product, Product Line, or Contact.
 If the user provides a Customer name, you MUST call the checkGroupeExistence tool. YOU MUST WAIT for the system to return the JSON response containing the database result.
@@ -1312,6 +1349,10 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - contact_role
 - contact_phone
 - target_price_eur
+- target_price_local
+- target_price_currency
+- target_price_is_estimated (boolean: true if estimated by Avocarbon, false if given by customer)
+- target_price_note
 - expected_delivery_conditions
 - expected_payment_terms
 - type_of_packaging
@@ -1327,6 +1368,7 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - strategic_note
 - final_recommendation
 - to_total
+- to_total_local
 - zone_manager_email
 - validator_role
 CRITICAL DATA RULE: The keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped above (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
@@ -1404,14 +1446,27 @@ NOTE: costing_data is OPTIONAL. If the product has no specific costing parameter
 
 ### Step 2: Commercial Expectations
 Ask sequentially for:
-- Target Price and quoted currency
+- Target Price (ask for the price in the LOCAL currency, the currency code, whether this price is 'Estimated by Avocarbon' or 'Given by Customer', and any additional notes about the price)
 - Delivery Conditions
 - Payment Terms
 - Type of Packaging
 - Business Trigger
 - Tooling Conditions
 - Entry Barriers
-CRITICAL TARGET PRICE RULE: When collecting the target price, you MUST explicitly ask which currency the user is quoting (for example, EUR, USD, GBP, MXN, or CNY). If the target price is quoted in a non-EUR currency, you MUST call `get_eur_exchange_rate`, convert the amount to EUR, and save ONLY the EUR value in `target_price_eur`. You MUST NOT save the raw non-EUR amount into `target_price_eur`. When converting, keep at most 5 digits after the decimal point and truncate extra digits instead of rounding.
+CRITICAL TARGET PRICE RULE:
+1. When collecting the target price, you MUST ask for the following four pieces of information:
+   a. The target price amount in the user's LOCAL currency.
+   b. The currency code (for example, EUR, USD, GBP, MXN, or CNY).
+   c. Whether this price is 'Estimated by Avocarbon' or 'Given by Customer'.
+   d. Any additional notes about the price (optional).
+2. Save these to the database using `updateFormFields` as:
+   - `target_price_local`: the raw price in the local currency
+   - `target_price_currency`: the 3-letter ISO currency code
+   - `target_price_is_estimated`: true if estimated by Avocarbon, false if given by customer
+   - `target_price_note`: any additional notes (or empty string)
+3. If the currency is NOT EUR, you MUST silently call `get_eur_exchange_rate` in the background, convert the local price to EUR, and save ONLY the converted EUR value into `target_price_eur`. You MUST NOT save the raw non-EUR amount into `target_price_eur`.
+4. If the currency IS EUR, save the same amount directly into both `target_price_local` and `target_price_eur`.
+5. When converting, keep at most 5 digits after the decimal point and truncate extra digits instead of rounding.
 CRITICAL PACKAGING RULE: When `type_of_packaging` is missing, you MUST ask the user to choose exactly one of these 3 options:
 1. carboard divider
 2. one way tray
@@ -1438,9 +1493,9 @@ CRITICAL STEP 4 RULES:
 1. Look at the missing fields list. If `to_total` or `zone_manager_email` are missing, DO NOT ask the user for them.
 2. Before validator routing, if the user provided the Target Price in a non-EUR currency, you MUST call `get_eur_exchange_rate` to get the live EUR conversion rate, convert the target price into EUR, and save the converted EUR value into `target_price_eur` with `updateFormFields`.
 3. If `get_eur_exchange_rate` returns `fallback_used: true` for a non-EUR currency, do NOT finalize validator routing. Ask the user to restate the Target Price directly in EUR, then wait for their answer.
-4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate the strict kEUR turnover using the saved `annual_volume` and `target_price_eur`, perform the matrix routing, and return the calculated `to_total` to you.
-5. You MUST use the `retrieveZoneManager` tool with `product_line_acronym` and the canonical `delivery_zone` to query the validation matrix and retrieve the backend-calculated `to_total`, Validator Email, and Validator Role.
-6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `to_total`, `zone_manager_email`, and `validator_role`.
+4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate the strict kEUR turnover using the saved `annual_volume` and `target_price_eur`, perform the matrix routing, and return the calculated `to_total` to you. The backend also calculates `to_total_local` (target_price_local * annual_volume / 1000) for the user-facing UI.
+5. You MUST use the `retrieveZoneManager` tool with `product_line_acronym` and the canonical `delivery_zone` to query the validation matrix and retrieve the backend-calculated `to_total`, `to_total_local`, Validator Email, and Validator Role.
+6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
 7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the RFQ for validation.
 8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
 9. CRITICAL SUBMISSION RULE: When you ask the user "Shall I submit this RFQ for validation?", you are waiting for a boolean confirmation. If the user replies "Yes" (or types the corresponding number, e.g., "1"), your IMMEDIATE AND ONLY action must be to execute the submitValidation tool. Do NOT generate another summary. Do NOT ask them to confirm a second time. Call the tool immediately.
