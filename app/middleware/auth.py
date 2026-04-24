@@ -5,9 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import jwt
 
-from app.config import settings
 from app.database import get_db
 from app.models.user import User, UserRole
+from app.security import decode_token
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -22,11 +22,10 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
-        )
+        payload = decode_token(token)
         email: str | None = payload.get("sub")
-        if email is None:
+        token_type = payload.get("token_type")
+        if email is None or token_type != "access":
             raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception

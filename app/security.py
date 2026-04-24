@@ -3,13 +3,18 @@ import binascii
 import hashlib
 import hmac
 import secrets
+from datetime import datetime, timedelta, timezone
 
 import bcrypt
+import jwt
+
+from app.config import settings
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 600_000
 PBKDF2_SALT_BYTES = 16
 LEGACY_BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
+REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 
 def hash_password(password: str) -> str:
@@ -33,6 +38,28 @@ def needs_password_rehash(password_hash: str) -> bool:
     return password_hash.startswith(LEGACY_BCRYPT_PREFIXES)
 
 
+def create_access_token(
+    email: str,
+    role: str,
+    expires_delta: timedelta | None = None,
+) -> str:
+    lifetime = expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return _create_token(email, role, "access", lifetime)
+
+
+def create_refresh_token(
+    email: str,
+    role: str,
+    expires_delta: timedelta | None = None,
+) -> str:
+    lifetime = expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    return _create_token(email, role, "refresh", lifetime)
+
+
+def decode_token(token: str) -> dict:
+    return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+
+
 def _verify_legacy_bcrypt(password: str, password_hash: str) -> bool:
     try:
         return bcrypt.checkpw(
@@ -54,6 +81,22 @@ def _verify_pbkdf2(password: str, password_hash: str) -> bool:
 
     actual_digest = _pbkdf2_digest(password, salt, iterations)
     return hmac.compare_digest(actual_digest, expected_digest)
+
+
+def _create_token(
+    email: str,
+    role: str,
+    token_type: str,
+    expires_delta: timedelta,
+) -> str:
+    expire = datetime.now(timezone.utc) + expires_delta
+    payload = {
+        "sub": email,
+        "role": role,
+        "exp": expire,
+        "token_type": token_type,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def _pbkdf2_digest(password: str, salt: bytes, iterations: int) -> bytes:

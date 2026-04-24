@@ -1,5 +1,3 @@
-from datetime import datetime, timedelta, timezone
-
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -9,18 +7,18 @@ from app.config import settings
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.user import User, UserRole
-from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UserOut
+from app.schemas.auth import (
+    AccessTokenResponse,
+    LoginRequest,
+    RefreshTokenRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserOut,
+)
+from app.security import create_access_token, create_refresh_token, decode_token
 from app.utils import emails
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
-
-
-def create_access_token(email: str, role: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
-    )
-    payload = {"sub": email, "role": role, "exp": expire}
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 async def _get_owner_emails(db: AsyncSession) -> list[str]:
@@ -108,8 +106,40 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         user.set_password(body.password)
         await db.commit()
 
-    token = create_access_token(email, role)
-    return TokenResponse(access_token=token)
+    access_token = create_access_token(email, role)
+    refresh_token = create_refresh_token(email, role)
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+    )
+
+
+@router.post("/refresh", response_model=AccessTokenResponse)
+async def refresh_token(body: RefreshTokenRequest, db: AsyncSession = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid refresh token.",
+    )
+
+    try:
+        payload = decode_token(body.refresh_token)
+    except jwt.PyJWTError as exc:
+        raise credentials_exception from exc
+
+    if payload.get("token_type") != "refresh":
+        raise credentials_exception
+
+    email = str(payload.get("sub") or "").strip()
+    if not email:
+        raise credentials_exception
+
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if user is None or not user.is_approved:
+        raise credentials_exception
+
+    access_token = create_access_token(user.email, user.role.value)
+    return AccessTokenResponse(access_token=access_token)
 
 
 @router.get("/me", response_model=UserOut)
