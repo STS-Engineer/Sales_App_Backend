@@ -14,6 +14,7 @@ class UserRole(str, enum.Enum):
     COMMERCIAL = "COMMERCIAL"
     ZONE_MANAGER = "ZONE_MANAGER"
     COSTING_TEAM = "COSTING_TEAM"
+    RND = "RND"
     PLANT_MANAGER = "PLANT_MANAGER"
     PLM = "PLM"
 

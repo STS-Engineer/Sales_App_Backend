@@ -57,51 +57,59 @@ RFQ_FILES_CONTAINER = "rfq-files"
 COSTING_DISCUSSION_PHASES = {RfqSubStatus.FEASIBILITY, RfqSubStatus.PRICING}
 PRODUCT_LINE_MATRIX = {
     "Chokes": {
-        "email": "ons.ghariani@avocarbon.com",
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
         "code": "CHO",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
     },
     "Brushes": {
-        "email": "ons.ghariani@avocarbon.com",
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
         "code": "BRU",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
     },
     "Seals": {
-        "email": "ons.ghariani@avocarbon.com",
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
         "code": "SEA",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
     },
     "Assembly": {
-        "email": "ons.ghariani@avocarbon.com",
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
         "code": "ASS",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
     },
     "Advanced material": {
-        "email": "ons.ghariani@avocarbon.com",
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
         "code": "ADM",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
     },
     "Friction": {
-        "email": "ons.ghariani@avocarbon.com",
+        "email": "mohamedlaith.benmabrouk@avocarbon.com",
         "code": "FRI",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
+        "costing_agent_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "plm_email": "mohamedlaith.benmabrouk@avocarbon.com",
+        "rnd_email": "mohamedlaith.benmabrouk@avocarbon.com",
     },
 }
 COSTING_FILE_STATUS_PENDING = "PENDING"
 COSTING_FILE_STATUS_UPLOADED = "UPLOADED"
 COSTING_FILE_STATUS_NA = "NA"
+FEASIBILITY_STATUS_FEASIBLE = "FEASIBLE"
+FEASIBILITY_STATUS_FEASIBLE_UNDER_CONDITION = "FEASIBLE_UNDER_CONDITION"
+FEASIBILITY_STATUS_NOT_FEASIBLE = "NOT_FEASIBLE"
+FEASIBILITY_STATUSES = {
+    FEASIBILITY_STATUS_FEASIBLE,
+    FEASIBILITY_STATUS_FEASIBLE_UNDER_CONDITION,
+    FEASIBILITY_STATUS_NOT_FEASIBLE,
+}
 PRICING_COSTING_FILE_ROLES = {"PRICING_BOM", "PRICING_FINAL_PRICE"}
 PRICING_WORKFLOW_STATE_WAITING_BOM = "WAITING_BOM"
 PRICING_WORKFLOW_STATE_BOM_UPLOADED = "BOM_UPLOADED"
@@ -231,7 +239,15 @@ def _assert_terminal_status_allowed(rfq: Rfq, target_sub_status: RfqSubStatus) -
 def _can_view_rfq(current_user: User, rfq: Rfq) -> bool:
     return (
         current_user.role == UserRole.OWNER
-        or (current_user.role == UserRole.COSTING_TEAM and rfq.phase == RfqPhase.COSTING)
+        or (
+            current_user.role == UserRole.COSTING_TEAM
+            and _is_assigned_costing_agent(current_user, rfq)
+        )
+        or (
+            current_user.role == UserRole.RND
+            and rfq.phase == RfqPhase.COSTING
+            and _is_assigned_rnd(current_user, rfq)
+        )
         or (current_user.role == UserRole.PLM and _is_assigned_plm(current_user, rfq))
         or rfq.created_by_email == current_user.email
         or rfq.zone_manager_email == current_user.email
@@ -417,6 +433,53 @@ def _is_assigned_plm(current_user: User, rfq: Rfq) -> bool:
     return _normalize_email(current_user.email) == _normalize_email(
         get_plm_email(rfq.product_line_acronym or "")
     )
+
+
+def _is_assigned_costing_agent(current_user: User, rfq: Rfq) -> bool:
+    return _normalize_email(current_user.email) == _normalize_email(
+        get_costing_agent_email(rfq.product_line_acronym or "")
+    )
+
+
+def _is_assigned_rnd(current_user: User, rfq: Rfq) -> bool:
+    return _normalize_email(current_user.email) == _normalize_email(
+        get_rnd_email(rfq.product_line_acronym or "")
+    )
+
+
+def _assert_costing_phase_assignment(
+    current_user: User,
+    rfq: Rfq,
+    *,
+    allow_rnd: bool = False,
+    allow_plm: bool = False,
+) -> None:
+    if current_user.role == UserRole.OWNER:
+        return
+
+    if current_user.role == UserRole.COSTING_TEAM:
+        if not _is_assigned_costing_agent(current_user, rfq):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned as the costing agent for this RFQ.",
+            )
+        return
+
+    if allow_rnd and current_user.role == UserRole.RND:
+        if not _is_assigned_rnd(current_user, rfq):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned as the R&D contact for this RFQ.",
+            )
+        return
+
+    if allow_plm and current_user.role == UserRole.PLM:
+        if not _is_assigned_plm(current_user, rfq):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned as the PLM for this RFQ.",
+            )
+        return
 
 
 def _append_revision_note(existing_notes: str | None, prefix: str, detail: str | None) -> str:
@@ -1045,18 +1108,27 @@ async def list_rfqs(
     query = _rfq_query().order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
 
     if current_user.role != UserRole.OWNER:
-        visibility_filters = [
-            Rfq.created_by_email == current_user.email,
-            Rfq.zone_manager_email == current_user.email,
-        ]
-        if current_user.role == UserRole.PLM:
+        if current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}:
+            contact_key = {
+                UserRole.COSTING_TEAM: "costing_agent_email",
+                UserRole.RND: "rnd_email",
+                UserRole.PLM: "plm_email",
+            }[current_user.role]
             assigned_acronyms = _get_product_line_acronyms_for_email(
-                "plm_email", current_user.email
+                contact_key, current_user.email
             )
-            if assigned_acronyms:
-                visibility_filters.append(Rfq.product_line_acronym.in_(assigned_acronyms))
-
-        query = query.where(or_(*visibility_filters))
+            if not assigned_acronyms:
+                query = query.where(Rfq.rfq_id == "__unassigned__")
+            else:
+                query = query.where(Rfq.product_line_acronym.in_(assigned_acronyms))
+                if current_user.role == UserRole.RND:
+                    query = query.where(Rfq.phase == RfqPhase.COSTING)
+        else:
+            visibility_filters = [
+                Rfq.created_by_email == current_user.email,
+                Rfq.zone_manager_email == current_user.email,
+            ]
+            query = query.where(or_(*visibility_filters))
 
     result = await db.execute(query)
     return result.scalars().all()
@@ -1153,8 +1225,7 @@ async def create_costing_message(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    if not _can_view_rfq(current_user, rfq) and current_user.role != UserRole.COSTING_TEAM:
-        raise HTTPException(status_code=403, detail="Not authorized to access this RFQ.")
+    _assert_can_view_rfq(current_user, rfq)
 
     if (rfq.phase, rfq.sub_status) not in {
         (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),
@@ -1498,6 +1569,7 @@ async def costing_review(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_costing_phase_assignment(current_user, rfq)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY):
         raise HTTPException(
@@ -1565,11 +1637,13 @@ async def submit_costing_file_action(
     rfq_id: str,
     action: str = Form(...),
     note: str = Form(...),
+    feasibility_status: str = Form(...),
     file: UploadFile | None = File(default=None),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.RND, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_costing_phase_assignment(current_user, rfq, allow_rnd=True)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY):
         raise HTTPException(
@@ -1585,6 +1659,16 @@ async def submit_costing_file_action(
         raise HTTPException(
             status_code=400,
             detail="action must be either 'UPLOADED' or 'NA'.",
+        )
+
+    normalized_feasibility_status = str(feasibility_status or "").strip().upper()
+    if normalized_feasibility_status not in FEASIBILITY_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "feasibility_status must be one of "
+                "'FEASIBLE', 'FEASIBLE_UNDER_CONDITION', or 'NOT_FEASIBLE'."
+            ),
         )
 
     trimmed_note = str(note or "").strip()
@@ -1618,23 +1702,44 @@ async def submit_costing_file_action(
             )
         ]
 
-    rfq.costing_file_state = {
-        "file_status": normalized_action,
-        "file_note": trimmed_note,
-        "action_by": current_user.email,
-        "action_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "file": file_meta,
-    }
+    next_costing_file_state = dict(rfq.costing_file_state or {})
+    next_costing_file_state.update(
+        {
+            "file_status": normalized_action,
+            "file_note": trimmed_note,
+            "feasibility_status": normalized_feasibility_status,
+            "action_by": current_user.email,
+            "action_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "file": file_meta,
+        }
+    )
+    rfq.costing_file_state = next_costing_file_state
 
-    action_label = "Not applicable noted" if normalized_action == COSTING_FILE_STATUS_NA else "Costing file uploaded"
+    action_label = (
+        "Not applicable noted"
+        if normalized_action == COSTING_FILE_STATUS_NA
+        else "Costing file uploaded"
+    )
     await log_action(
         db,
         rfq_id,
-        f"{action_label}: {trimmed_note}",
+        f"{action_label} [{normalized_feasibility_status}]: {trimmed_note}",
         current_user.email,
     )
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if current_user.role == UserRole.RND:
+        refreshed_data = dict(refreshed_rfq.rfq_data or {})
+        systematic_rfq_id = str(refreshed_data.get("systematic_rfq_id") or "")
+        emails.send_feasibility_result_email(
+            recipient_email=refreshed_rfq.created_by_email,
+            systematic_rfq_id=systematic_rfq_id,
+            feasibility_status=normalized_feasibility_status,
+            rfq_link=_build_rfq_link(rfq_id),
+        )
+
+    return refreshed_rfq
 
 
 @router.post("/{rfq_id}/pricing-bom", response_model=RfqOut)
@@ -1646,6 +1751,7 @@ async def upload_pricing_bom_file(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_costing_phase_assignment(current_user, rfq)
 
     if rfq.phase != RfqPhase.COSTING or rfq.sub_status != RfqSubStatus.PRICING:
         raise HTTPException(
@@ -1722,6 +1828,7 @@ async def upload_pricing_final_price_file(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_costing_phase_assignment(current_user, rfq)
 
     if rfq.phase != RfqPhase.COSTING or rfq.sub_status != RfqSubStatus.PRICING:
         raise HTTPException(
@@ -1809,12 +1916,7 @@ async def costing_validation(
     current_user: User = Depends(require_role(UserRole.PLM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and not _is_assigned_plm(current_user, rfq):
-        raise HTTPException(
-            status_code=403,
-            detail="You are not assigned as the PLM for this RFQ.",
-        )
+    _assert_costing_phase_assignment(current_user, rfq, allow_plm=True)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.PRICING):
         raise HTTPException(
@@ -1911,6 +2013,12 @@ async def advance_status(
     ),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+
+    if rfq.phase == RfqPhase.COSTING:
+        if current_user.role == UserRole.COSTING_TEAM:
+            _assert_costing_phase_assignment(current_user, rfq)
+        elif current_user.role == UserRole.PLM:
+            _assert_costing_phase_assignment(current_user, rfq, allow_plm=True)
 
     if body.target_sub_status == RfqSubStatus.MISSION_NOT_ACCEPTED:
         raise HTTPException(

@@ -448,6 +448,50 @@ Please download the templates and open the RFQ here:
     return send_email(recipient_email, subject, text_body, html_body=html_body)
 
 
+def send_feasibility_result_email(
+    recipient_email: str,
+    systematic_rfq_id: str,
+    feasibility_status: str,
+    rfq_link: str,
+) -> bool:
+    normalized_rfq_id = _normalize_systematic_rfq_id(systematic_rfq_id)
+    normalized_status = str(feasibility_status or "").strip().upper() or "-"
+    rfq_id_line = _rfq_id_text_block(normalized_rfq_id)
+    rfq_id_html = _rfq_id_html_item(normalized_rfq_id)
+    subject = (
+        f"RFQ {normalized_rfq_id} - Feasibility Result: {normalized_status}"
+        if normalized_rfq_id
+        else f"Feasibility Result: {normalized_status}"
+    )
+    text_body = f"""Hello,
+
+R&D has submitted the feasibility result for this RFQ.
+
+{rfq_id_line}Feasibility result: {normalized_status}
+
+The RFQ is now transitioning to the Pricing stage of the Costing phase. You can review the notes and files here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "Feasibility Result Submitted",
+        f"""
+          <p>Hello,</p>
+          <p>R&amp;D has submitted the feasibility result for this RFQ.</p>
+          <ul>
+            {rfq_id_html}
+            <li><strong>Feasibility result:</strong> {normalized_status}</li>
+          </ul>
+          <p>The RFQ is now transitioning to the <strong>Pricing</strong> stage of the Costing phase. You can review the notes and files here:</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+        """,
+    )
+    return send_email(recipient_email, subject, text_body, html_body=html_body)
+
+
 def send_bom_ready_email(
     costing_agent_email: str,
     systematic_rfq_id: str,

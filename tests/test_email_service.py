@@ -257,3 +257,39 @@ def test_send_revision_and_costing_message_emails_use_only_systematic_rfq_id(mon
     assert "RFQ ID: rfq-123" not in str(message_email["body"])
     assert "RFQ ID:</strong> 26001-BRU-00" in str(message_email["html_body"])
     assert "RFQ ID:</strong> rfq-123" not in str(message_email["html_body"])
+
+
+def test_send_feasibility_result_email_includes_status_and_pricing_stage(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_send_email(to, subject, body, cc=None, html_body=None):
+        captured["to"] = to
+        captured["subject"] = subject
+        captured["body"] = body
+        captured["cc"] = cc
+        captured["html_body"] = html_body
+        return True
+
+    monkeypatch.setattr(emails, "send_email", _fake_send_email)
+
+    result = emails.send_feasibility_result_email(
+        "creator@example.com",
+        "26001-BRU-00",
+        "FEASIBLE_UNDER_CONDITION",
+        "http://localhost:5173/rfqs/new?id=rfq-123",
+    )
+
+    assert result is True
+    assert captured["to"] == "creator@example.com"
+    assert captured["cc"] is None
+    assert (
+        captured["subject"]
+        == "RFQ 26001-BRU-00 - Feasibility Result: FEASIBLE_UNDER_CONDITION"
+    )
+    assert "R&D has submitted the feasibility result" in str(captured["body"])
+    assert "FEASIBLE_UNDER_CONDITION" in str(captured["body"])
+    assert "Pricing stage of the Costing phase" in str(captured["body"])
+    assert "RFQ ID: 26001-BRU-00" in str(captured["body"])
+    assert "RFQ ID:</strong> 26001-BRU-00" in str(captured["html_body"])
+    assert "FEASIBLE_UNDER_CONDITION" in str(captured["html_body"])
+    assert "Pricing" in str(captured["html_body"])

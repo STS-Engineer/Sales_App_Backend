@@ -71,6 +71,34 @@ async def _create_rfq(
     return rfq
 
 
+def _assign_matrix_contacts(
+    monkeypatch,
+    *,
+    product_line_acronym: str = "BRU",
+    costing_email: str | None = None,
+    rnd_email: str | None = None,
+    plm_email: str | None = None,
+) -> None:
+    next_matrix = {
+        product_line: dict(entry)
+        for product_line, entry in rfq_router.PRODUCT_LINE_MATRIX.items()
+    }
+    normalized_acronym = str(product_line_acronym or "").strip().upper()
+
+    for entry in next_matrix.values():
+        if str(entry.get("code") or "").strip().upper() != normalized_acronym:
+            continue
+        if costing_email is not None:
+            entry["costing_agent_email"] = costing_email
+        if rnd_email is not None:
+            entry["rnd_email"] = rnd_email
+        if plm_email is not None:
+            entry["plm_email"] = plm_email
+        break
+
+    monkeypatch.setattr(rfq_router, "PRODUCT_LINE_MATRIX", next_matrix)
+
+
 @pytest.mark.asyncio
 async def test_validation_approval_initializes_costing_file_state_and_sends_entry_email(
     client: AsyncClient,
@@ -107,7 +135,7 @@ async def test_validation_approval_initializes_costing_file_state_and_sends_entr
         _rfq_link: str,
     ) -> bool:
         email_calls.append(
-            (systematic_rfq_id, "ons.ghariani@avocarbon.com")
+            (systematic_rfq_id, "mohamedlaith.benmabrouk@avocarbon.com")
         )
         return True
 
@@ -131,7 +159,7 @@ async def test_validation_approval_initializes_costing_file_state_and_sends_entr
     assert email_calls == [
         (
             str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
-            "ons.ghariani@avocarbon.com",
+            "mohamedlaith.benmabrouk@avocarbon.com",
         )
     ]
 
@@ -160,6 +188,7 @@ async def test_costing_review_approval_sends_reception_and_handoff_emails(
         role=UserRole.COSTING_TEAM,
         full_name="Costing Reviewer",
     )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -224,7 +253,7 @@ async def test_costing_review_approval_sends_reception_and_handoff_emails(
     assert handoff_calls == [
         (
             str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
-            "ons.ghariani@avocarbon.com",
+            "mohamedlaith.benmabrouk@avocarbon.com",
             "BRU",
         )
     ]
@@ -254,6 +283,11 @@ async def test_costing_review_approval_syncs_assembly_rfq_only_for_ass_product_l
         prefix="assembly-sync-user",
         role=UserRole.COSTING_TEAM,
         full_name="Assembly Costing Reviewer",
+    )
+    _assign_matrix_contacts(
+        monkeypatch,
+        product_line_acronym="ASS",
+        costing_email=costing_user.email,
     )
     rfq = await _create_rfq(
         db_session,
@@ -319,6 +353,7 @@ async def test_costing_review_rejection_sends_reception_email_without_handoff(
         role=UserRole.COSTING_TEAM,
         full_name="Reject Reviewer",
     )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -404,6 +439,23 @@ async def test_costing_file_action_supports_na_and_uploaded(
         role=UserRole.COSTING_TEAM,
         full_name="File Reviewer",
     )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    feasibility_email_calls: list[tuple[str, str, str, str]] = []
+    monkeypatch.setattr(
+        rfq_router.emails,
+        "send_feasibility_result_email",
+        lambda recipient_email, systematic_rfq_id, feasibility_status, rfq_link: (
+            feasibility_email_calls.append(
+                (
+                    recipient_email,
+                    systematic_rfq_id,
+                    feasibility_status,
+                    rfq_link,
+                )
+            )
+            or True
+        ),
+    )
     rfq_na = await _create_rfq(
         db_session,
         creator=creator,
@@ -414,7 +466,11 @@ async def test_costing_file_action_supports_na_and_uploaded(
 
     na_response = await client.post(
         f"/api/rfq/{rfq_na.rfq_id}/costing-file-action",
-        data={"action": "NA", "note": "Handled in the standard costing template."},
+        data={
+            "action": "NA",
+            "note": "Handled in the standard costing template.",
+            "feasibility_status": "FEASIBLE_UNDER_CONDITION",
+        },
         headers=_headers_for(costing_user),
     )
 
@@ -422,6 +478,7 @@ async def test_costing_file_action_supports_na_and_uploaded(
     na_payload = na_response.json()
     assert na_payload["costing_file_state"]["file_status"] == "NA"
     assert na_payload["costing_file_state"]["file_note"] == "Handled in the standard costing template."
+    assert na_payload["costing_file_state"]["feasibility_status"] == "FEASIBLE_UNDER_CONDITION"
     assert na_payload["costing_file_state"]["action_by"] == costing_user.email
 
     rfq_upload = await _create_rfq(
@@ -451,7 +508,11 @@ async def test_costing_file_action_supports_na_and_uploaded(
 
     upload_response = await client.post(
         f"/api/rfq/{rfq_upload.rfq_id}/costing-file-action",
-        data={"action": "UPLOADED", "note": "Final feasibility workbook attached."},
+        data={
+            "action": "UPLOADED",
+            "note": "Final feasibility workbook attached.",
+            "feasibility_status": "FEASIBLE",
+        },
         files={"file": ("feasibility.xlsx", b"dummy-bytes", "application/vnd.ms-excel")},
         headers=_headers_for(costing_user),
     )
@@ -459,14 +520,312 @@ async def test_costing_file_action_supports_na_and_uploaded(
     assert upload_response.status_code == 200
     upload_payload = upload_response.json()
     assert upload_payload["costing_file_state"]["file_status"] == "UPLOADED"
+    assert upload_payload["costing_file_state"]["feasibility_status"] == "FEASIBLE"
     assert upload_payload["costing_file_state"]["file"]["filename"] == "feasibility.xlsx"
     assert upload_payload["costing_files"][-1]["filename"] == "feasibility.xlsx"
+    assert feasibility_email_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rnd_can_submit_feasibility_file_action_with_status(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="rnd-file-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="RND File Creator",
+    )
+    rnd_user = await _create_user(
+        db_session,
+        prefix="rnd-file-user",
+        role=UserRole.RND,
+        full_name="RND Engineer",
+    )
+    _assign_matrix_contacts(monkeypatch, rnd_email=rnd_user.email)
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.FEASIBILITY,
+        costing_file_state={"file_status": "PENDING"},
+    )
+
+    async def _fake_upload_costing_action_file(*, rfq_id, file, current_user_email):
+        return {
+            "id": f"{rfq_id}-rnd-feasibility",
+            "filename": "rnd-feasibility.xlsx",
+            "name": "rnd-feasibility.xlsx",
+            "download_url": "https://example.com/rnd-feasibility.xlsx",
+            "url": "https://example.com/rnd-feasibility.xlsx",
+            "uploaded_by": current_user_email,
+            "uploaded_at": "2026-04-16T14:00:00+00:00",
+        }
+
+    monkeypatch.setattr(
+        rfq_router,
+        "_upload_costing_action_file",
+        _fake_upload_costing_action_file,
+    )
+    feasibility_email_calls: list[tuple[str, str, str, str]] = []
+    monkeypatch.setattr(
+        rfq_router.emails,
+        "send_feasibility_result_email",
+        lambda recipient_email, systematic_rfq_id, feasibility_status, rfq_link: (
+            feasibility_email_calls.append(
+                (
+                    recipient_email,
+                    systematic_rfq_id,
+                    feasibility_status,
+                    rfq_link,
+                )
+            )
+            or True
+        ),
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/costing-file-action",
+        data={
+            "action": "UPLOADED",
+            "note": "R&D feasibility package attached.",
+            "feasibility_status": "NOT_FEASIBLE",
+        },
+        files={"file": ("rnd-feasibility.xlsx", b"dummy-bytes", "application/vnd.ms-excel")},
+        headers=_headers_for(rnd_user),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["costing_file_state"]["action_by"] == rnd_user.email
+    assert payload["costing_file_state"]["feasibility_status"] == "NOT_FEASIBLE"
+    assert payload["costing_file_state"]["file"]["filename"] == "rnd-feasibility.xlsx"
+    assert feasibility_email_calls == [
+        (
+            creator.email,
+            str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
+            "NOT_FEASIBLE",
+            rfq_router._build_rfq_link(rfq.rfq_id),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_costing_file_action_rejects_invalid_feasibility_status(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="costing-file-invalid-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Invalid Status Creator",
+    )
+    costing_user = await _create_user(
+        db_session,
+        prefix="costing-file-invalid-user",
+        role=UserRole.COSTING_TEAM,
+        full_name="Invalid Status Reviewer",
+    )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.FEASIBILITY,
+        costing_file_state={"file_status": "PENDING"},
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/costing-file-action",
+        data={
+            "action": "NA",
+            "note": "This should fail.",
+            "feasibility_status": "MAYBE",
+        },
+        headers=_headers_for(costing_user),
+    )
+
+    assert response.status_code == 400
+    assert "feasibility_status" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_unassigned_rnd_cannot_submit_feasibility_file_action(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="rnd-unassigned-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Unassigned RND Creator",
+    )
+    assigned_rnd_user = await _create_user(
+        db_session,
+        prefix="rnd-assigned",
+        role=UserRole.RND,
+        full_name="Assigned RND Engineer",
+    )
+    rnd_user = await _create_user(
+        db_session,
+        prefix="rnd-unassigned",
+        role=UserRole.RND,
+        full_name="Unassigned RND Engineer",
+    )
+    _assign_matrix_contacts(monkeypatch, rnd_email=assigned_rnd_user.email)
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.FEASIBILITY,
+        costing_file_state={"file_status": "PENDING"},
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/costing-file-action",
+        data={
+            "action": "NA",
+            "note": "R&D is not assigned here.",
+            "feasibility_status": "FEASIBLE",
+        },
+        headers=_headers_for(rnd_user),
+    )
+
+    assert response.status_code == 403
+    assert "R&D" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "restrict_to_costing_phase"),
+    [
+        (UserRole.COSTING_TEAM, False),
+        (UserRole.RND, True),
+        (UserRole.PLM, False),
+    ],
+)
+async def test_list_rfqs_filters_assigned_product_lines_for_matrix_roles(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+    role: UserRole,
+    restrict_to_costing_phase: bool,
+):
+    matrix_user = await _create_user(
+        db_session,
+        prefix=f"matrix-{role.value.lower()}",
+        role=role,
+        full_name=f"{role.value} Matrix User",
+    )
+    creator = await _create_user(
+        db_session,
+        prefix=f"matrix-{role.value.lower()}-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Matrix Creator",
+    )
+
+    assign_kwargs = {}
+    if role == UserRole.COSTING_TEAM:
+        assign_kwargs["costing_email"] = matrix_user.email
+    elif role == UserRole.RND:
+        assign_kwargs["rnd_email"] = matrix_user.email
+    else:
+        assign_kwargs["plm_email"] = matrix_user.email
+
+    _assign_matrix_contacts(monkeypatch, product_line_acronym="BRU", **assign_kwargs)
+
+    assigned_costing_rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.FEASIBILITY,
+        costing_file_state={"file_status": "PENDING"},
+        product_line_acronym="BRU",
+        product_name="Brushes",
+    )
+    assigned_rfq_stage_rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.RFQ,
+        sub_status=RfqSubStatus.NEW_RFQ,
+        product_line_acronym="BRU",
+        product_name="Brushes",
+    )
+    other_product_line_rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.FEASIBILITY,
+        costing_file_state={"file_status": "PENDING"},
+        product_line_acronym="SEA",
+        product_name="Seals",
+    )
+
+    response = await client.get("/api/rfq", headers=_headers_for(matrix_user))
+
+    assert response.status_code == 200
+    returned_ids = {item["rfq_id"] for item in response.json()}
+    assert assigned_costing_rfq.rfq_id in returned_ids
+    assert other_product_line_rfq.rfq_id not in returned_ids
+    if restrict_to_costing_phase:
+        assert assigned_rfq_stage_rfq.rfq_id not in returned_ids
+    else:
+        assert assigned_rfq_stage_rfq.rfq_id in returned_ids
+
+
+@pytest.mark.asyncio
+async def test_unassigned_costing_user_cannot_run_costing_review(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="unassigned-costing-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Unassigned Costing Creator",
+    )
+    assigned_costing_user = await _create_user(
+        db_session,
+        prefix="assigned-costing-review",
+        role=UserRole.COSTING_TEAM,
+        full_name="Assigned Costing Reviewer",
+    )
+    costing_user = await _create_user(
+        db_session,
+        prefix="unassigned-costing-review",
+        role=UserRole.COSTING_TEAM,
+        full_name="Unassigned Costing Reviewer",
+    )
+    _assign_matrix_contacts(monkeypatch, costing_email=assigned_costing_user.email)
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.FEASIBILITY,
+        costing_file_state={"file_status": "PENDING"},
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/costing_review",
+        json={"scope": True},
+        headers=_headers_for(costing_user),
+    )
+
+    assert response.status_code == 403
+    assert "costing agent" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
 async def test_advance_to_pricing_requires_costing_file_action(
     client: AsyncClient,
     db_session: AsyncSession,
+    monkeypatch,
 ):
     creator = await _create_user(
         db_session,
@@ -480,6 +839,7 @@ async def test_advance_to_pricing_requires_costing_file_action(
         role=UserRole.COSTING_TEAM,
         full_name="Advance Reviewer",
     )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -524,6 +884,7 @@ async def test_costing_messages_store_recipient_and_unify_costing_thread(
         role=UserRole.COSTING_TEAM,
         full_name="Message Sender",
     )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -616,6 +977,7 @@ async def test_pricing_bom_upload_persists_file_in_costing_files(
         role=UserRole.COSTING_TEAM,
         full_name="Pricing BOM User",
     )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -678,6 +1040,7 @@ async def test_pricing_final_price_upload_requires_bom_and_persists_file(
         role=UserRole.COSTING_TEAM,
         full_name="Pricing User",
     )
+    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
