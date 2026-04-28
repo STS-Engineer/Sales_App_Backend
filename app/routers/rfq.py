@@ -17,6 +17,7 @@ from app.database import get_db
 from app.middleware.auth import get_current_user, require_role
 from app.models.audit_log import AuditLog
 from app.models.discussion import DiscussionMessage
+from app.models.notification_log import NotificationLog
 from app.models.potential import Potential
 from app.models.rfq import ALLOWED_TRANSITIONS, Rfq, RfqPhase, RfqSubStatus, VALID_PHASE_SUBSTATUS
 from app.models.user import User, UserRole
@@ -31,6 +32,7 @@ from app.schemas.rfq import (
     CostingValidationRequest,
     AutopsyRequest,
     CostingReviewRequest,
+    NotificationLogOut,
     PhaseStatusUpdateRequest,
     RequestRevisionRequest,
     RfqCreateRequest,
@@ -47,6 +49,20 @@ from app.services.costing_template import (
 from app.services.potential import (
     get_missing_potential_shared_fields,
     sync_potential_to_rfq_data,
+)
+from app.services.notifications import (
+    EMAIL_BOM_READY,
+    EMAIL_COSTING_APPROVED,
+    EMAIL_COSTING_ENTRY,
+    EMAIL_COSTING_HANDOFF,
+    EMAIL_COSTING_MESSAGE,
+    EMAIL_COSTING_RECEPTION_RESULT,
+    EMAIL_COSTING_REJECTED,
+    EMAIL_FEASIBILITY_RESULT,
+    EMAIL_PRICING_READY,
+    EMAIL_REVISION_REQUEST,
+    EMAIL_VALIDATION_REQUEST,
+    record_notification_sent,
 )
 from app.utils import emails
 
@@ -257,6 +273,111 @@ def _can_view_rfq(current_user: User, rfq: Rfq) -> bool:
 def _assert_can_view_rfq(current_user: User, rfq: Rfq) -> None:
     if not _can_view_rfq(current_user, rfq):
         raise HTTPException(status_code=403, detail="Not authorized to access this RFQ.")
+
+
+def _is_rfq_creator(current_user: User, rfq: Rfq) -> bool:
+    return _normalize_email(current_user.email) == _normalize_email(rfq.created_by_email)
+
+
+def _is_assigned_validator(current_user: User, rfq: Rfq) -> bool:
+    return _normalize_email(current_user.email) == _normalize_email(rfq.zone_manager_email)
+
+
+def _is_costing_specialist_role(current_user: User) -> bool:
+    return current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}
+
+
+def _can_edit_rfq_phase(current_user: User, rfq: Rfq) -> bool:
+    if current_user.role == UserRole.OWNER:
+        return True
+    if _is_costing_specialist_role(current_user):
+        return False
+    return _is_rfq_creator(current_user, rfq) or _is_assigned_validator(current_user, rfq)
+
+
+def _can_edit_offer_phase(current_user: User, rfq: Rfq) -> bool:
+    if current_user.role == UserRole.OWNER:
+        return True
+    if _is_costing_specialist_role(current_user):
+        return False
+    return _is_rfq_creator(current_user, rfq) or _is_assigned_validator(current_user, rfq)
+
+
+def _assert_can_edit_rfq_phase(current_user: User, rfq: Rfq) -> None:
+    if not _can_edit_rfq_phase(current_user, rfq):
+        raise HTTPException(status_code=403, detail="Not authorized to edit this RFQ phase.")
+
+
+def _assert_can_edit_offer_phase(current_user: User, rfq: Rfq) -> None:
+    if not _can_edit_offer_phase(current_user, rfq):
+        raise HTTPException(status_code=403, detail="Not authorized to edit this Offer phase.")
+
+
+def _assert_can_edit_base_rfq_data(current_user: User, rfq: Rfq) -> None:
+    if rfq.phase == RfqPhase.RFQ:
+        _assert_can_edit_rfq_phase(current_user, rfq)
+        return
+    if rfq.phase == RfqPhase.OFFER:
+        _assert_can_edit_offer_phase(current_user, rfq)
+        return
+    if current_user.role == UserRole.OWNER:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Base RFQ data can only be changed from the RFQ or Offer phase.",
+    )
+
+
+def _assert_can_directly_update_status(
+    current_user: User,
+    rfq: Rfq,
+    target_phase: RfqPhase,
+) -> None:
+    if rfq.phase == RfqPhase.COSTING:
+        _assert_costing_phase_assignment(
+            current_user,
+            rfq,
+            allow_rnd=True,
+            allow_plm=True,
+        )
+        return
+
+    if rfq.phase == RfqPhase.RFQ:
+        if current_user.role == UserRole.OWNER or _is_assigned_validator(
+            current_user,
+            rfq,
+        ):
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="Only the owner or assigned validator can directly update RFQ status.",
+        )
+
+    if rfq.phase == RfqPhase.OFFER:
+        _assert_can_edit_offer_phase(current_user, rfq)
+        return
+
+    if target_phase == RfqPhase.COSTING:
+        _assert_costing_phase_assignment(
+            current_user,
+            rfq,
+            allow_rnd=True,
+            allow_plm=True,
+        )
+        return
+
+    if target_phase == RfqPhase.RFQ:
+        _assert_can_edit_rfq_phase(current_user, rfq)
+        return
+
+    if target_phase == RfqPhase.OFFER:
+        _assert_can_edit_offer_phase(current_user, rfq)
+        return
+
+    if current_user.role == UserRole.OWNER:
+        return
+
+    raise HTTPException(status_code=403, detail="Not authorized to update this RFQ status.")
 
 
 def _rfq_query():
@@ -480,6 +601,11 @@ def _assert_costing_phase_assignment(
                 detail="You are not assigned as the PLM for this RFQ.",
             )
         return
+
+    raise HTTPException(
+        status_code=403,
+        detail="You are not authorized to perform costing actions for this RFQ.",
+    )
 
 
 def _append_revision_note(existing_notes: str | None, prefix: str, detail: str | None) -> str:
@@ -727,8 +853,7 @@ async def _submit_rfq_for_validation_internal(
     current_user: User,
     send_email: bool = True,
 ) -> dict[str, str | bool]:
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to submit this RFQ.")
+    _assert_can_edit_rfq_phase(current_user, rfq)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ):
         raise HTTPException(
@@ -795,6 +920,13 @@ async def _submit_rfq_for_validation_internal(
             _build_rfq_link(rfq.rfq_id),
             validator_role=validator_role,
         )
+        if email_sent:
+            await record_notification_sent(
+                db,
+                rfq_id=rfq.rfq_id,
+                recipients=zone_manager_email,
+                email_type=EMAIL_VALIDATION_REQUEST,
+            )
 
     return {
         "message": "RFQ submitted for validation.",
@@ -851,11 +983,10 @@ async def update_rfq_data(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to update this RFQ.")
+    _assert_can_edit_base_rfq_data(current_user, rfq)
 
     incoming_data = rfq_data_payload_to_dict(body.rfq_data)
+    incoming_data.pop("rfq_files", None)
     if "target_price_is_estimated" in incoming_data:
         val = incoming_data["target_price_is_estimated"]
         incoming_data["target_price_is_estimated"] = (
@@ -887,9 +1018,7 @@ async def proceed_to_rfq(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to proceed with this RFQ.")
+    _assert_can_edit_rfq_phase(current_user, rfq)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.POTENTIAL):
         raise HTTPException(
@@ -927,9 +1056,7 @@ async def upload_rfq_file(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to upload files to this RFQ.")
+    _assert_can_edit_base_rfq_data(current_user, rfq)
 
     safe_name = _safe_upload_filename(file.filename)
     file_id = str(uuid.uuid4())
@@ -996,9 +1123,7 @@ async def delete_rfq_file(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to delete files from this RFQ.")
+    _assert_can_edit_base_rfq_data(current_user, rfq)
 
     extracted_data = dict(rfq.rfq_data or {})
     raw_files = extracted_data.get("rfq_files")
@@ -1050,9 +1175,7 @@ async def delete_rfq_file_by_name(
         raise HTTPException(status_code=400, detail="filename is required.")
 
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to delete files from this RFQ.")
+    _assert_can_edit_base_rfq_data(current_user, rfq)
 
     extracted_data = dict(rfq.rfq_data or {})
     raw_files = extracted_data.get("rfq_files")
@@ -1226,6 +1349,7 @@ async def create_costing_message(
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
     _assert_can_view_rfq(current_user, rfq)
+    _assert_costing_phase_assignment(current_user, rfq, allow_rnd=True, allow_plm=True)
 
     if (rfq.phase, rfq.sub_status) not in {
         (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),
@@ -1251,13 +1375,20 @@ async def create_costing_message(
     await db.refresh(message)
 
     rfq_data = dict(rfq.rfq_data or {})
-    emails.send_costing_message_email(
+    email_sent = emails.send_costing_message_email(
         body.recipient_email,
         str(rfq_data.get("systematic_rfq_id") or ""),
         current_user.email,
         body.message,
         _build_rfq_link(rfq_id),
     )
+    if email_sent:
+        await record_notification_sent(
+            db,
+            rfq_id=rfq_id,
+            recipients=body.recipient_email,
+            email_type=EMAIL_COSTING_MESSAGE,
+        )
 
     return _build_discussion_message_out(message, current_user)
 
@@ -1322,14 +1453,7 @@ async def request_revision(
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
 
-    assigned_validator_email = str(rfq.zone_manager_email or "").strip()
-    current_user_email = str(current_user.email or "").strip()
-    is_assigned_validator = (
-        bool(assigned_validator_email)
-        and assigned_validator_email.casefold() == current_user_email.casefold()
-    )
-
-    if current_user.role != UserRole.OWNER and not is_assigned_validator:
+    if current_user.role != UserRole.OWNER and not _is_assigned_validator(current_user, rfq):
         raise HTTPException(
             status_code=403,
             detail="You are not assigned as the Validator for this RFQ.",
@@ -1364,12 +1488,19 @@ async def request_revision(
     await db.refresh(rfq)
 
     rfq_data = dict(rfq.rfq_data or {})
-    emails.send_revision_request_email(
+    email_sent = emails.send_revision_request_email(
         rfq.created_by_email,
         str(rfq_data.get("systematic_rfq_id") or ""),
         comment,
         _build_rfq_link(rfq_id),
     )
+    if email_sent:
+        await record_notification_sent(
+            db,
+            rfq_id=rfq_id,
+            recipients=rfq.created_by_email,
+            email_type=EMAIL_REVISION_REQUEST,
+        )
 
     return await _get_rfq_or_404(db, rfq_id)
 
@@ -1381,9 +1512,7 @@ async def submit_revision(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to submit this revision.")
+    _assert_can_edit_rfq_phase(current_user, rfq)
 
     if (rfq.phase, rfq.sub_status) != (
         RfqPhase.RFQ,
@@ -1416,10 +1545,20 @@ async def update_rfq_status(
     body: PhaseStatusUpdateRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(
-        require_role(UserRole.ZONE_MANAGER, UserRole.OWNER, UserRole.COSTING_TEAM)
+        require_role(
+            UserRole.COMMERCIAL,
+            UserRole.ZONE_MANAGER,
+            UserRole.COSTING_TEAM,
+            UserRole.RND,
+            UserRole.PLANT_MANAGER,
+            UserRole.PLM,
+            UserRole.OWNER,
+        )
     ),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_directly_update_status(current_user, rfq, body.phase)
+
     effective_phase = body.phase
     if body.sub_status in TERMINAL_SUBSTATUSES:
         effective_phase = rfq.phase
@@ -1477,6 +1616,24 @@ async def get_audit_logs(
     return logs.scalars().all()
 
 
+@router.get("/{rfq_id}/notifications", response_model=list[NotificationLogOut])
+async def get_notification_logs(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_view_rfq(current_user, rfq)
+
+    query = (
+        select(NotificationLog)
+        .where(NotificationLog.rfq_id == rfq_id)
+        .order_by(NotificationLog.sent_at.desc(), NotificationLog.log_id.desc())
+    )
+    logs = await db.execute(query)
+    return logs.scalars().all()
+
+
 @router.post("/{rfq_id}/validate", response_model=RfqOut)
 async def validate_rfq(
     rfq_id: str,
@@ -1488,14 +1645,7 @@ async def validate_rfq(
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
 
-    assigned_validator_email = str(rfq.zone_manager_email or "").strip()
-    current_user_email = str(current_user.email or "").strip()
-    is_assigned_validator = (
-        bool(assigned_validator_email)
-        and assigned_validator_email.casefold() == current_user_email.casefold()
-    )
-
-    if current_user.role != UserRole.OWNER and not is_assigned_validator:
+    if current_user.role != UserRole.OWNER and not _is_assigned_validator(current_user, rfq):
         raise HTTPException(
             status_code=403,
             detail="You are not assigned as the Validator for this RFQ.",
@@ -1550,13 +1700,21 @@ async def validate_rfq(
         route_entry = _resolve_product_line_route(refreshed_rfq)
         if route_entry:
             refreshed_data = dict(refreshed_rfq.rfq_data or {})
-            emails.send_costing_entry_email(
-                str(route_entry.get("email") or ""),
+            recipient_email = str(route_entry.get("email") or "")
+            email_sent = emails.send_costing_entry_email(
+                recipient_email,
                 str(route_entry.get("product_line") or ""),
                 str(route_entry.get("code") or ""),
                 str(refreshed_data.get("systematic_rfq_id") or ""),
                 _build_rfq_link(refreshed_rfq.rfq_id),
             )
+            if email_sent:
+                await record_notification_sent(
+                    db,
+                    rfq_id=refreshed_rfq.rfq_id,
+                    recipients=recipient_email,
+                    email_type=EMAIL_COSTING_ENTRY,
+                )
 
     return refreshed_rfq
 
@@ -1606,7 +1764,7 @@ async def costing_review(
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
     systematic_rfq_id = str(refreshed_data.get("systematic_rfq_id") or "")
     rfq_link = _build_rfq_link(refreshed_rfq.rfq_id)
-    emails.send_costing_reception_results_email(
+    reception_email_sent = emails.send_costing_reception_results_email(
         refreshed_rfq.created_by_email,
         cc_email,
         current_user.email,
@@ -1615,17 +1773,32 @@ async def costing_review(
         is_approved=body.scope,
         rejection_reason=body.rejection_reason,
     )
+    if reception_email_sent:
+        await record_notification_sent(
+            db,
+            rfq_id=refreshed_rfq.rfq_id,
+            recipients=[refreshed_rfq.created_by_email, cc_email or ""],
+            email_type=EMAIL_COSTING_RECEPTION_RESULT,
+        )
 
     if body.scope:
         route_entry = _resolve_product_line_route(refreshed_rfq)
         if route_entry:
-            emails.send_costing_handoff_email(
-                str(route_entry.get("email") or ""),
+            recipient_email = str(route_entry.get("email") or "")
+            handoff_email_sent = emails.send_costing_handoff_email(
+                recipient_email,
                 str(route_entry.get("product_line") or ""),
                 str(route_entry.get("code") or ""),
                 systematic_rfq_id,
                 rfq_link,
             )
+            if handoff_email_sent:
+                await record_notification_sent(
+                    db,
+                    rfq_id=refreshed_rfq.rfq_id,
+                    recipients=recipient_email,
+                    email_type=EMAIL_COSTING_HANDOFF,
+                )
         if str(refreshed_rfq.product_line_acronym or "").upper() == "ASS":
             await sync_rfq_to_assembly(refreshed_rfq)
 
@@ -1732,12 +1905,19 @@ async def submit_costing_file_action(
     if current_user.role == UserRole.RND:
         refreshed_data = dict(refreshed_rfq.rfq_data or {})
         systematic_rfq_id = str(refreshed_data.get("systematic_rfq_id") or "")
-        emails.send_feasibility_result_email(
+        email_sent = emails.send_feasibility_result_email(
             recipient_email=refreshed_rfq.created_by_email,
             systematic_rfq_id=systematic_rfq_id,
             feasibility_status=normalized_feasibility_status,
             rfq_link=_build_rfq_link(rfq_id),
         )
+        if email_sent:
+            await record_notification_sent(
+                db,
+                rfq_id=rfq_id,
+                recipients=refreshed_rfq.created_by_email,
+                email_type=EMAIL_FEASIBILITY_RESULT,
+            )
 
     return refreshed_rfq
 
@@ -1811,11 +1991,19 @@ async def upload_pricing_bom_file(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
-    emails.send_bom_ready_email(
-        get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or "",
+    recipient_email = get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or ""
+    email_sent = emails.send_bom_ready_email(
+        recipient_email,
         str(refreshed_data.get("systematic_rfq_id") or ""),
         _build_rfq_link(refreshed_rfq.rfq_id),
     )
+    if email_sent:
+        await record_notification_sent(
+            db,
+            rfq_id=refreshed_rfq.rfq_id,
+            recipients=recipient_email,
+            email_type=EMAIL_BOM_READY,
+        )
     return refreshed_rfq
 
 
@@ -1900,11 +2088,19 @@ async def upload_pricing_final_price_file(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
-    emails.send_pricing_ready_email(
-        get_plm_email(refreshed_rfq.product_line_acronym or "") or "",
+    recipient_email = get_plm_email(refreshed_rfq.product_line_acronym or "") or ""
+    email_sent = emails.send_pricing_ready_email(
+        recipient_email,
         str(refreshed_data.get("systematic_rfq_id") or ""),
         _build_rfq_link(refreshed_rfq.rfq_id),
     )
+    if email_sent:
+        await record_notification_sent(
+            db,
+            rfq_id=refreshed_rfq.rfq_id,
+            recipients=recipient_email,
+            email_type=EMAIL_PRICING_READY,
+        )
     return refreshed_rfq
 
 
@@ -1979,19 +2175,36 @@ async def costing_validation(
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
     if body.is_approved:
-        emails.send_costing_approved_email(
+        email_sent = emails.send_costing_approved_email(
             refreshed_rfq.created_by_email,
             systematic_rfq_id,
             rfq_link,
         )
+        if email_sent:
+            await record_notification_sent(
+                db,
+                rfq_id=refreshed_rfq.rfq_id,
+                recipients=refreshed_rfq.created_by_email,
+                email_type=EMAIL_COSTING_APPROVED,
+            )
     else:
-        emails.send_costing_rejected_email(
-            get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or "",
+        costing_agent_email = (
+            get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or ""
+        )
+        email_sent = emails.send_costing_rejected_email(
+            costing_agent_email,
             refreshed_rfq.created_by_email,
             systematic_rfq_id,
             rfq_link,
             str(body.rejection_reason or ""),
         )
+        if email_sent:
+            await record_notification_sent(
+                db,
+                rfq_id=refreshed_rfq.rfq_id,
+                recipients=[costing_agent_email, refreshed_rfq.created_by_email],
+                email_type=EMAIL_COSTING_REJECTED,
+            )
 
     return refreshed_rfq
 
@@ -2014,11 +2227,20 @@ async def advance_status(
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
 
-    if rfq.phase == RfqPhase.COSTING:
+    if rfq.phase == RfqPhase.RFQ:
+        _assert_can_edit_rfq_phase(current_user, rfq)
+    elif rfq.phase == RfqPhase.OFFER:
+        _assert_can_edit_offer_phase(current_user, rfq)
+    elif rfq.phase == RfqPhase.COSTING:
         if current_user.role == UserRole.COSTING_TEAM:
             _assert_costing_phase_assignment(current_user, rfq)
         elif current_user.role == UserRole.PLM:
             _assert_costing_phase_assignment(current_user, rfq, allow_plm=True)
+        elif current_user.role != UserRole.OWNER:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not authorized to advance this costing RFQ.",
+            )
 
     if body.target_sub_status == RfqSubStatus.MISSION_NOT_ACCEPTED:
         raise HTTPException(

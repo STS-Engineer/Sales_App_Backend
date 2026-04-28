@@ -12,6 +12,10 @@ from app.middleware.auth import get_current_user, require_role
 from app.models.contact import Contact
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
 from app.models.user import User, UserRole
+from app.routers.rfq import (
+    _assert_can_edit_rfq_phase,
+    _assert_costing_phase_assignment,
+)
 from app.services.audit import log_action
 
 router = APIRouter(prefix="/api/actions", tags=["actions"])
@@ -65,8 +69,12 @@ async def check_group(
 async def upload_file(
     rfq_id: str,
     file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_edit_rfq_phase(current_user, rfq)
+
     upload_dir = os.path.join("uploads", rfq_id)
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, os.path.basename(file.filename or "attachment"))
@@ -105,9 +113,7 @@ async def trigger_workflow(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, body.rfq_id)
-
-    if current_user.role != UserRole.OWNER and rfq.created_by_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to trigger this workflow.")
+    _assert_can_edit_rfq_phase(current_user, rfq)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ):
         raise HTTPException(
@@ -175,6 +181,8 @@ async def upload_costing_file(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_costing_phase_assignment(current_user, rfq)
+
     costing_states = {
         (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),
         (RfqPhase.COSTING, RfqSubStatus.PRICING),

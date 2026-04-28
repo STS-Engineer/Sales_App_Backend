@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     FROM_EMAIL: str | None = None
     AZURE_CONNECTION_STRING: str | None = None
     AZURE_RFQ_FILES_CONTAINER: str = "rfq-files"
+    CRON_TOKEN: str | None = None
 
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE))
 

@@ -15,6 +15,7 @@ from app.database import get_db, get_db3
 from app.middleware.auth import get_current_user
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
 from app.routers.rfq import (
+    _assert_can_edit_base_rfq_data,
     _maybe_assign_systematic_rfq_id,
     _submit_rfq_for_validation_internal,
 )
@@ -1729,6 +1730,7 @@ async def edit_chat_message(
 
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
+    _assert_can_edit_base_rfq_data(current_user, rfq)
 
     if rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.POTENTIAL:
         raise HTTPException(
@@ -1778,6 +1780,7 @@ async def handle_chat(
 
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found")
+    _assert_can_edit_base_rfq_data(current_user, rfq)
 
     if str(req.chat_mode or "").strip().lower() == "potential" or (
         rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.POTENTIAL

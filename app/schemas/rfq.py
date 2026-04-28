@@ -25,6 +25,8 @@ class RfqOut(BaseModel):
     autopsy_notes: str | None
     approved_at: datetime | None
     rejected_at: datetime | None
+    last_notification_sent_at: datetime | None = None
+    follow_up_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -37,6 +39,16 @@ class AuditLogOut(BaseModel):
     action: str
     performed_by: str
     timestamp: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class NotificationLogOut(BaseModel):
+    log_id: str
+    rfq_id: str
+    recipient_email: str
+    email_type: str
+    sent_at: datetime
 
     model_config = {"from_attributes": True}
 

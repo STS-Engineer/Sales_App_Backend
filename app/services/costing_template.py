@@ -1065,11 +1065,11 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
 
         field_rows = []
         for label, keys in fields:
-            raw = _pick_first_value(data, keys)
-            value_style = field_empty_style if raw == "-" else field_value_style
+            display_value = _get_field_display_value(label, keys, data)
+            value_style = field_empty_style if display_value == "-" else field_value_style
             field_rows.append([
                 Paragraph(escape(label.upper()), field_label_style),
-                Paragraph(_paragraph_html(raw), value_style),
+                Paragraph(_paragraph_html(display_value), value_style),
             ])
 
         body = Table(field_rows, colWidths=[56 * mm, 124 * mm])
@@ -1119,10 +1119,10 @@ def _render_field_group(
     rows: list[str] = []
 
     for label, keys in fields:
-        raw = _pick_first_value(data, keys)
-        is_empty = raw == "-"
+        display_value = _get_field_display_value(label, keys, data)
+        is_empty = display_value == "-"
         cell_class = "value-empty" if is_empty else "value"
-        cell_content = "&mdash;" if is_empty else _format_html_value(raw)
+        cell_content = "&mdash;" if is_empty else _format_html_value(display_value)
         rows.append(
             f'<tr>'
             f'<td class="label">{escape(label)}</td>'
@@ -1192,14 +1192,72 @@ def _load_logo_data_uri() -> str:
 # ── Data helpers ─────────────────────────────────────────────────────────────
 
 
-def _pick_first_value(data: dict[str, Any], keys: tuple[str, ...]) -> str:
+def _get_field_display_value(
+    label: str,
+    keys: tuple[str, ...],
+    data: dict[str, Any],
+) -> str:
+    if label == "Target price":
+        return _format_target_price_display(data)
+    return _pick_first_value(data, keys)
+
+
+def _format_target_price_display(data: dict[str, Any]) -> str:
+    eur_value = _pick_first_raw_value(data, ("target_price_eur", "targetPrice"))
+    local_value = _pick_first_raw_value(data, ("target_price_local", "targetPriceLocal"))
+    local_currency = _pick_first_raw_value(data, ("target_price_currency", "targetPriceCurrency"))
+    estimated_value = _pick_first_raw_value(
+        data,
+        ("target_price_is_estimated", "targetPriceIsEstimated"),
+    )
+
+    eur_text = _stringify_value(eur_value).strip() if eur_value is not None else ""
+    local_text = _stringify_value(local_value).strip() if local_value is not None else ""
+    local_currency_text = (
+        _stringify_value(local_currency).strip().upper()
+        if local_currency is not None
+        else ""
+    )
+
+    if not eur_text and not local_text:
+        return "-"
+
+    status_label = "estimated" if _coerce_bool(estimated_value) else "customer price"
+
+    if eur_text and local_text and local_currency_text != "EUR":
+        local_segment = f"{local_text} {local_currency_text}".strip()
+        return f"{eur_text} EUR / {local_segment} ({status_label})"
+
+    if eur_text:
+        return f"{eur_text} EUR ({status_label})"
+
+    local_segment = f"{local_text} {local_currency_text}".strip()
+    return f"{local_segment} ({status_label})"
+
+
+def _pick_first_raw_value(data: dict[str, Any], keys: tuple[str, ...]) -> Any | None:
     for key in keys:
         if key not in data:
             continue
         value = data.get(key)
         if _has_meaningful_value(value):
-            return _stringify_value(value)
-    return "-"
+            return value
+    return None
+
+
+def _pick_first_value(data: dict[str, Any], keys: tuple[str, ...]) -> str:
+    value = _pick_first_raw_value(data, keys)
+    if value is None:
+        return "-"
+    return _stringify_value(value)
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes"}
 
 
 def _has_meaningful_value(value: Any) -> bool:

@@ -492,6 +492,52 @@ The RFQ is now transitioning to the Pricing stage of the Costing phase. You can 
     return send_email(recipient_email, subject, text_body, html_body=html_body)
 
 
+def send_action_required_followup(
+    recipient_email: str,
+    systematic_rfq_id: str,
+    action_description: str,
+    days_pending: int,
+    rfq_link: str,
+) -> bool:
+    normalized_action = str(action_description or "").strip() or "your action"
+    normalized_days = max(int(days_pending or 0), 0)
+    rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
+    rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    subject = f"Action Required: RFQ Follow-Up{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+This is a follow-up reminder from the AVO Carbon RFQ Portal.
+
+{rfq_id_line}This RFQ has been waiting for {normalized_action} for {normalized_days} days and requires your immediate attention.
+
+Please open the RFQ and complete the pending action here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "RFQ Follow-Up Required",
+        f"""
+          <p>Hello,</p>
+          <p>This is a follow-up reminder from the <strong>AVO Carbon RFQ Portal</strong>.</p>
+          <ul>
+            {rfq_id_html}
+            <li><strong>Pending action:</strong> {normalized_action}</li>
+            <li><strong>Days pending:</strong> {normalized_days}</li>
+          </ul>
+          <p>This RFQ requires your immediate attention.</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #dc2626; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+          <p style="font-size: 14px; color: #666666;">
+            If the button above does not work, copy and paste this link into your browser:<br>
+            <a href="{rfq_link}" style="color: #2563eb; word-break: break-all;">{rfq_link}</a>
+          </p>
+        """,
+    )
+    return send_email(recipient_email, subject, text_body, html_body=html_body)
+
+
 def send_bom_ready_email(
     costing_agent_email: str,
     systematic_rfq_id: str,

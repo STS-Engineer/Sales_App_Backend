@@ -293,3 +293,38 @@ def test_send_feasibility_result_email_includes_status_and_pricing_stage(monkeyp
     assert "RFQ ID:</strong> 26001-BRU-00" in str(captured["html_body"])
     assert "FEASIBLE_UNDER_CONDITION" in str(captured["html_body"])
     assert "Pricing" in str(captured["html_body"])
+
+
+def test_send_action_required_followup_includes_pending_details(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_send_email(to, subject, body, cc=None, html_body=None):
+        captured["to"] = to
+        captured["subject"] = subject
+        captured["body"] = body
+        captured["cc"] = cc
+        captured["html_body"] = html_body
+        return True
+
+    monkeypatch.setattr(emails, "send_email", _fake_send_email)
+
+    result = emails.send_action_required_followup(
+        "validator@example.com",
+        "26001-BRU-00",
+        "Commercial Validation",
+        3,
+        "http://localhost:5173/rfqs/new?id=rfq-123",
+    )
+
+    assert result is True
+    assert captured["to"] == "validator@example.com"
+    assert captured["cc"] is None
+    assert captured["subject"] == "Action Required: RFQ Follow-Up: 26001-BRU-00"
+    assert "RFQ ID: 26001-BRU-00" in str(captured["body"])
+    assert "Commercial Validation" in str(captured["body"])
+    assert "3 days" in str(captured["body"])
+    assert "immediate attention" in str(captured["body"])
+    assert "rfq-123" in str(captured["body"])
+    assert "RFQ ID:</strong> 26001-BRU-00" in str(captured["html_body"])
+    assert "Commercial Validation" in str(captured["html_body"])
+    assert "Days pending:</strong> 3" in str(captured["html_body"])

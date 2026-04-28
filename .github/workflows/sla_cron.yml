@@ -1,0 +1,18 @@
+name: SLA Follow-Up Sweeper
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  trigger-sweeper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Call Follow-up API
+        run: |
+          curl --fail --show-error --silent \
+            -X POST "${{ secrets.API_BASE_URL }}/api/internal/trigger-followups" \
+            -H "Content-Type: application/json" \
+            -H "X-Cron-Token: ${{ secrets.CRON_TOKEN }}"
