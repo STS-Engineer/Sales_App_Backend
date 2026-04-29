@@ -305,6 +305,9 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Keep at most 5 digits after the decimal point." in chat.SYSTEM_PROMPT
     assert "save 0.19879 into the database" in chat.SYSTEM_PROMPT
     assert "Target Price" in chat.SYSTEM_PROMPT
+    assert "TARGET PRICE FORMAT RULE" in chat.SYSTEM_PROMPT
+    assert "Price source (Must be either 'Estimated by Avocarbon' or 'Given by Customer')" in chat.SYSTEM_PROMPT
+    assert "FORBIDDEN from flattening" in chat.SYSTEM_PROMPT
     assert "target_price_local" in chat.SYSTEM_PROMPT
     assert "target_price_currency" in chat.SYSTEM_PROMPT
     assert "target_price_is_estimated" in chat.SYSTEM_PROMPT
