@@ -312,6 +312,10 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "NO SCRATCHPAD MATH" in chat.SYSTEM_PROMPT
     assert "NO GUESSING/PROPOSITIONS" in chat.SYSTEM_PROMPT
     assert "ENUM EXCEPTION" in chat.SYSTEM_PROMPT
+    assert "FINAL CONFIRMATION RULE" in chat.SYSTEM_PROMPT
+    assert "Shall I submit this RFQ for validation?" in chat.SYSTEM_PROMPT
+    assert "NEVER write '1. Yes'" in chat.SYSTEM_PROMPT
+    assert "strict boolean choices" in chat.SYSTEM_PROMPT
     assert "target_price_local" in chat.SYSTEM_PROMPT
     assert "target_price_currency" in chat.SYSTEM_PROMPT
     assert "target_price_is_estimated" in chat.SYSTEM_PROMPT
