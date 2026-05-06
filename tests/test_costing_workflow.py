@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
 from app.models.discussion import DiscussionMessage
-from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
+from app.models.rfq import Rfq, RfqDocumentType, RfqPhase, RfqSubStatus
 from app.models.user import User, UserRole
 from app.routers import rfq as rfq_router
 from app.routers.auth import create_access_token
@@ -49,8 +49,10 @@ async def _create_rfq(
     costing_file_state: dict | None = None,
     product_line_acronym: str = "BRU",
     product_name: str = "Brushes",
+    document_type: RfqDocumentType = RfqDocumentType.RFQ,
 ) -> Rfq:
     rfq = Rfq(
+        document_type=document_type,
         phase=phase,
         sub_status=sub_status,
         product_line_acronym=product_line_acronym,
@@ -1099,3 +1101,185 @@ async def test_pricing_final_price_upload_requires_bom_and_persists_file(
     assert payload["costing_files"][-1]["phase"] == "PRICING"
     assert payload["costing_files"][-1]["folder_name"] == "pricing-final-price"
     assert payload["costing_files"][-1]["note"] == "Final customer price validated."
+
+
+@pytest.mark.asyncio
+async def test_pricing_validation_approval_keeps_rfq_offer_handoff(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="pricing-approve-rfq-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Pricing Approve RFQ Creator",
+    )
+    plm_user = await _create_user(
+        db_session,
+        prefix="pricing-approve-rfq-plm",
+        role=UserRole.PLM,
+        full_name="Pricing Approve RFQ PLM",
+    )
+    _assign_matrix_contacts(monkeypatch, plm_email=plm_user.email)
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.PRICING,
+        costing_file_state={
+            "file_status": "UPLOADED",
+            "workflow_state": "PRICING_UPLOADED",
+        },
+    )
+    rfq.costing_files = [
+        {
+            "id": f"{rfq.rfq_id}-final-price",
+            "filename": "final-price.xlsx",
+            "url": "https://example.com/final-price.xlsx",
+            "file_role": "PRICING_FINAL_PRICE",
+            "phase": "PRICING",
+        }
+    ]
+    await db_session.commit()
+
+    email_calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        rfq_router.emails,
+        "send_costing_approved_email",
+        lambda requester_email, systematic_rfq_id, rfq_link: (
+            email_calls.append((requester_email, systematic_rfq_id, rfq_link)) or True
+        ),
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/costing_validation",
+        json={"is_approved": True},
+        headers=_headers_for(plm_user),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["phase"] == "OFFER"
+    assert payload["sub_status"] == "PREPARATION"
+    assert payload["costing_file_state"]["workflow_state"] == "APPROVED"
+    assert email_calls == [
+        (
+            creator.email,
+            str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
+            f"http://localhost:5173/rfqs/new?id={rfq.rfq_id}",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pricing_validation_approval_closes_rfi_and_emails_requester(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="pricing-approve-rfi-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Pricing Approve RFI Creator",
+    )
+    plm_user = await _create_user(
+        db_session,
+        prefix="pricing-approve-rfi-plm",
+        role=UserRole.PLM,
+        full_name="Pricing Approve RFI PLM",
+    )
+    _assign_matrix_contacts(monkeypatch, plm_email=plm_user.email)
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.PRICING,
+        costing_file_state={
+            "file_status": "UPLOADED",
+            "workflow_state": "PRICING_UPLOADED",
+        },
+        document_type=RfqDocumentType.RFI,
+    )
+    rfq.costing_files = [
+        {
+            "id": f"{rfq.rfq_id}-final-price",
+            "filename": "rfi-costing.xlsx",
+            "download_url": "https://example.com/rfi-costing.xlsx",
+            "file_role": "PRICING_FINAL_PRICE",
+            "phase": "PRICING",
+        }
+    ]
+    await db_session.commit()
+
+    email_calls: list[tuple[str, str, str, str]] = []
+    monkeypatch.setattr(
+        rfq_router.emails,
+        "send_rfi_completed_email",
+        lambda requester_email, systematic_rfq_id, rfq_link, costing_file_link: (
+            email_calls.append(
+                (requester_email, systematic_rfq_id, rfq_link, costing_file_link)
+            )
+            or True
+        ),
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/costing_validation",
+        json={"is_approved": True},
+        headers=_headers_for(plm_user),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["document_type"] == "RFI"
+    assert payload["phase"] == "CLOSED"
+    assert payload["sub_status"] == "RFI_COMPLETED"
+    assert payload["costing_file_state"]["workflow_state"] == "APPROVED"
+    assert email_calls == [
+        (
+            creator.email,
+            str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
+            f"http://localhost:5173/rfqs/new?id={rfq.rfq_id}",
+            "https://example.com/rfi-costing.xlsx",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rfi_cannot_be_advanced_to_offer_with_generic_transition(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="rfi-no-offer-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="RFI No Offer Creator",
+    )
+    plm_user = await _create_user(
+        db_session,
+        prefix="rfi-no-offer-plm",
+        role=UserRole.PLM,
+        full_name="RFI No Offer PLM",
+    )
+    _assign_matrix_contacts(monkeypatch, plm_email=plm_user.email)
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.PRICING,
+        costing_file_state={"file_status": "UPLOADED"},
+        document_type=RfqDocumentType.RFI,
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/advance",
+        json={"target_phase": "OFFER", "target_sub_status": "PREPARATION"},
+        headers=_headers_for(plm_user),
+    )
+
+    assert response.status_code == 400
+    assert "RFI documents cannot advance beyond Costing" in response.json()["detail"]

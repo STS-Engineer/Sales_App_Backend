@@ -23,10 +23,15 @@ class RfqPhase(str, enum.Enum):
     CLOSED = "CLOSED"
 
 
+class RfqDocumentType(str, enum.Enum):
+    RFQ = "RFQ"
+    RFI = "RFI"
+    POTENTIAL = "POTENTIAL"
+
+
 # ── Sub-status enum ──────────────────────────────────────────────────
 class RfqSubStatus(str, enum.Enum):
     # RFQ phase
-    POTENTIAL = "POTENTIAL"
     NEW_RFQ = "NEW_RFQ"
     PENDING_FOR_VALIDATION = "PENDING_FOR_VALIDATION"
     REVISION_REQUESTED = "REVISION_REQUESTED"
@@ -49,6 +54,7 @@ class RfqSubStatus(str, enum.Enum):
     CANCELED = "CANCELED"
     # Terminal positive (under CLOSED phase)
     PO_SECURED = "PO_SECURED"
+    RFI_COMPLETED = "RFI_COMPLETED"
 
 
 # ── Terminal sub-statuses that can occur in any phase ────────────────
@@ -60,7 +66,6 @@ _TERMINAL_ANYWHERE: set[RfqSubStatus] = {
 # ── Valid (phase, sub_status) pairs ──────────────────────────────────
 VALID_PHASE_SUBSTATUS: dict[RfqPhase, set[RfqSubStatus]] = {
     RfqPhase.RFQ: {
-        RfqSubStatus.POTENTIAL,
         RfqSubStatus.NEW_RFQ,
         RfqSubStatus.PENDING_FOR_VALIDATION,
         RfqSubStatus.REVISION_REQUESTED,
@@ -85,6 +90,7 @@ VALID_PHASE_SUBSTATUS: dict[RfqPhase, set[RfqSubStatus]] = {
     } | _TERMINAL_ANYWHERE,
     RfqPhase.CLOSED: {
         RfqSubStatus.PO_SECURED,
+        RfqSubStatus.RFI_COMPLETED,
         RfqSubStatus.LOST,
         RfqSubStatus.CANCELED,
     },
@@ -102,10 +108,6 @@ ALLOWED_TRANSITIONS: dict[
     set[tuple[RfqPhase, RfqSubStatus]],
 ] = {
     # ── RFQ phase ────────────────────────────────────────────────────
-    (RfqPhase.RFQ, RfqSubStatus.POTENTIAL): {
-        (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ),
-        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
-    },
     (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ): {
         (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),
         (RfqPhase.RFQ, RfqSubStatus.CANCELED),
@@ -190,7 +192,13 @@ class Rfq(Base):
     sub_status: Mapped[RfqSubStatus] = mapped_column(
         SAEnum(RfqSubStatus, name="rfqsubstatus"),
         nullable=False,
-        default=RfqSubStatus.POTENTIAL,
+        default=RfqSubStatus.NEW_RFQ,
+    )
+    document_type: Mapped[RfqDocumentType] = mapped_column(
+        SAEnum(RfqDocumentType, name="rfqdocumenttype"),
+        nullable=False,
+        default=RfqDocumentType.RFQ,
+        server_default=RfqDocumentType.RFQ.value,
     )
 
     # FK to validation_matrix.acronym (unique-constrained)

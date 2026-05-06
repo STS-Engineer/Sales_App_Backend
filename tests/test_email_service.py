@@ -295,6 +295,37 @@ def test_send_feasibility_result_email_includes_status_and_pricing_stage(monkeyp
     assert "Pricing" in str(captured["html_body"])
 
 
+def test_send_rfi_completed_email_includes_costing_file_link(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_send_email(to, subject, body, cc=None, html_body=None):
+        captured["to"] = to
+        captured["subject"] = subject
+        captured["body"] = body
+        captured["cc"] = cc
+        captured["html_body"] = html_body
+        return True
+
+    monkeypatch.setattr(emails, "send_email", _fake_send_email)
+
+    result = emails.send_rfi_completed_email(
+        "requester@example.com",
+        "26001-BRU-00",
+        "http://localhost:5173/rfqs/new?id=rfq-123",
+        "https://example.com/rfi-costing.xlsx",
+    )
+
+    assert result is True
+    assert captured["to"] == "requester@example.com"
+    assert captured["cc"] is None
+    assert captured["subject"] == "RFI Completed: 26001-BRU-00"
+    assert "The costing has been validated for this RFI" in str(captured["body"])
+    assert "https://example.com/rfi-costing.xlsx" in str(captured["body"])
+    assert "RFQ ID: 26001-BRU-00" in str(captured["body"])
+    assert "RFI Completed" in str(captured["html_body"])
+    assert "Download Costing File" in str(captured["html_body"])
+
+
 def test_send_action_required_followup_includes_pending_details(monkeypatch):
     captured: dict[str, object] = {}
 

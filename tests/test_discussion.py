@@ -140,7 +140,7 @@ async def test_discussion_get_filters_by_rfq_and_phase(
             DiscussionMessage(
                 rfq_id=first_rfq.rfq_id,
                 user_id=creator.user_id,
-                phase=RfqSubStatus.POTENTIAL,
+                phase=RfqSubStatus.FEASIBILITY,
                 message="Wrong phase",
             ),
             DiscussionMessage(

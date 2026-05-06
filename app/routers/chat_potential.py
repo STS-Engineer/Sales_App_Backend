@@ -15,8 +15,8 @@ from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.contact import Contact
 from app.models.potential import Potential
-from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
-from app.schemas.rfq import RfqOut
+from app.models.rfq import Rfq, RfqDocumentType
+from app.schemas.rfq import RfqOut, normalize_rfq_data_products
 from app.models.user import User, UserRole
 from app.services.potential import POTENTIAL_ALLOWED_FIELDS, update_potential_fields
 
@@ -99,6 +99,20 @@ POTENTIAL_TOOL_FIELD_PROPERTIES = {
     field_name: {"type": "number" if field_type == "float" else "string"}
     for field_name, field_type in POTENTIAL_ALLOWED_FIELDS.items()
 }
+POTENTIAL_TOOL_FIELD_PROPERTIES["products"] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "part_number": {"type": "string"},
+            "revision_level": {"type": "string"},
+            "quantity": {"type": "number"},
+            "target_price": {"type": "number"},
+            "target_to": {"type": "number"},
+        },
+    },
+}
+POTENTIAL_TOOL_FIELD_PROPERTIES["total_target_to"] = {"type": "number"}
 
 TOOLS = [
     {
@@ -291,6 +305,7 @@ def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
 async def _execute_tool_calls(
     *,
     db: AsyncSession,
+    rfq: Rfq,
     potential: Potential,
     tool_calls: list[dict],
     tool_calls_used: list[str],
@@ -347,20 +362,34 @@ async def _execute_tool_calls(
             )
         elif func_name == "updatePotentialFields":
             fields = args.get("fields_to_update", {})
+            fields = dict(fields) if isinstance(fields, dict) else {}
+            product_fields = {
+                key: fields.pop(key)
+                for key in ("products", "total_target_to")
+                if key in fields
+            }
             filtered_fields, ignored_fields = await update_potential_fields(
                 db=db,
                 potential=potential,
                 fields_to_update=fields,
             )
+            if product_fields:
+                next_rfq_data = dict(rfq.rfq_data or {})
+                next_rfq_data.update(product_fields)
+                rfq.rfq_data = normalize_rfq_data_products(
+                    next_rfq_data,
+                    products_authoritative="products" in product_fields,
+                )
             await db.flush()
             tool_response_text = json.dumps(
                 {
                     "success": True,
-                    "fields_updated": list(filtered_fields.keys()),
+                    "fields_updated": list(filtered_fields.keys()) + list(product_fields.keys()),
                     "ignored_fields": ignored_fields,
                     "potential_systematic_id": potential.potential_systematic_id,
                     "margin_keur": potential.margin_keur,
                     "potential": _serialize_potential_state(potential),
+                    "rfq_data": rfq.rfq_data,
                 }
             )
         else:
@@ -396,10 +425,16 @@ async def handle_potential_chat(
         raise HTTPException(status_code=404, detail="RFQ not found")
     if not _can_view_rfq(current_user, rfq):
         raise HTTPException(status_code=403, detail="Not authorized to access this RFQ.")
-    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.POTENTIAL):
+    document_type = rfq.document_type
+    document_type_value = (
+        document_type.value
+        if isinstance(document_type, RfqDocumentType)
+        else str(document_type or "")
+    ).strip().upper()
+    if document_type_value != RfqDocumentType.POTENTIAL.value:
         raise HTTPException(
             status_code=409,
-            detail="The Potential phase is locked for this RFQ.",
+            detail="The Potential assistant is locked for this request.",
         )
 
     potential = rfq.potential
@@ -420,6 +455,11 @@ You are the Potential Opportunity Intake Assistant. This is a pre-sales assessme
 
 You must ONLY use these database fields:
 {json.dumps(sorted(POTENTIAL_ALLOWED_FIELDS.keys()), indent=2)}
+
+Potential product intake:
+- First, ask the user how many part numbers/products are included in this request.
+- Once they answer, ask them to provide the Part Number, Revision Level, Quantity, and Target Price for each product.
+- Save those product rows with updatePotentialFields using the parent RFQ JSON keys `products` and `total_target_to`; do not store products on the Potential table.
 
 Math rule:
 - When the user provides Sales (k€) and Margin (%), you must calculate Margin (k€) autonomously and save it with updatePotentialFields.
@@ -456,6 +496,9 @@ Current missing fields for that question:
 
 Current Potential database state:
 {json.dumps(_serialize_potential_state(potential), indent=2)}
+
+Current parent RFQ product state:
+{json.dumps(normalize_rfq_data_products(rfq.rfq_data), indent=2)}
 """.strip()
 
     messages_for_llm = [{"role": "system", "content": dynamic_prompt}, *history[-20:]]
@@ -481,6 +524,7 @@ Current Potential database state:
 
             tool_messages = await _execute_tool_calls(
                 db=db,
+                rfq=rfq,
                 potential=potential,
                 tool_calls=normalized_tool_calls,
                 tool_calls_used=tool_calls_used,
@@ -528,6 +572,8 @@ Current Potential database state:
         .where(Rfq.rfq_id == req.rfq_id)
     )
     refreshed_rfq = refreshed_result.scalar_one_or_none()
+    if refreshed_rfq:
+        refreshed_rfq.rfq_data = normalize_rfq_data_products(refreshed_rfq.rfq_data)
 
     return ChatResponse(
         response=final_text,
