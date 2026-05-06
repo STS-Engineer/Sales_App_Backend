@@ -10,6 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
 if TYPE_CHECKING:
+    from app.models.offer_preparation import OfferPreparation
     from app.models.potential import Potential
 
 
@@ -251,6 +252,12 @@ class Rfq(Base):
         back_populates="rfq",
         uselist=False,
         cascade="all, delete-orphan",
+    )
+    offer_preparation: Mapped["OfferPreparation | None"] = relationship(
+        back_populates="rfq",
+        uselist=False,
+        cascade="all, delete-orphan",
+        lazy="noload",
     )
 
     @property

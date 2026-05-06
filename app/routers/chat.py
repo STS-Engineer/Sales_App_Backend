@@ -580,7 +580,10 @@ def _is_field_filled(data: dict, field_name: str) -> bool:
 
 
 def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[int, list[str]]:
-    steps = POTENTIAL_STEPS if chat_mode == "potential" else RFQ_STEPS
+    if chat_mode == "potential":
+        steps = POTENTIAL_STEPS
+    else:
+        steps = RFQ_STEPS
     for step_number, fields in steps:
         missing_fields = [field for field in fields if not _is_field_filled(data, field)]
         if missing_fields:
@@ -589,7 +592,10 @@ def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[in
 
 
 def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
-    steps = POTENTIAL_STEPS if chat_mode == "potential" else RFQ_STEPS
+    if chat_mode == "potential":
+        steps = POTENTIAL_STEPS
+    else:
+        steps = RFQ_STEPS
     current_step, missing_fields = _get_current_step_and_missing_fields(chat_mode, data)
     current_step_fields = next(
         (fields for step_number, fields in steps if step_number == current_step),
@@ -613,7 +619,10 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
 
 
 def _filter_update_fields(chat_mode: str, fields: dict) -> dict:
-    allowed_fields = POTENTIAL_ALLOWED_FIELDS if chat_mode == "potential" else RFQ_ALLOWED_FIELDS
+    if chat_mode == "potential":
+        allowed_fields = POTENTIAL_ALLOWED_FIELDS
+    else:
+        allowed_fields = RFQ_ALLOWED_FIELDS
     return {key: value for key, value in fields.items() if key in allowed_fields}
 
 
@@ -843,7 +852,7 @@ def _payload_contains_internal_tool_markers(payload) -> bool:
     return False
 
 
-def _get_available_tools(rfq: Rfq) -> list[dict]:
+def _get_available_tools(rfq: Rfq, chat_mode: str) -> list[dict]:
     if _is_revision_requested(rfq):
         return [
             tool
@@ -1965,9 +1974,12 @@ async def handle_chat(
         
     sliced_history = list(history)[start_idx:]
 
-    base_system_prompt = POTENTIAL_SYSTEM_PROMPT if chat_mode == "potential" else SYSTEM_PROMPT
+    if chat_mode == "potential":
+        base_system_prompt = POTENTIAL_SYSTEM_PROMPT
+    else:
+        base_system_prompt = SYSTEM_PROMPT
     revision_mode_prompt = _build_revision_mode_prompt_context(rfq)
-    available_tools = _get_available_tools(rfq)
+    available_tools = _get_available_tools(rfq, chat_mode)
 
     def _build_dynamic_system_prompt() -> str:
         current_rfq_state = dict(extracted_data)
@@ -2005,22 +2017,7 @@ async def handle_chat(
                 chat_mode, current_rfq_state
             )
 
-        return f"""{base_system_prompt}
-
-=== MISSING_FIELDS_PROMPT ===
-{missing_fields_prompt}
-
-=== REVISION_MODE_CONTEXT ===
-{revision_mode_prompt}
-
-=== DOCUMENT_TYPE_CONTEXT ===
-{document_type_prompt}
-
-=== CURRENT RFQ DATABASE STATE ===
-Review this JSON to know exactly what has already been collected:
-{json.dumps(current_rfq_state, indent=2)}
-
-CRITICAL INSTRUCTION: 
+        mode_specific_instructions = """CRITICAL INSTRUCTION:
 1. Look at the CURRENT RFQ DATABASE STATE above. 
 2. NEVER ask the user for information that is already populated in this JSON.
 3. Use the populated fields and the missing-fields engine to determine exactly which step of the checklist you are currently on.
@@ -2041,7 +2038,24 @@ CRITICAL INSTRUCTION:
 18. If the request document_type is POTENTIAL, do NOT ask for detailed NEW_RFQ fields until it is converted to RFQ.
 19. If the RFQ sub_status is REVISION_REQUESTED, treat it as an editable RFQ revision workflow. Do NOT claim the user must return to NEW_RFQ before updates can be saved.
 20. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
-21. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen.
+21. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen."""
+
+        return f"""{base_system_prompt}
+
+=== MISSING_FIELDS_PROMPT ===
+{missing_fields_prompt}
+
+=== REVISION_MODE_CONTEXT ===
+{revision_mode_prompt}
+
+=== DOCUMENT_TYPE_CONTEXT ===
+{document_type_prompt}
+
+=== CURRENT RFQ DATABASE STATE ===
+Review this JSON to know exactly what has already been collected:
+{json.dumps(current_rfq_state, indent=2)}
+
+{mode_specific_instructions}
 """
 
     # Create a dynamic system message containing the database state

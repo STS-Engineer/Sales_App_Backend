@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from app.schemas.offer_preparation import OfferPreparationOut
 from app.models.rfq import RfqDocumentType, RfqPhase, RfqSubStatus
 from app.schemas.potential import PotentialOut
 
@@ -23,6 +24,7 @@ class RfqOut(BaseModel):
     costing_files: list[dict[str, Any]] | None
     costing_file_state: dict[str, Any] | None
     potential: PotentialOut | None = None
+    offer_preparation: OfferPreparationOut | None = None
     rejection_reason: str | None
     revision_notes: str | None
     autopsy_notes: str | None

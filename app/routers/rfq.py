@@ -16,6 +16,7 @@ from app.database_assembly import sync_rfq_to_assembly
 from app.database import get_db
 from app.middleware.auth import get_current_user, require_role
 from app.models.audit_log import AuditLog
+from app.models.contact import Contact
 from app.models.discussion import DiscussionMessage
 from app.models.notification_log import NotificationLog
 from app.models.potential import Potential
@@ -55,6 +56,11 @@ from app.services.costing_template import (
     build_costing_template_filename,
     render_costing_template_pdf,
 )
+from app.services.offer_template import (
+    build_offer_preparation_filename,
+    render_offer_preparation_docx,
+    render_offer_preparation_preview_html,
+)
 from app.services.potential import (
     get_missing_potential_shared_fields,
     sync_potential_to_rfq_data,
@@ -74,6 +80,7 @@ from app.services.notifications import (
     EMAIL_VALIDATION_REQUEST,
     record_notification_sent,
 )
+from app.services.offer_preparation_store import get_offer_preparation_data_snapshot
 from app.utils import emails
 
 router = APIRouter(prefix="/api/rfq", tags=["rfq"])
@@ -471,7 +478,10 @@ def _assert_can_directly_update_status(
 
 
 def _rfq_query():
-    return select(Rfq).options(selectinload(Rfq.potential))
+    return select(Rfq).options(
+        selectinload(Rfq.potential),
+        selectinload(Rfq.offer_preparation),
+    )
 
 
 async def _get_rfq_or_404(db: AsyncSession, rfq_id: str) -> Rfq:
@@ -503,6 +513,40 @@ def _build_discussion_message_out(
 
 def _normalize_email(value: str | None) -> str:
     return str(value or "").strip().casefold()
+
+
+async def _get_offer_creator_profile(db: AsyncSession, rfq: Rfq) -> dict[str, str]:
+    creator_email = str(rfq.created_by_email or "").strip()
+    if not creator_email:
+        return {}
+
+    creator_user_result = await db.execute(select(User).where(User.email == creator_email))
+    creator_user = creator_user_result.scalar_one_or_none()
+
+    creator_contact_result = await db.execute(
+        select(Contact).where(Contact.contact_email == creator_email)
+    )
+    creator_contact = creator_contact_result.scalar_one_or_none()
+
+    creator_name = (
+        str(creator_user.full_name or "").strip()
+        if creator_user is not None
+        else ""
+    )
+    if not creator_name and creator_contact is not None:
+        creator_name = str(creator_contact.contact_name or "").strip()
+
+    creator_phone = (
+        str(creator_contact.contact_phone or "").strip()
+        if creator_contact is not None
+        else ""
+    )
+
+    return {
+        "created_by_name": creator_name or creator_email,
+        "created_by_phone": creator_phone,
+        "created_by_email": creator_email,
+    }
 
 
 def _normalize_product_line_key(value: str | None) -> str:
@@ -1571,6 +1615,78 @@ async def download_costing_template(
     return Response(
         content=document_pdf,
         media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{rfq_id}/offer-template/preview")
+async def preview_offer_template(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_view_rfq(current_user, rfq)
+
+    if rfq.phase != RfqPhase.OFFER:
+        raise HTTPException(
+            status_code=400,
+            detail="The offer preparation template preview is only available during the Offer phase.",
+        )
+
+    try:
+        creator_profile = await _get_offer_creator_profile(db, rfq)
+        preview_html = render_offer_preparation_preview_html(
+            rfq,
+            creator_profile=creator_profile,
+            offer_data=get_offer_preparation_data_snapshot(rfq),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to generate the offer preparation preview. {exc}",
+        ) from exc
+
+    return {
+        "html": preview_html,
+        "filename": build_offer_preparation_filename(rfq),
+    }
+
+
+@router.get("/{rfq_id}/offer-template")
+async def download_offer_template(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_view_rfq(current_user, rfq)
+
+    if rfq.phase != RfqPhase.OFFER:
+        raise HTTPException(
+            status_code=400,
+            detail="The offer preparation template is only available during the Offer phase.",
+        )
+
+    filename = build_offer_preparation_filename(rfq)
+    try:
+        creator_profile = await _get_offer_creator_profile(db, rfq)
+        document_docx = render_offer_preparation_docx(
+            rfq,
+            creator_profile=creator_profile,
+            offer_data=get_offer_preparation_data_snapshot(rfq),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to generate the offer preparation document. {exc}",
+        ) from exc
+
+    return Response(
+        content=document_docx,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ),
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

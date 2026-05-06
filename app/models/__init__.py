@@ -12,6 +12,7 @@ from app.models.rfq import (
 from app.models.audit_log import AuditLog
 from app.models.notification_log import NotificationLog
 from app.models.discussion import DiscussionMessage
+from app.models.offer_preparation import OfferPreparation
 from app.models.potential import Potential
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "AuditLog",
     "NotificationLog",
     "DiscussionMessage",
+    "OfferPreparation",
 ]
