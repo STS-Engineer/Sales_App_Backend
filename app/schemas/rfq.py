@@ -1,15 +1,18 @@
 from datetime import datetime
+import json
+import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from app.models.rfq import RfqPhase, RfqSubStatus
 from app.schemas.offer_preparation import OfferPreparationOut
+from app.models.rfq import RfqDocumentType, RfqPhase, RfqSubStatus
 from app.schemas.potential import PotentialOut
 
 
 class RfqOut(BaseModel):
     rfq_id: str
+    document_type: RfqDocumentType = RfqDocumentType.RFQ
     phase: RfqPhase
     sub_status: RfqSubStatus
     product_line_acronym: str | None
@@ -55,11 +58,262 @@ class NotificationLogOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ProductItem(BaseModel):
+    part_number: str | None = None
+    revision_level: str | None = None
+    quantity: float | None = None
+    target_price: float | None = None
+    target_to: float | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+    @field_validator("quantity", "target_price", "target_to", mode="before")
+    @classmethod
+    def blank_numeric_to_none(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def compute_target_to(self) -> "ProductItem":
+        if self.quantity is not None and self.target_price is not None:
+            self.target_to = self.quantity * self.target_price
+        return self
+
+
 class RfqDataPayload(BaseModel):
+    products: list[ProductItem] | None = None
+    total_target_to: float | None = None
     po_date: str | None = None
     ppap_date: str | None = None
 
     model_config = ConfigDict(extra="allow")
+
+
+def _pick_first(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _clean_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _coerce_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if number == number else None
+
+    text = str(value).strip().replace("\u00a0", " ")
+    if not text:
+        return None
+    text = re.sub(r"[^0-9,.\-]", "", text.replace(" ", ""))
+    if not text or text in {"-", ".", ","}:
+        return None
+
+    last_comma = text.rfind(",")
+    last_dot = text.rfind(".")
+    if last_comma != -1 and last_dot != -1:
+        if last_comma > last_dot:
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif last_comma != -1:
+        comma_count = text.count(",")
+        if comma_count == 1 and re.search(r",\d{1,2}$", text):
+            text = text.replace(",", ".")
+        else:
+            text = text.replace(",", "")
+
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if number == number else None
+
+
+def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
+    if isinstance(raw_item, ProductItem):
+        item = raw_item.model_dump()
+    elif isinstance(raw_item, dict):
+        item = dict(raw_item)
+    else:
+        return None
+
+    part_number = _clean_text(
+        _pick_first(
+            item,
+            (
+                "part_number",
+                "partNumber",
+                "customer_pn",
+                "customerPn",
+                "pn",
+                "part_no",
+                "partNo",
+            ),
+        )
+    )
+    revision_level = _clean_text(
+        _pick_first(
+            item,
+            (
+                "revision_level",
+                "revisionLevel",
+                "revision",
+                "rev",
+            ),
+        )
+    )
+    quantity = _coerce_float_or_none(
+        _pick_first(
+            item,
+            (
+                "quantity",
+                "qty",
+                "annual_volume",
+                "annualVolume",
+                "qty_per_year",
+                "qtyPerYear",
+            ),
+        )
+    )
+    target_price = _coerce_float_or_none(
+        _pick_first(
+            item,
+            (
+                "target_price",
+                "targetPrice",
+                "target_price_eur",
+                "targetPriceEur",
+                "price",
+            ),
+        )
+    )
+    target_to = (
+        quantity * target_price
+        if quantity is not None and target_price is not None
+        else _coerce_float_or_none(
+            _pick_first(item, ("target_to", "targetTo", "turnover"))
+        )
+    )
+
+    normalized = {
+        "part_number": part_number,
+        "revision_level": revision_level,
+        "quantity": quantity,
+        "target_price": target_price,
+        "target_to": target_to,
+    }
+    if not any(value not in (None, "") for value in normalized.values()):
+        return None
+    return normalized
+
+
+def _normalize_products_input(raw_products: Any) -> list[dict[str, Any]]:
+    products_value = raw_products
+    if isinstance(products_value, str):
+        try:
+            products_value = json.loads(products_value)
+        except json.JSONDecodeError:
+            products_value = None
+
+    if isinstance(products_value, dict):
+        products_value = [products_value]
+    if not isinstance(products_value, list):
+        return []
+
+    normalized_products: list[dict[str, Any]] = []
+    for item in products_value:
+        normalized_item = _normalize_product_item(item)
+        if normalized_item is not None:
+            normalized_products.append(normalized_item)
+    return normalized_products
+
+
+def _legacy_product_from_data(data: dict[str, Any]) -> dict[str, Any] | None:
+    legacy_item = {
+        "part_number": data.get("customer_pn") or data.get("customerPn"),
+        "revision_level": data.get("revision_level") or data.get("revisionLevel"),
+        "quantity": data.get("annual_volume") or data.get("qty_per_year") or data.get("qtyPerYear"),
+        "target_price": data.get("target_price_eur") or data.get("targetPrice"),
+    }
+    return _normalize_product_item(legacy_item)
+
+
+def normalize_rfq_data_products(
+    data: dict[str, Any] | None,
+    *,
+    products_authoritative: bool = False,
+) -> dict[str, Any]:
+    """Return rfq_data with canonical products and legacy first-row mirrors."""
+    normalized = dict(data or {})
+    products = _normalize_products_input(normalized.get("products"))
+    if not products and not products_authoritative:
+        legacy_product = _legacy_product_from_data(normalized)
+        if legacy_product is not None:
+            products = [legacy_product]
+
+    if products or products_authoritative:
+        total_target_to = sum(
+            product["target_to"]
+            for product in products
+            if isinstance(product.get("target_to"), (int, float))
+        )
+        normalized["products"] = products
+        normalized["total_target_to"] = total_target_to
+        normalized["to_total"] = total_target_to / 1000.0
+
+        first_product = products[0] if products else {}
+        if first_product:
+            normalized["customer_pn"] = first_product.get("part_number") or ""
+            normalized["revision_level"] = first_product.get("revision_level") or ""
+            normalized["annual_volume"] = first_product.get("quantity") or ""
+            normalized["target_price_eur"] = first_product.get("target_price") or ""
+
+            local_price = _coerce_float_or_none(normalized.get("target_price_local"))
+            first_quantity = _coerce_float_or_none(first_product.get("quantity"))
+            if local_price is not None and first_quantity is not None:
+                normalized["to_total_local"] = (local_price * first_quantity) / 1000.0
+
+    return normalized
+
+
+def get_incomplete_product_fields(data: dict[str, Any] | None) -> list[str]:
+    normalized = normalize_rfq_data_products(data)
+    products = normalized.get("products")
+    if not isinstance(products, list) or not products:
+        return ["products"]
+
+    missing_fields: list[str] = []
+    for index, product in enumerate(products, start=1):
+        if not isinstance(product, dict):
+            missing_fields.append(f"products[{index}]")
+            continue
+        if not _clean_text(product.get("part_number")):
+            missing_fields.append(f"products[{index}].part_number")
+        if not _clean_text(product.get("revision_level")):
+            missing_fields.append(f"products[{index}].revision_level")
+        quantity = _coerce_float_or_none(product.get("quantity"))
+        if quantity is None or quantity <= 0:
+            missing_fields.append(f"products[{index}].quantity")
+        target_price = _coerce_float_or_none(product.get("target_price"))
+        if target_price is None or target_price <= 0:
+            missing_fields.append(f"products[{index}].target_price")
+    return missing_fields
 
 
 def rfq_data_payload_to_dict(
@@ -68,15 +322,20 @@ def rfq_data_payload_to_dict(
     if payload is None:
         return {}
     if isinstance(payload, dict):
-        return dict(payload)
-    return payload.model_dump(exclude_unset=True)
+        return normalize_rfq_data_products(dict(payload), products_authoritative="products" in payload)
+    return normalize_rfq_data_products(
+        payload.model_dump(exclude_unset=True),
+        products_authoritative=payload.products is not None,
+    )
+
 
 
 class RfqCreateRequest(BaseModel):
     """Optional body when creating a new RFQ.
-    chat_mode controls the initial sub_status: 'potential' → POTENTIAL, 'rfq' → NEW_RFQ.
+    chat_mode='potential' creates a POTENTIAL document at RFQ/NEW_RFQ.
     """
     chat_mode: str = "rfq"
+    document_type: RfqDocumentType = RfqDocumentType.RFQ
     rfq_data: RfqDataPayload | None = None
 
 

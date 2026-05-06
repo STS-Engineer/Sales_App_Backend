@@ -280,7 +280,7 @@ async def test_update_form_fields_preserves_target_price_estimated_as_boolean():
         db3=None,
         rfq=SimpleNamespace(
             created_by_email="owner@example.com",
-            sub_status=chat.RfqSubStatus.POTENTIAL,
+            sub_status=chat.RfqSubStatus.NEW_RFQ,
             product_line_acronym=None,
             zone_manager_email=None,
         ),

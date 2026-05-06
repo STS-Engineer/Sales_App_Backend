@@ -5,7 +5,7 @@ from functools import lru_cache
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +20,14 @@ from app.models.contact import Contact
 from app.models.discussion import DiscussionMessage
 from app.models.notification_log import NotificationLog
 from app.models.potential import Potential
-from app.models.rfq import ALLOWED_TRANSITIONS, Rfq, RfqPhase, RfqSubStatus, VALID_PHASE_SUBSTATUS
+from app.models.rfq import (
+    ALLOWED_TRANSITIONS,
+    Rfq,
+    RfqDocumentType,
+    RfqPhase,
+    RfqSubStatus,
+    VALID_PHASE_SUBSTATUS,
+)
 from app.models.user import User, UserRole
 from app.schemas.discussion import (
     CostingMessageCreateRequest,
@@ -40,6 +47,8 @@ from app.schemas.rfq import (
     RfqDataUpdateRequest,
     RfqOut,
     ValidateRfqRequest,
+    get_incomplete_product_fields,
+    normalize_rfq_data_products,
     rfq_data_payload_to_dict,
 )
 from app.services.audit import log_action
@@ -67,6 +76,7 @@ from app.services.notifications import (
     EMAIL_FEASIBILITY_RESULT,
     EMAIL_PRICING_READY,
     EMAIL_REVISION_REQUEST,
+    EMAIL_RFI_COMPLETED,
     EMAIL_VALIDATION_REQUEST,
     record_notification_sent,
 )
@@ -76,6 +86,7 @@ from app.utils import emails
 router = APIRouter(prefix="/api/rfq", tags=["rfq"])
 
 TERMINAL_SUBSTATUSES = {RfqSubStatus.LOST, RfqSubStatus.CANCELED}
+RFI_BLOCKED_FORWARD_PHASES = {RfqPhase.OFFER, RfqPhase.PO, RfqPhase.PROTOTYPE}
 RFQ_FILES_CONTAINER = "rfq-files"
 COSTING_DISCUSSION_PHASES = {RfqSubStatus.FEASIBILITY, RfqSubStatus.PRICING}
 PRODUCT_LINE_MATRIX = {
@@ -146,6 +157,85 @@ PRICING_WORKFLOW_STATES = {
     PRICING_WORKFLOW_STATE_APPROVED,
     PRICING_WORKFLOW_STATE_REJECTED,
 }
+
+
+def _document_type_value(rfq: Rfq) -> str:
+    document_type = rfq.document_type or RfqDocumentType.RFQ
+    value = document_type.value if isinstance(document_type, RfqDocumentType) else str(document_type)
+    return value.strip().upper()
+
+
+def _is_rfi(rfq: Rfq) -> bool:
+    return _document_type_value(rfq) == RfqDocumentType.RFI.value
+
+
+def _is_potential(rfq: Rfq) -> bool:
+    return _document_type_value(rfq) == RfqDocumentType.POTENTIAL.value
+
+
+def _parse_document_type_filters(values: list[str] | None) -> list[RfqDocumentType]:
+    document_types: list[RfqDocumentType] = []
+    for raw_value in values or []:
+        for token in str(raw_value or "").split(","):
+            normalized = token.strip().upper()
+            if not normalized:
+                continue
+            try:
+                document_type = RfqDocumentType(normalized)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid document_type: {token.strip()}",
+                ) from exc
+            if document_type not in document_types:
+                document_types.append(document_type)
+    return document_types
+
+
+def _assert_document_type_allows_target(
+    rfq: Rfq,
+    target_phase: RfqPhase,
+    target_sub_status: RfqSubStatus,
+) -> None:
+    if target_sub_status == RfqSubStatus.RFI_COMPLETED and not _is_rfi(rfq):
+        raise HTTPException(
+            status_code=400,
+            detail="Only RFI documents can be completed with RFI_COMPLETED.",
+        )
+    if _is_rfi(rfq) and target_phase in RFI_BLOCKED_FORWARD_PHASES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "RFI documents cannot advance beyond Costing. "
+                "Validate the pricing file to close the RFI."
+            ),
+        )
+    if (
+        _is_potential(rfq)
+        and (target_phase, target_sub_status) != (rfq.phase, rfq.sub_status)
+        and target_sub_status not in TERMINAL_SUBSTATUSES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Potential requests must be converted to RFQ before workflow advancement.",
+        )
+
+
+def _latest_pricing_file_link(rfq: Rfq) -> str:
+    for entry in reversed(list(rfq.costing_files or [])):
+        if not isinstance(entry, dict):
+            continue
+        file_role = str(entry.get("file_role") or "").strip().upper()
+        if file_role != "PRICING_FINAL_PRICE":
+            continue
+        return str(
+            entry.get("download_url")
+            or entry.get("url")
+            or entry.get("path")
+            or entry.get("blob_url")
+            or ""
+        ).strip()
+    return ""
 
 
 @lru_cache(maxsize=1)
@@ -399,6 +489,7 @@ async def _get_rfq_or_404(db: AsyncSession, rfq_id: str) -> Rfq:
     rfq = result.scalar_one_or_none()
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found.")
+    rfq.rfq_data = normalize_rfq_data_products(rfq.rfq_data)
     return rfq
 
 
@@ -829,6 +920,24 @@ async def _upload_costing_action_file(
 
 def _allowed_transitions_for(rfq: Rfq) -> set[tuple[RfqPhase, RfqSubStatus]]:
     allowed = set(ALLOWED_TRANSITIONS.get((rfq.phase, rfq.sub_status), set()))
+    if _is_potential(rfq):
+        allowed = {
+            (phase, sub_status)
+            for phase, sub_status in allowed
+            if sub_status in TERMINAL_SUBSTATUSES
+        }
+    elif _is_rfi(rfq):
+        allowed = {
+            (phase, sub_status)
+            for phase, sub_status in allowed
+            if phase not in RFI_BLOCKED_FORWARD_PHASES
+        }
+    else:
+        allowed = {
+            (phase, sub_status)
+            for phase, sub_status in allowed
+            if sub_status != RfqSubStatus.RFI_COMPLETED
+        }
 
     # Business clarification: a "mission not accepted" outcome must close the RFQ
     # immediately with LOST or CANCELED plus autopsy notes.
@@ -863,8 +972,8 @@ async def _maybe_assign_systematic_rfq_id(
     rfq: Rfq,
     rfq_data: dict,
 ) -> dict:
-    next_data = dict(rfq_data)
-    if rfq.sub_status == RfqSubStatus.POTENTIAL:
+    next_data = normalize_rfq_data_products(rfq_data)
+    if _is_potential(rfq):
         return next_data
     if next_data.get("systematic_rfq_id"):
         return next_data
@@ -907,8 +1016,23 @@ async def _submit_rfq_for_validation_internal(
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
+    if _is_potential(rfq):
+        raise HTTPException(
+            status_code=409,
+            detail="Convert this Potential request to RFQ before submitting it for validation.",
+        )
 
-    extracted_data = dict(rfq.rfq_data or {})
+    extracted_data = normalize_rfq_data_products(rfq.rfq_data)
+    incomplete_product_fields = get_incomplete_product_fields(extracted_data)
+    if incomplete_product_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Complete all product rows before validation.",
+                "missing_fields": incomplete_product_fields,
+            },
+        )
+
     acronym = (extracted_data.get("product_line_acronym") or "").strip()
     revision = str(extracted_data.get("revision_level") or "00").strip() or "00"
     zone_manager_email = (
@@ -993,15 +1117,18 @@ async def create_rfq(
 ):
     request_body = body or RfqCreateRequest()
     chat_mode = request_body.chat_mode.lower().strip()
-    initial_sub_status = (
-        RfqSubStatus.POTENTIAL if chat_mode == "potential" else RfqSubStatus.NEW_RFQ
-    )
+    document_type = request_body.document_type
+    if chat_mode == "potential" or document_type == RfqDocumentType.POTENTIAL:
+        chat_mode = "potential"
+        document_type = RfqDocumentType.POTENTIAL
+    initial_sub_status = RfqSubStatus.NEW_RFQ
     rfq_data = rfq_data_payload_to_dict(request_body.rfq_data)
     zone_manager_email = (
         rfq_data.get("zone_manager_email") or rfq_data.get("validator_email") or None
     )
 
     rfq = Rfq(
+        document_type=document_type,
         phase=RfqPhase.RFQ,
         sub_status=initial_sub_status,
         product_line_acronym=rfq_data.get("product_line_acronym"),
@@ -1012,7 +1139,7 @@ async def create_rfq(
     )
     rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, rfq_data)
     db.add(rfq)
-    if initial_sub_status == RfqSubStatus.POTENTIAL:
+    if document_type == RfqDocumentType.POTENTIAL:
         rfq.potential = Potential(chat_history=[])
 
     await db.commit()
@@ -1039,6 +1166,10 @@ async def update_rfq_data(
         )
     next_data = dict(rfq.rfq_data or {})
     next_data.update(incoming_data)
+    next_data = normalize_rfq_data_products(
+        next_data,
+        products_authoritative="products" in incoming_data,
+    )
     rfq.rfq_data = next_data
 
     if "product_line_acronym" in incoming_data:
@@ -1064,10 +1195,15 @@ async def proceed_to_rfq(
     rfq = await _get_rfq_or_404(db, rfq_id)
     _assert_can_edit_rfq_phase(current_user, rfq)
 
-    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.POTENTIAL):
+    if not _is_potential(rfq):
         raise HTTPException(
             status_code=409,
-            detail="This opportunity is no longer in the Potential phase.",
+            detail="This opportunity is no longer a Potential request.",
+        )
+    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ):
+        raise HTTPException(
+            status_code=409,
+            detail="Only Potential requests in RFQ/NEW_RFQ can be converted to RFQ.",
         )
 
     potential = rfq.potential
@@ -1084,7 +1220,11 @@ async def proceed_to_rfq(
             },
         )
 
-    rfq.rfq_data = sync_potential_to_rfq_data(potential, rfq.rfq_data)
+    rfq.rfq_data = normalize_rfq_data_products(
+        sync_potential_to_rfq_data(potential, rfq.rfq_data)
+    )
+    rfq.document_type = RfqDocumentType.RFQ
+    rfq.phase = RfqPhase.RFQ
     rfq.sub_status = RfqSubStatus.NEW_RFQ
 
     await log_action(db, rfq_id, "Potential promoted to formal RFQ", current_user.email)
@@ -1269,10 +1409,15 @@ async def download_file(filename: str):
 
 @router.get("", response_model=list[RfqOut])
 async def list_rfqs(
+    document_type: list[str] | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     query = _rfq_query().order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
+
+    document_type_filters = _parse_document_type_filters(document_type)
+    if document_type_filters:
+        query = query.where(Rfq.document_type.in_(document_type_filters))
 
     if current_user.role != UserRole.OWNER:
         if current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}:
@@ -1298,7 +1443,10 @@ async def list_rfqs(
             query = query.where(or_(*visibility_filters))
 
     result = await db.execute(query)
-    return result.scalars().all()
+    rfqs = result.scalars().all()
+    for rfq in rfqs:
+        rfq.rfq_data = normalize_rfq_data_products(rfq.rfq_data)
+    return rfqs
 
 
 @router.get("/{rfq_id}", response_model=RfqOut)
@@ -1679,6 +1827,7 @@ async def update_rfq_status(
     if body.sub_status in TERMINAL_SUBSTATUSES:
         effective_phase = rfq.phase
         _assert_terminal_status_allowed(rfq, body.sub_status)
+    _assert_document_type_allows_target(rfq, effective_phase, body.sub_status)
     _ensure_valid_phase_sub_status(effective_phase, body.sub_status)
     _set_phase_sub_status(rfq, effective_phase, body.sub_status)
 
@@ -2259,11 +2408,22 @@ async def costing_validation(
             validation_at=validation_at,
             rejection_reason=None,
         )
-        _set_phase_sub_status(rfq, RfqPhase.OFFER, RfqSubStatus.PREPARATION)
+        if _is_rfi(rfq):
+            _set_phase_sub_status(rfq, RfqPhase.CLOSED, RfqSubStatus.RFI_COMPLETED)
+            log_message = (
+                f"RFI pricing file approved -> "
+                f"{RfqPhase.CLOSED.value}/{RfqSubStatus.RFI_COMPLETED.value}"
+            )
+        else:
+            _set_phase_sub_status(rfq, RfqPhase.OFFER, RfqSubStatus.PREPARATION)
+            log_message = (
+                f"Pricing file approved -> "
+                f"{RfqPhase.OFFER.value}/{RfqSubStatus.PREPARATION.value}"
+            )
         await log_action(
             db,
             rfq_id,
-            f"Pricing file approved -> {RfqPhase.OFFER.value}/{RfqSubStatus.PREPARATION.value}",
+            log_message,
             current_user.email,
         )
     else:
@@ -2291,17 +2451,27 @@ async def costing_validation(
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
     if body.is_approved:
-        email_sent = emails.send_costing_approved_email(
-            refreshed_rfq.created_by_email,
-            systematic_rfq_id,
-            rfq_link,
-        )
+        if _is_rfi(refreshed_rfq):
+            email_sent = emails.send_rfi_completed_email(
+                refreshed_rfq.created_by_email,
+                systematic_rfq_id,
+                rfq_link,
+                _latest_pricing_file_link(refreshed_rfq),
+            )
+            email_type = EMAIL_RFI_COMPLETED
+        else:
+            email_sent = emails.send_costing_approved_email(
+                refreshed_rfq.created_by_email,
+                systematic_rfq_id,
+                rfq_link,
+            )
+            email_type = EMAIL_COSTING_APPROVED
         if email_sent:
             await record_notification_sent(
                 db,
                 rfq_id=refreshed_rfq.rfq_id,
                 recipients=refreshed_rfq.created_by_email,
-                email_type=EMAIL_COSTING_APPROVED,
+                email_type=email_type,
             )
     else:
         costing_agent_email = (
@@ -2373,6 +2543,7 @@ async def advance_status(
     if body.target_sub_status in TERMINAL_SUBSTATUSES:
         effective_phase = rfq.phase
         _assert_terminal_status_allowed(rfq, body.target_sub_status)
+    _assert_document_type_allows_target(rfq, effective_phase, body.target_sub_status)
 
     target_state = (effective_phase, body.target_sub_status)
     allowed = _allowed_transitions_for(rfq)

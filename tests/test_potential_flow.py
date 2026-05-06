@@ -57,7 +57,7 @@ async def _create_headers(db_session: AsyncSession) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_create_potential_draft_is_hidden_from_dashboard(
+async def test_create_potential_draft_uses_document_type_and_is_listed(
     client: AsyncClient,
     db_session: AsyncSession,
 ):
@@ -71,12 +71,14 @@ async def test_create_potential_draft_is_hidden_from_dashboard(
 
     assert create_response.status_code == 201
     created = create_response.json()
-    assert created["sub_status"] == "POTENTIAL"
+    assert created["document_type"] == "POTENTIAL"
+    assert created["phase"] == "RFQ"
+    assert created["sub_status"] == "NEW_RFQ"
     assert created["potential"]["rfq_id"] == created["rfq_id"]
 
     list_response = await client.get("/api/rfq", headers=headers)
     assert list_response.status_code == 200
-    assert all(item["rfq_id"] != created["rfq_id"] for item in list_response.json())
+    assert any(item["rfq_id"] == created["rfq_id"] for item in list_response.json())
 
     detail_response = await client.get(
         f"/api/rfq/{created['rfq_id']}",
@@ -101,12 +103,137 @@ async def test_create_direct_rfq_starts_in_new_rfq_and_is_listed(
 
     assert create_response.status_code == 201
     created = create_response.json()
+    assert created["document_type"] == "RFQ"
     assert created["sub_status"] == "NEW_RFQ"
     assert created["potential"] is None
 
     list_response = await client.get("/api/rfq", headers=headers)
     assert list_response.status_code == 200
     assert any(item["rfq_id"] == created["rfq_id"] for item in list_response.json())
+
+
+@pytest.mark.asyncio
+async def test_create_explicit_potential_document_uses_potential_flow(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _create_headers(db_session)
+
+    create_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "rfq", "document_type": "POTENTIAL"},
+        headers=headers,
+    )
+
+    assert create_response.status_code == 201
+    created = create_response.json()
+    assert created["document_type"] == "POTENTIAL"
+    assert created["phase"] == "RFQ"
+    assert created["sub_status"] == "NEW_RFQ"
+    assert created["potential"]["rfq_id"] == created["rfq_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_rfi_and_filter_lists_by_document_type(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _create_headers(db_session)
+
+    rfq_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "rfq"},
+        headers=headers,
+    )
+    rfi_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "rfq", "document_type": "RFI"},
+        headers=headers,
+    )
+    potential_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "potential"},
+        headers=headers,
+    )
+
+    assert rfq_response.status_code == 201
+    assert rfi_response.status_code == 201
+    assert potential_response.status_code == 201
+    rfq = rfq_response.json()
+    rfi = rfi_response.json()
+    potential = potential_response.json()
+    assert rfq["document_type"] == "RFQ"
+    assert rfi["document_type"] == "RFI"
+    assert potential["document_type"] == "POTENTIAL"
+
+    rfi_list_response = await client.get(
+        "/api/rfq",
+        params={"document_type": "RFI"},
+        headers=headers,
+    )
+    rfq_list_response = await client.get(
+        "/api/rfq",
+        params={"document_type": "RFQ"},
+        headers=headers,
+    )
+
+    assert rfi_list_response.status_code == 200
+    rfi_ids = {item["rfq_id"] for item in rfi_list_response.json()}
+    assert rfi["rfq_id"] in rfi_ids
+    assert rfq["rfq_id"] not in rfi_ids
+    assert {item["document_type"] for item in rfi_list_response.json()} == {"RFI"}
+
+    assert rfq_list_response.status_code == 200
+    rfq_ids = {item["rfq_id"] for item in rfq_list_response.json()}
+    assert rfq["rfq_id"] in rfq_ids
+    assert rfi["rfq_id"] not in rfq_ids
+    assert potential["rfq_id"] not in rfq_ids
+
+    potential_list_response = await client.get(
+        "/api/rfq",
+        params={"document_type": "POTENTIAL"},
+        headers=headers,
+    )
+    assert potential_list_response.status_code == 200
+    assert {item["document_type"] for item in potential_list_response.json()} == {"POTENTIAL"}
+
+    mixed_list_response = await client.get(
+        "/api/rfq",
+        params={"document_type": "RFQ,RFI"},
+        headers=headers,
+    )
+    assert mixed_list_response.status_code == 200
+    mixed_ids = {item["rfq_id"] for item in mixed_list_response.json()}
+    assert rfq["rfq_id"] in mixed_ids
+    assert rfi["rfq_id"] in mixed_ids
+    assert potential["rfq_id"] not in mixed_ids
+
+    repeated_list_response = await client.get(
+        "/api/rfq",
+        params=[("document_type", "RFI"), ("document_type", "POTENTIAL")],
+        headers=headers,
+    )
+    assert repeated_list_response.status_code == 200
+    repeated_ids = {item["rfq_id"] for item in repeated_list_response.json()}
+    assert rfi["rfq_id"] in repeated_ids
+    assert potential["rfq_id"] in repeated_ids
+    assert rfq["rfq_id"] not in repeated_ids
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_invalid_document_type(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _create_headers(db_session)
+
+    response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "rfq", "document_type": "RFX"},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -272,6 +399,7 @@ async def test_proceed_to_formal_rfq_syncs_fields_locks_potential_and_enables_fo
     )
     assert proceed_response.status_code == 200
     proceeded = proceed_response.json()
+    assert proceeded["document_type"] == "RFQ"
     assert proceeded["sub_status"] == "NEW_RFQ"
     assert proceeded["rfq_data"]["customer_name"] == "Nidec"
     assert proceeded["rfq_data"]["application"] == "Traction motor"

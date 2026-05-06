@@ -637,6 +637,56 @@ Costing is approved for this RFQ. You can now start offer preparation.
     return send_email(kam_email, subject, text_body, html_body=html_body)
 
 
+def send_rfi_completed_email(
+    requester_email: str,
+    systematic_rfq_id: str,
+    rfq_link: str,
+    costing_file_link: str | None = None,
+) -> bool:
+    rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
+    rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    file_link = str(costing_file_link or "").strip()
+    file_text = f"\nValidated costing file:\n{file_link}\n" if file_link else ""
+    file_html = (
+        f"""
+          <p>You can download the validated costing file here:</p>
+          <div style="margin: 20px 0; text-align: center;">
+            <a href="{file_link}" style="background-color: #059669; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Download Costing File
+            </a>
+          </div>
+        """
+        if file_link
+        else ""
+    )
+    subject = f"RFI Completed{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+The costing has been validated for this RFI. The RFI is now closed.
+
+{rfq_id_line}{file_text}
+Open the RFI here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "RFI Completed",
+        f"""
+          <p>Hello,</p>
+          <p>The costing has been validated for this RFI. The RFI is now closed.</p>
+          <ul>
+            {rfq_id_html}
+          </ul>
+          {file_html}
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFI
+            </a>
+          </div>
+        """,
+    )
+    return send_email(requester_email, subject, text_body, html_body=html_body)
+
+
 def send_costing_rejected_email(
     costing_agent_email: str,
     kam_email: str,

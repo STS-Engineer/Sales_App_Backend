@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_db, get_db3
 from app.middleware.auth import get_current_user
-from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
+from app.models.rfq import Rfq, RfqDocumentType, RfqPhase, RfqSubStatus
 from app.routers.rfq import (
     _assert_can_edit_base_rfq_data,
     _maybe_assign_systematic_rfq_id,
@@ -28,6 +28,10 @@ from app.services.routing import (
 )
 from app.models.user import User
 from app.models.validation_matrix import ValidationMatrix
+from app.schemas.rfq import (
+    get_incomplete_product_fields,
+    normalize_rfq_data_products,
+)
 from app.utils.currency import get_eur_exchange_rate
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -66,7 +70,7 @@ CRITICAL DIRECTIVE - PROACTIVE DATA EXTRACTION:
 3. If the user has provided ANY valid information in the recent chat history that is currently missing or empty in the database state, your IMMEDIATE and ONLY next action MUST be to call the 'updateFormFields' tool to save that data.
 4. Do not acknowledge the user's answer in text without ALSO calling the tool in the same response.
 """
-ENGLISH_INITIAL_GREETING = (
+ENGLISH_INITIAL_GREETING_TEMPLATE = (
     "Hello, I'm your sales assistant. I'll be helping you fill your RFQ. "
     "How would you like to proceed?\n"
     "1. Guide me step by step\n"
@@ -167,6 +171,8 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "product_line_acronym",
     "project_name",
     "costing_data",
+    "products",
+    "total_target_to",
     "customer_pn",
     "revision_level",
     "delivery_zone",
@@ -205,6 +211,10 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
 UPDATE_FORM_FIELD_ALIASES = {
     "customerName": "customer_name",
     "productName": "product_name",
+    "products": "products",
+    "productItems": "products",
+    "lineItems": "products",
+    "totalTargetTo": "total_target_to",
     "productLineAcronym": "product_line_acronym",
     "projectName": "project_name",
     "customerPn": "customer_pn",
@@ -248,10 +258,26 @@ UPDATE_FORM_FIELD_PROPERTIES = {
     field_name: {"type": "string"}
     for field_name in sorted(RFQ_ALLOWED_FIELDS)
 }
+PRODUCT_ITEM_TOOL_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "part_number": {"type": "string"},
+            "revision_level": {"type": "string"},
+            "quantity": {"type": "number"},
+            "target_price": {"type": "number"},
+            "target_to": {"type": "number"},
+        },
+    },
+}
+UPDATE_FORM_FIELD_PROPERTIES["products"] = PRODUCT_ITEM_TOOL_SCHEMA
+UPDATE_FORM_FIELD_PROPERTIES["total_target_to"] = {"type": "number"}
 UPDATE_FORM_FIELD_PROPERTIES["to_total"] = {"type": "number"}
 UPDATE_FORM_FIELD_PROPERTIES["to_total_local"] = {"type": "number"}
 UPDATE_FORM_FIELD_PROPERTIES["target_price_is_estimated"] = {"type": "boolean"}
 AI_GENERATED_STEP_FIELDS = [
+    "total_target_to",
     "to_total",
     "zone_manager_email",
     "validator_email",
@@ -272,15 +298,13 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "product_line_acronym",
             "project_name",
             "rfq_files",
-            "customer_pn",
-            "revision_level",
+            "products",
             "delivery_zone",
             "delivery_plant",
             "country",
             "po_date",
             "ppap_date",
             "sop_year",
-            "annual_volume",
             "rfq_reception_date",
             "quotation_expected_date",
             "contact_email",
@@ -292,7 +316,6 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
     (
         2,
         [
-            "target_price_eur",
             "expected_delivery_conditions",
             "expected_payment_terms",
             "type_of_packaging",
@@ -314,7 +337,7 @@ RFQ_STEPS: list[tuple[int, list[str]]] = [
             "final_recommendation",
         ],
     ),
-    (4, ["to_total", "zone_manager_email", "validator_role"]),
+    (4, ["total_target_to", "to_total", "zone_manager_email", "validator_role"]),
 ]
 
 
@@ -335,7 +358,7 @@ def _normalize_rfq_data_fields(data: dict | None) -> dict:
     legacy_scope = normalized.pop("is_feasible", None)
     if "scope" not in normalized and legacy_scope is not None:
         normalized["scope"] = _normalize_scope_value(legacy_scope)
-    return normalized
+    return normalize_rfq_data_products(normalized)
 
 
 def _coerce_numeric_value(value) -> float:
@@ -353,6 +376,53 @@ def _normalize_language_token(value: str) -> str:
         char for char in normalized if not unicodedata.combining(char)
     )
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _document_type_label(value: RfqDocumentType | str | None) -> str:
+    raw_value = value.value if isinstance(value, RfqDocumentType) else str(value or "")
+    normalized = raw_value.strip().upper()
+    if normalized == RfqDocumentType.RFI.value:
+        return RfqDocumentType.RFI.value
+    if normalized == RfqDocumentType.POTENTIAL.value:
+        return RfqDocumentType.POTENTIAL.value
+    return RfqDocumentType.RFQ.value
+
+
+def _is_potential_document(rfq: Rfq) -> bool:
+    return _document_type_label(rfq.document_type) == RfqDocumentType.POTENTIAL.value
+
+
+def _format_document_type_text(content: str, document_type: RfqDocumentType | str | None) -> str:
+    label = _document_type_label(document_type)
+    if label == RfqDocumentType.RFQ.value:
+        return str(content or "")
+    return re.sub(r"\bRFQ\b", label, str(content or ""))
+
+
+def _build_formal_initial_greeting(rfq: Rfq) -> str:
+    return _format_document_type_text(ENGLISH_INITIAL_GREETING_TEMPLATE, rfq.document_type)
+
+
+def _normalize_initial_greeting_for_document_type(history: list[dict], rfq: Rfq) -> list[dict]:
+    if _document_type_label(rfq.document_type) == RfqDocumentType.RFQ.value:
+        return history
+
+    normalized_history = []
+    replaced = False
+    for message in history:
+        next_message = dict(message)
+        content = next_message.get("content")
+        if (
+            not replaced
+            and next_message.get("role") == "assistant"
+            and isinstance(content, str)
+            and "Hello, I'm your sales assistant" in content
+            and "RFQ" in content
+        ):
+            next_message["content"] = _format_document_type_text(content, rfq.document_type)
+            replaced = True
+        normalized_history.append(next_message)
+    return normalized_history
 
 
 def _detect_language_choice(message: str | None) -> dict[str, object] | None:
@@ -386,7 +456,7 @@ def _build_language_context(preferred_language_code: str | None) -> str:
         return (
             "No preferred language has been stored yet. Treat the current user "
             "message as their response to the language-selection menu. Do not start "
-            "the RFQ workflow until you have either acknowledged one of the 6 "
+            "the request workflow until you have either acknowledged one of the 6 "
             "supported languages or asked the user to choose again from the menu."
         )
 
@@ -408,7 +478,7 @@ def _normalize_chat_mode(rfq: Rfq, requested_mode: str) -> str:
     mode = (requested_mode or "rfq").strip().lower()
     if mode == "potential":
         return "potential"
-    if rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.POTENTIAL:
+    if _is_potential_document(rfq):
         return "potential"
     return "rfq"
 
@@ -485,6 +555,8 @@ def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
 
 
 def _is_field_filled(data: dict, field_name: str) -> bool:
+    if field_name == "products":
+        return not get_incomplete_product_fields(data)
     if field_name == "rfq_files":
         value = (
             data.get("rfq_files")
@@ -1030,20 +1102,24 @@ async def _execute_tool_calls(
             )
 
             try:
-                annual_volume_value = extracted_data.get("annual_volume")
-                target_price_value = extracted_data.get("target_price_eur")
-                if annual_volume_value in (None, ""):
+                extracted_data.update(normalize_rfq_data_products(extracted_data))
+                incomplete_product_fields = get_incomplete_product_fields(extracted_data)
+                if incomplete_product_fields:
                     raise ValueError(
-                        "annual_volume must be saved before validator routing."
-                    )
-                if target_price_value in (None, ""):
-                    raise ValueError(
-                        "target_price_eur must be saved before validator routing."
+                        "Complete products before validator routing: "
+                        + ", ".join(incomplete_product_fields)
                     )
 
-                volume = _coerce_numeric_value(annual_volume_value)
-                price = _coerce_numeric_value(target_price_value)
-                to_total_float = (volume * price) / 1000.0
+                total_target_to = _coerce_numeric_value(
+                    extracted_data.get("total_target_to")
+                )
+                if total_target_to <= 0:
+                    raise ValueError(
+                        "total_target_to must be greater than zero before validator routing."
+                    )
+
+                to_total_float = total_target_to / 1000.0
+                extracted_data["total_target_to"] = total_target_to
                 extracted_data["to_total"] = str(to_total_float)
 
                 # Also compute to_total_local for the user-facing UI
@@ -1051,7 +1127,11 @@ async def _execute_tool_calls(
                 if local_price_value not in (None, ""):
                     try:
                         local_price = _coerce_numeric_value(local_price_value)
-                        to_total_local_float = (volume * local_price) / 1000.0
+                        first_product = (extracted_data.get("products") or [{}])[0]
+                        first_quantity = _coerce_numeric_value(
+                            first_product.get("quantity")
+                        )
+                        to_total_local_float = (first_quantity * local_price) / 1000.0
                         extracted_data["to_total_local"] = str(to_total_local_float)
                     except (ValueError, TypeError):
                         pass
@@ -1123,6 +1203,8 @@ async def _execute_tool_calls(
                             "validator_role": required_role,
                             "validator_email": zone_manager_email,
                             "zone_manager_email": zone_manager_email,
+                            "products": extracted_data.get("products"),
+                            "total_target_to": total_target_to,
                             "to_total": to_total_float,
                             "to_total_local": extracted_data.get("to_total_local"),
                             "delivery_zone": canonical_delivery_zone,
@@ -1167,6 +1249,7 @@ async def _execute_tool_calls(
                 saved_data = _normalize_rfq_data_fields(rfq.rfq_data)
                 validator_email = str(saved_data.get("zone_manager_email") or rfq.zone_manager_email or "").strip()
                 to_total_value = str(saved_data.get("to_total") or "").strip()
+                total_target_to_value = str(saved_data.get("total_target_to") or "").strip()
                 product_line_acronym = str(
                     saved_data.get("product_line_acronym")
                     or rfq.product_line_acronym
@@ -1176,6 +1259,8 @@ async def _execute_tool_calls(
                 missing_step4_fields = [
                     field_name
                     for field_name, field_value in (
+                        ("products", "" if get_incomplete_product_fields(saved_data) else "ok"),
+                        ("total_target_to", total_target_to_value),
                         ("to_total", to_total_value),
                         ("zone_manager_email", validator_email),
                         ("product_line_acronym", product_line_acronym),
@@ -1262,11 +1347,25 @@ async def _execute_tool_calls(
                 )
                 if canonical_delivery_zone:
                     filtered_fields["delivery_zone"] = canonical_delivery_zone
+            products_are_authoritative = "products" in filtered_fields
             for key, value in filtered_fields.items():
                 if key == "target_price_is_estimated":
                     extracted_data[key] = bool(value)
+                elif key == "products":
+                    extracted_data[key] = value
+                elif key in {"total_target_to", "to_total", "to_total_local"}:
+                    try:
+                        extracted_data[key] = _coerce_numeric_value(value)
+                    except ValueError:
+                        extracted_data[key] = str(value)
                 else:
                     extracted_data[key] = str(value)
+            normalized_extracted_data = normalize_rfq_data_products(
+                extracted_data,
+                products_authoritative=products_are_authoritative,
+            )
+            extracted_data.clear()
+            extracted_data.update(normalized_extracted_data)
             if "zone_manager_email" in filtered_fields:
                 rfq.zone_manager_email = str(filtered_fields.get("zone_manager_email") or "").strip() or None
             if "product_line_acronym" in filtered_fields:
@@ -1305,6 +1404,7 @@ class ChatRequest(BaseModel):
     rfq_id: str
     message: str
     chat_mode: str = "rfq"
+    document_type: RfqDocumentType | None = None
 
 
 class ChatEditRequest(BaseModel):
@@ -1322,7 +1422,7 @@ SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """
 
 CRITICAL CONVERSATION RULES:
 1. NO CHATTER: Never say 'Update saved', 'I have processed your request', or 'Got it'. Just ask the exact next missing question.
-2. NO UNSOLICITED SUMMARIES: Never print out a summary of the RFQ fields unless the user explicitly types 'summary'.
+2. NO UNSOLICITED SUMMARIES: Never print out a summary of the request fields unless the user explicitly types 'summary'.
 3. STRICT ENGLISH TRANSLATION: You must seamlessly translate all delivery zones, regions, and countries into English before saving them. You MUST adhere to the following exact mappings for delivery zones:
    - "asie sud" MUST be saved as "South Asia"
    - "asie est" MUST be saved as "East Asia"
@@ -1337,14 +1437,15 @@ DO NOT generate a text response confirming or denying the customer until you hav
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information (e.g., Application, chosen Product Name, Contact Info, Target Price, Quantities, Dates, etc.), you MUST immediately call the 'updateFormFields' tool to save that specific data point to the database. You can call 'updateFormFields' at the exact same time as you ask your next question. If you fail to call 'updateFormFields', the UI will break.
 USER-FACING TERMINOLOGY RULE: When speaking to the user, you MUST always say 'Validator' and NEVER say 'Zone Manager'. This terminology rule applies to every user-facing sentence, confirmation, and question.
 DATE FORMAT RULE: When updating date fields, you must output the strict YYYY-MM-DD format. If the user only provides a month and year (for example, "June 2025"), default to the 1st of the month (for example, "2025-06-01"). This applies to po_date, ppap_date, rfq_reception_date, and quotation_expected_date.
-NUMBERED OPTION FORMATTING RULE: When asking the user a question with multiple choices, you MUST NEVER number the question itself. You must ask the question on a new line, and then start the numbered list of choices starting at number 1. Use this only for normal predefined option lists, not for the final RFQ submission confirmation.
-FINAL CONFIRMATION RULE: When all required information is gathered and you ask the user 'Shall I submit this RFQ for validation?', you MUST provide exactly two options: 'Yes' and 'No'. Do NOT format them as a numbered list or use bullet points (e.g., NEVER write '1. Yes' or '- Yes'). Output the options cleanly so the UI can parse them as strict boolean choices.
+NUMBERED OPTION FORMATTING RULE: When asking the user a question with multiple choices, you MUST NEVER number the question itself. You must ask the question on a new line, and then start the numbered list of choices starting at number 1. Use this only for normal predefined option lists, not for the final request submission confirmation.
+FINAL CONFIRMATION RULE: When all required information is gathered and you ask the user whether to submit this request for validation, you MUST provide exactly two options: 'Yes' and 'No'. Do NOT format them as a numbered list or use bullet points (e.g., NEVER write '1. Yes' or '- Yes'). Output the options cleanly so the UI can parse them as strict boolean choices.
 NUMBERED OPTION PARSING RULE: When you provide a numbered list of options and the user replies with a single number, you MUST internally substitute that number with the exact text of the corresponding option before taking any further action or making tool calls. Never treat numeric replies as generic booleans.
 NUMERIC EXTRACTION RULE: When extracting numerical values (like volumes, prices, or quantities) from user text that contain spaces or commas (for example, "500 000" or "500,000"), you MUST remove all spaces and commas and output the continuous number in your tool calls. Preserve decimals for pricing fields when they are present.
 CRITICAL NO-ROUNDING RULE: When you convert a non-EUR currency to EUR using the exchange rate, or when you perform any calculations, you MUST NEVER round the result. Keep at most 5 digits after the decimal point. If the exact result has more than 5 digits after the decimal point, truncate it instead of rounding. For example, if the math results in 0.19879123, save 0.19879 into the database, never round it to 0.19880 or 0.20. Do not apply any 'arrondi' or formatting.
 DIMENSION NORMALIZATION RULE: If the user provides physical dimensions or technical specifications in inches or any other non-mm unit, you MUST seamlessly convert them to millimeters (mm) before saving the data. Always store dimension data in mm.
 DELIVERY ZONE CLASSIFICATION RULE: When collecting the customer location or delivery destination, you MUST classify it into exactly one of these 4 approved `delivery_zone` strings: "asie est", "asie sud", "europe", "amerique". Never use any other spelling or region name. If the user gives a specific country, map it automatically to the correct approved zone (for example, France -> europe, Mexico -> amerique, China -> asie est, India -> asie sud). If you cannot confidently map it, ask the user to clarify before saving.
 FORM STATE SYNC RULE: On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data. Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 4 approved strings: "asie est", "asie sud", "europe", "amerique".
+MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, and Target Price for each product. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, and `target_price`. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
@@ -1354,6 +1455,8 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - product_line_acronym
 - project_name
 - costing_data (Format ALL costing parameters as a single formatted string/list here)
+- products (array of product rows: part_number, revision_level, quantity, target_price, target_to)
+- total_target_to
 - customer_pn
 - revision_level
 - delivery_zone
@@ -1419,7 +1522,7 @@ DUAL-MODE RULE:
 CRITICAL STATE RULE:
 If an RFQ is rejected during the RFQ or COSTING phases, the terminal outcome MUST be CANCELED, never LOST. LOST is only allowed after the RFQ has reached the OFFER, PO, or PROTOTYPE phases.
 
-You are a rigorous, highly-structured B2B RFQ Assistant. Your primary goal is to guide the user through the RFQ data collection process smoothly, in a strict order, utilizing the provided exact tools to extract and validate information into the database.
+You are a rigorous, highly-structured B2B request assistant. Your primary goal is to guide the user through the active RFQ/RFI data collection process smoothly, in a strict order, utilizing the provided exact tools to extract and validate information into the database. Use the DOCUMENT_TYPE_CONTEXT section to decide whether visible wording should say RFQ or RFI.
 
 You are a state-aware assistant. Your progress is determined by the 'CURRENT RFQ DATABASE STATE'. If a field is filled in the state, consider that step 100% complete and move to the next logical question in your strict sequence.
 CRITICAL WORKFLOW RULES:
@@ -1454,7 +1557,7 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save both `product_name` and the authorized `product_line_acronym` with `updateFormFields` to lock them in.
 6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
 7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-8. Ask only for the remaining missing Step 1 fields among P/N, Revision level, Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, Quantity per year, RFQ reception date, and quotation expected date. CRITICAL RULE: Quantity per year maps to `annual_volume` and MUST be normalized before saving by removing embedded spaces and commas (for example, "500 000" becomes "500000"). Extract it using `updateFormFields`.
+8. Ask only for the remaining missing Step 1 fields among product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Revision Level, Quantity, and Target Price.
 CRITICAL DELIVERY ZONE RULE: Whenever you save `delivery_zone`, it MUST be exactly one of these 4 approved strings: "asie est", "asie sud", "europe", "amerique". If the user gives a country or city, convert it to the approved zone before calling `updateFormFields`. If you cannot confidently map it, ask a clarification question instead of guessing.
 
 STEP 1 VALIDATION RULE:
@@ -1472,7 +1575,7 @@ NOTE: costing_data is OPTIONAL. If the product has no specific costing parameter
 
 ### Step 2: Commercial Expectations
 Ask sequentially for:
-- Target Price (ask for the price in the LOCAL currency, the currency code, whether this price is 'Estimated by Avocarbon' or 'Given by Customer', and any additional notes about the price)
+- Request-level pricing metadata if still missing (currency code, whether the product target prices are 'Estimated by Avocarbon' or 'Given by Customer', and any additional notes about the price)
 - Delivery Conditions
 - Payment Terms
 - Type of Packaging
@@ -1480,9 +1583,9 @@ Ask sequentially for:
 - Tooling Conditions
 - Entry Barriers
 CRITICAL TARGET PRICE RULE:
-1. When collecting the target price, you MUST ask for the following four pieces of information:
-   a. The target price amount in the user's LOCAL currency.
-   b. The currency code (for example, EUR, USD, GBP, MXN, or CNY).
+1. When collecting product target prices, you MUST save each line price in the `products` array. You may also collect these request-level price metadata fields:
+   a. The target price amount for each product row in the user's local currency.
+   b. The currency code for the provided product target prices (for example, EUR, USD, GBP, MXN, or CNY).
    c. Whether this price is 'Estimated by Avocarbon' or 'Given by Customer'.
    d. Any additional notes about the price (optional).
 TARGET PRICE FORMAT RULE: When asking for these target price details, you MUST keep the price source options attached to the Price source field. You are FORBIDDEN from flattening "Estimated by Avocarbon" and "Given by Customer" into separate main numbered-list items. Format it exactly as either:
@@ -1496,8 +1599,8 @@ OR:
    - `target_price_currency`: the 3-letter ISO currency code
    - `target_price_is_estimated`: true if estimated by Avocarbon, false if given by customer
    - `target_price_note`: any additional notes (or empty string)
-3. If the currency is NOT EUR, you MUST silently call `get_eur_exchange_rate` in the background, convert the local price to EUR, and save ONLY the converted EUR value into `target_price_eur`. You MUST NOT save the raw non-EUR amount into `target_price_eur`.
-4. If the currency IS EUR, save the same amount directly into both `target_price_local` and `target_price_eur`.
+3. If the currency is NOT EUR, you MUST silently call `get_eur_exchange_rate` in the background, convert each local product target price to EUR, and save ONLY the converted EUR values in the `products` array. You MUST NOT save raw non-EUR line prices as canonical `target_price`.
+4. If the currency IS EUR, save the same product target prices directly in the `products` array.
 5. When converting, keep at most 5 digits after the decimal point and truncate extra digits instead of rounding.
 CRITICAL PACKAGING RULE: When `type_of_packaging` is missing, you MUST ask the user to choose exactly one of these 3 options:
 1. carboard divider
@@ -1523,15 +1626,15 @@ CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormF
 ### Step 4: Final Calculation & Routing
 CRITICAL STEP 4 RULES:
 1. Look at the missing fields list. If `to_total` or `zone_manager_email` are missing, DO NOT ask the user for them.
-2. Before validator routing, if the user provided the Target Price in a non-EUR currency, you MUST call `get_eur_exchange_rate` to get the live EUR conversion rate, convert the target price into EUR, and save the converted EUR value into `target_price_eur` with `updateFormFields`.
+2. Before validator routing, if the user provided product Target Prices in a non-EUR currency, you MUST call `get_eur_exchange_rate` to get the live EUR conversion rate, convert each product row's `target_price` into EUR, and save the converted prices in `products` with `updateFormFields`.
 3. If `get_eur_exchange_rate` returns `fallback_used: true` for a non-EUR currency, do NOT finalize validator routing. Ask the user to restate the Target Price directly in EUR, then wait for their answer.
-4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate the strict kEUR turnover using the saved `annual_volume` and `target_price_eur`, perform the matrix routing, and return the calculated `to_total` to you. The backend also calculates `to_total_local` (target_price_local * annual_volume / 1000) for the user-facing UI.
-5. You MUST use the `retrieveZoneManager` tool with `product_line_acronym` and the canonical `delivery_zone` to query the validation matrix and retrieve the backend-calculated `to_total`, `to_total_local`, Validator Email, and Validator Role.
-6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
-7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the RFQ for validation.
+4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate every product row `target_to`, sum `total_target_to`, calculate the strict kEUR turnover, perform the matrix routing, and return the calculated `to_total` to you.
+5. You MUST use the `retrieveZoneManager` tool with `product_line_acronym` and the canonical `delivery_zone` to query the validation matrix and retrieve the backend-calculated `products`, `total_target_to`, `to_total`, `to_total_local`, Validator Email, and Validator Role.
+6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `products`, `total_target_to`, `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
+7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the request for validation, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
 8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-9. CRITICAL SUBMISSION RULE: When you ask the user "Shall I submit this RFQ for validation?", you are waiting for a boolean confirmation. If the user replies "Yes" (or types the corresponding number, e.g., "1"), your IMMEDIATE AND ONLY action must be to execute the submitValidation tool. Do NOT generate another summary. Do NOT ask them to confirm a second time. Call the tool immediately.
-10. After `submitValidation` succeeds, clearly tell the user that the RFQ was submitted and the validation workflow has started.
+9. CRITICAL SUBMISSION RULE: When you ask the user whether to submit this request for validation, you are waiting for a boolean confirmation. If the user replies "Yes" (or types the corresponding number, e.g., "1"), your IMMEDIATE AND ONLY action must be to execute the submitValidation tool. Do NOT generate another summary. Do NOT ask them to confirm a second time. Call the tool immediately.
+10. After `submitValidation` succeeds, clearly tell the user that the request was submitted and the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
 """
 
 POTENTIAL_SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """
@@ -1753,7 +1856,7 @@ async def edit_chat_message(
         raise HTTPException(status_code=404, detail="RFQ not found")
     _assert_can_edit_base_rfq_data(current_user, rfq)
 
-    if rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.POTENTIAL:
+    if _is_potential_document(rfq):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -1803,9 +1906,30 @@ async def handle_chat(
         raise HTTPException(status_code=404, detail="RFQ not found")
     _assert_can_edit_base_rfq_data(current_user, rfq)
 
-    if str(req.chat_mode or "").strip().lower() == "potential" or (
-        rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.POTENTIAL
-    ):
+    if req.document_type == RfqDocumentType.POTENTIAL:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Potential drafts must use the dedicated Potential chatbot until they are "
+                "promoted to a formal RFQ."
+            ),
+        )
+
+    if req.document_type is not None and rfq.document_type != req.document_type:
+        existing_data = dict(rfq.rfq_data or {})
+        if (
+            rfq.phase != RfqPhase.RFQ
+            or rfq.sub_status != RfqSubStatus.NEW_RFQ
+            or bool(rfq.chat_history)
+            or bool(existing_data)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Document type can only be selected before the RFQ/RFI chat starts.",
+            )
+        rfq.document_type = req.document_type
+
+    if str(req.chat_mode or "").strip().lower() == "potential" or _is_potential_document(rfq):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -1817,9 +1941,6 @@ async def handle_chat(
     chat_mode = _normalize_chat_mode(rfq, req.chat_mode)
     extracted_data = _normalize_rfq_data_fields(rfq.rfq_data)
 
-    if chat_mode == "potential":
-        rfq.phase = RfqPhase.RFQ
-        rfq.sub_status = RfqSubStatus.POTENTIAL
     extracted_data["chat_mode"] = chat_mode
 
     if chat_mode == "potential":
@@ -1828,12 +1949,14 @@ async def handle_chat(
         history = list(rfq.chat_history or [])
 
     history = _sanitize_chat_history(history)
+    if chat_mode != "potential":
+        history = _normalize_initial_greeting_for_document_type(history, rfq)
 
     if not history:
         initial_greeting = (
             _build_revision_greeting(rfq.revision_notes)
             if _is_revision_requested(rfq)
-            else ENGLISH_INITIAL_GREETING
+            else _build_formal_initial_greeting(rfq)
         )
         history.append({"role": "assistant", "content": initial_greeting})
 
@@ -1863,14 +1986,31 @@ async def handle_chat(
         current_rfq_state.pop("potential_chat_history", None)
         current_rfq_state["phase"] = rfq.phase.value
         current_rfq_state["sub_status"] = rfq.sub_status.value
+        document_type_value = _document_type_label(rfq.document_type)
+        current_rfq_state["document_type"] = document_type_value
         current_rfq_state["revision_notes"] = rfq.revision_notes
+        if document_type_value == RfqDocumentType.RFI.value:
+            document_type_prompt = (
+                "This document is an RFI. In every user-facing message, say RFI when "
+                "referring to this record. If any static instruction says RFQ, treat it "
+                "as the shared internal workflow name and substitute RFI in visible text. "
+                "Collect the same fields and use the same workflow as an RFQ until "
+                "costing is validated."
+            )
+        elif document_type_value == RfqDocumentType.POTENTIAL.value:
+            document_type_prompt = (
+                "This document is a Potential request. It must use the dedicated "
+                "Potential chatbot until it is converted to RFQ."
+            )
+        else:
+            document_type_prompt = "This document is an RFQ. Use RFQ in user-facing wording."
 
         if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
             missing_fields_prompt = (
-                "The RFQ has been successfully submitted and is currently "
+                f"The {document_type_value} has been successfully submitted and is currently "
                 "PENDING_FOR_VALIDATION. The data entry phase is completely finished. "
                 "DO NOT ask the user for any more fields or missing information. "
-                "Simply inform them that the RFQ is waiting for validator approval."
+                f"Simply inform them that the {document_type_value} is waiting for validator approval."
             )
         else:
             missing_fields_prompt = _build_missing_fields_prompt(
@@ -1891,11 +2031,11 @@ async def handle_chat(
 11. If you cannot confidently map a location or country to one of those 4 approved `delivery_zone` values, ask the user to clarify instead of guessing.
 12. If a tool response or your own reasoning gives you a canonical `delivery_zone`, you MUST immediately persist that exact canonical string with `updateFormFields`.
 13. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
-14. If the MISSING_FIELDS_PROMPT says `to_total`, `zone_manager_email`, `validator_email`, or `validator_role` are missing, you MUST generate or retrieve them yourself. You MUST NOT ask the user to manually provide them.
+14. If the MISSING_FIELDS_PROMPT says `total_target_to`, `to_total`, `zone_manager_email`, `validator_email`, or `validator_role` are missing, you MUST generate or retrieve them yourself. You MUST NOT ask the user to manually provide them.
 15. Your follow-up text after paragraph extraction should ONLY list the specific missing fields for the CURRENT step as a clean numbered list.
 16. Combine missing-fields guidance into ONE single concise message. Do not repeat the same section header or send two separate text blocks for the same turn.
 17. NEVER type raw JSON, `tooluses`, or function-call payloads in your visible response. Use native tool calling only.
-18. If the RFQ is in Potential mode, do NOT ask for detailed NEW_RFQ fields until the workflow is explicitly transitioned out of POTENTIAL.
+18. If the request document_type is POTENTIAL, do NOT ask for detailed NEW_RFQ fields until it is converted to RFQ.
 19. If the RFQ sub_status is REVISION_REQUESTED, treat it as an editable RFQ revision workflow. Do NOT claim the user must return to NEW_RFQ before updates can be saved.
 20. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
 21. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen."""
@@ -1907,6 +2047,9 @@ async def handle_chat(
 
 === REVISION_MODE_CONTEXT ===
 {revision_mode_prompt}
+
+=== DOCUMENT_TYPE_CONTEXT ===
+{document_type_prompt}
 
 === CURRENT RFQ DATABASE STATE ===
 Review this JSON to know exactly what has already been collected:
