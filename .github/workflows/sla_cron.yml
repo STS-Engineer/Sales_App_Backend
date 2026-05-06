@@ -2,7 +2,7 @@ name: SLA Follow-Up Sweeper
 
 on:
   schedule:
-    - cron: "0 8 * * 1-5"
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
 jobs:
