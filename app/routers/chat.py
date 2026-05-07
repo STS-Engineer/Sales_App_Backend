@@ -615,6 +615,35 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
             "\nAll required fields for this step are already present, so move to the next "
             "workflow action instead of re-asking completed fields."
         )
+
+    # ── Strict Step 4 blocking when Steps 2 or 3 are incomplete ──
+    if chat_mode != "potential" and current_step < 4:
+        step2_fields = next(
+            (fields for step_number, fields in steps if step_number == 2), []
+        )
+        step3_fields = next(
+            (fields for step_number, fields in steps if step_number == 3), []
+        )
+        step2_missing = [f for f in step2_fields if not _is_field_filled(data, f)]
+        step3_missing = [f for f in step3_fields if not _is_field_filled(data, f)]
+
+        if step2_missing or step3_missing:
+            prompt += (
+                "\n\n*** STEP 4 IS BLOCKED ***"
+                "\nStep 4 (Validation & Submission) is COMPLETELY HIDDEN from you."
+                "\nYou are FORBIDDEN from mentioning 'Validation', 'Submit', 'Step 4', "
+                "'Turnover', 'TO Total', or 'Zone Manager' until Steps 2 AND 3 are 100% complete."
+            )
+            if step2_missing:
+                prompt += f"\n- Step 2 still missing: {step2_missing}"
+            if step3_missing:
+                prompt += f"\n- Step 3 still missing: {step3_missing}"
+            prompt += (
+                "\nYou MUST ask about the current step's missing fields ONLY. "
+                "If the current step is Step 1 and it is complete, move to Step 2 "
+                "(Delivery Conditions, Payment Terms, Packaging, etc.) immediately."
+            )
+
     return prompt
 
 
@@ -708,12 +737,17 @@ def _normalize_tool_arguments(func_name: str, args: dict | None) -> dict:
             or normalized.get("fromCurrency")
         )
     elif func_name == "updateFormFields":
+        # ── Preserve the append_products flag before flattening ──
+        raw_append = (
+            normalized.pop("append_products", None)
+            or normalized.pop("appendProducts", None)
+        )
         fields = normalized.get("fields_to_update")
         if not isinstance(fields, dict):
             fields = {
                 key: value
                 for key, value in normalized.items()
-                if key != "fields_to_update"
+                if key not in ("fields_to_update", "append_products", "appendProducts")
             }
         legacy_scope = fields.pop("is_feasible", None) if isinstance(fields, dict) else None
         if isinstance(fields, dict) and legacy_scope is not None and "scope" not in fields:
@@ -722,7 +756,10 @@ def _normalize_tool_arguments(func_name: str, args: dict | None) -> dict:
         if isinstance(fields, dict):
             for key, value in fields.items():
                 normalized_fields[UPDATE_FORM_FIELD_ALIASES.get(key, key)] = value
-        normalized = {"fields_to_update": normalized_fields}
+        result = {"fields_to_update": normalized_fields}
+        if raw_append is not None:
+            result["append_products"] = str(raw_append).strip().lower() in ("true", "1", "yes") if not isinstance(raw_append, bool) else raw_append
+        normalized = result
     elif func_name == "uploadRfqFiles" and "file_confirmed" not in normalized:
         normalized["file_confirmed"] = bool(
             normalized.get("confirmed", normalized.get("fileConfirmed", True))
@@ -1347,6 +1384,34 @@ async def _execute_tool_calls(
                 )
                 if canonical_delivery_zone:
                     filtered_fields["delivery_zone"] = canonical_delivery_zone
+
+            # ── append_products: merge new product rows into existing ones ──
+            should_append = args.get("append_products") is True
+            if should_append and "products" in filtered_fields:
+                new_products = filtered_fields["products"]
+                existing_products = extracted_data.get("products") or []
+                if isinstance(new_products, list) and isinstance(existing_products, list) and existing_products:
+                    # Reject mixed currencies
+                    def _product_currency(p):
+                        return str(p.get("currency") or "").strip().upper()
+                    existing_currencies = {_product_currency(p) for p in existing_products if _product_currency(p)}
+                    new_currencies = {_product_currency(p) for p in new_products if _product_currency(p)}
+                    all_currencies = existing_currencies | new_currencies
+                    if len(all_currencies) > 1:
+                        tool_response_text = json.dumps({
+                            "success": False,
+                            "error": "All product rows must use the same currency. "
+                                     f"Existing: {existing_currencies}, New: {new_currencies}",
+                        })
+                        tool_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": func_name,
+                            "content": tool_response_text,
+                        })
+                        continue
+                    filtered_fields["products"] = existing_products + new_products
+
             products_are_authoritative = "products" in filtered_fields
             for key, value in filtered_fields.items():
                 if key == "target_price_is_estimated":
@@ -1544,6 +1609,7 @@ The system maps products to one of these strict acronyms:
 - Friction -> FRI
 
 When the user selects a Product, you MUST extract and save ONLY the authorized acronym (e.g., 'BRU' or 'CHO') to the form using updateFormFields({"fields_to_update": {"product_line_acronym": "<ACRONYM>"}}).
+NEVER ask the user for the Product Line acronym. It is always automatically mapped from the product name.
 
 You must only ask ONE question at a time. Do not overwhelm the user. Wait for their answer before moving to the next.
 You must strictly follow this exact sequential checklist to collect data. Do not move to the next step until the current one is completed.
@@ -1554,10 +1620,17 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
 2. Ask 'What is the Application?' ONLY IF `application` is currently missing.
 3. CRITICAL RULE: Once the user answers the application question, you MUST immediately call `updateFormFields` with {"fields_to_update": {"application": "<user_answer>"}}. You are FORBIDDEN from calling `retrieveProducts` until the application is either already present in the state or has just been successfully saved.
 4. ONLY AFTER the application is saved or already present, call `retrieveProducts` with an empty string ("") to fetch the catalog IF `product_name` is still missing.
-5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save both `product_name` and the authorized `product_line_acronym` with `updateFormFields` to lock them in.
+5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save `product_name` with `updateFormFields` and map it to the authorized `product_line_acronym` to lock them in.
 6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
 7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
 8. Ask only for the remaining missing Step 1 fields among product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Revision Level, Quantity, and Target Price.
+MULTI-PRODUCT SUPPORT:
+- NEVER ask the user how many part numbers/products there are upfront.
+- After each part number is saved, ask: "Would you like to add another part number to this request?"
+- When the user says yes, collect the new product row and call updateFormFields with `append_products=true` so the new rows are APPENDED to existing ones instead of replacing them.
+- When the user says no, move on to the remaining Step 1 fields.
+- You MUST NOT jump to validator routing or ask for submission while `products` still have missing fields (target_price, currency, quantity).
+CRITICAL PRODUCT COMPLETENESS RULE: A product row is NOT complete until it has ALL of: part_number, revision_level, quantity, target_price, currency, and target_price_is_estimated. If ANY of these are missing, you MUST ask for them BEFORE moving on. NEVER skip target_price or currency.
 CRITICAL DELIVERY ZONE RULE: Whenever you save `delivery_zone`, it MUST be exactly one of these 4 approved strings: "asie est", "asie sud", "europe", "amerique". If the user gives a country or city, convert it to the approved zone before calling `updateFormFields`. If you cannot confidently map it, ask a clarification question instead of guessing.
 
 STEP 1 VALIDATION RULE:
@@ -1575,7 +1648,6 @@ NOTE: costing_data is OPTIONAL. If the product has no specific costing parameter
 
 ### Step 2: Commercial Expectations
 Ask sequentially for:
-- Request-level pricing metadata if still missing (currency code, whether the product target prices are 'Estimated by Avocarbon' or 'Given by Customer', and any additional notes about the price)
 - Delivery Conditions
 - Payment Terms
 - Type of Packaging
@@ -1589,7 +1661,7 @@ CRITICAL TARGET PRICE RULE:
    c. Whether this price is 'Estimated by Avocarbon' or 'Given by Customer'.
    d. Any additional notes about the price (optional).
 TARGET PRICE FORMAT RULE: When asking for these target price details, you MUST keep the price source options attached to the Price source field. You are FORBIDDEN from flattening "Estimated by Avocarbon" and "Given by Customer" into separate main numbered-list items. Format it exactly as either:
-   3. Price source (Must be either 'Estimated by Avocarbon' or 'Given by Customer')
+   3. Price source (Must be either 'Estimated' or 'Official Customer Price')
 OR:
    3. Price source:
       - Estimated by Avocarbon
@@ -1622,6 +1694,9 @@ Ask the user the following questions sequentially or all at once:
 - Do u have any comments to add?
 - L'assistant DOIT ensuite synth??tiser la position commerciale et faire une recommandation.
 CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormFields` to save them using the exact keys listed in the mapping (e.g., {"fields_to_update": {"responsibility_design": "...", "capacity_available": "...", "scope": "...", "strategic_note": "...", "final_recommendation": "..."}}).
+
+CRITICAL STEP SEQUENCE ENFORCEMENT:
+You are STRICTLY FORBIDDEN from mentioning 'Validation', 'Submit', 'Step 4', 'Turnover', 'TO Total', or 'Validator' until the MISSING_FIELDS_PROMPT explicitly confirms that Steps 2 AND 3 are 100% complete. If MISSING_FIELDS_PROMPT contains '*** STEP 4 IS BLOCKED ***', you MUST NOT reference Step 4 topics AT ALL. If you just finished collecting part numbers, dates, or contacts from Step 1, you MUST immediately proceed to ask for Delivery Conditions, Payment Terms, and Packaging (Step 2). You are NEVER allowed to skip from Step 1 directly to Step 4.
 
 ### Step 4: Final Calculation & Routing
 CRITICAL STEP 4 RULES:

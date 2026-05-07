@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database_assembly import sync_rfq_to_assembly
-from app.database import get_db
+from app.database import get_db, get_db3
 from app.middleware.auth import get_current_user, require_role
 from app.models.audit_log import AuditLog
 from app.models.contact import Contact
@@ -29,6 +29,7 @@ from app.models.rfq import (
     VALID_PHASE_SUBSTATUS,
 )
 from app.models.user import User, UserRole
+from app.models.validation_matrix import ValidationMatrix
 from app.schemas.discussion import (
     CostingMessageCreateRequest,
     DiscussionMessageCreateRequest,
@@ -47,6 +48,7 @@ from app.schemas.rfq import (
     RfqDataUpdateRequest,
     RfqOut,
     ValidateRfqRequest,
+    get_conflicting_product_currencies,
     get_incomplete_product_fields,
     normalize_rfq_data_products,
     rfq_data_payload_to_dict,
@@ -82,6 +84,7 @@ from app.services.notifications import (
 )
 from app.services.offer_preparation_store import get_offer_preparation_data_snapshot
 from app.utils import emails
+from app.utils.currency import get_eur_exchange_rate
 
 router = APIRouter(prefix="/api/rfq", tags=["rfq"])
 
@@ -967,6 +970,123 @@ async def _generate_systematic_rfq_id(
     return f"{yy}{current_count + 1:03d}-{acronym}-{revision}"
 
 
+async def _resolve_validation_matrix_product(
+    db: AsyncSession,
+    product_name: str | None,
+) -> ValidationMatrix | None:
+    normalized_name = str(product_name or "").strip()
+    if not normalized_name:
+        return None
+
+    result = await db.execute(
+        select(ValidationMatrix).where(
+            or_(
+                func.lower(ValidationMatrix.product_line) == normalized_name.casefold(),
+                func.lower(ValidationMatrix.acronym) == normalized_name.casefold(),
+            )
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _sync_product_line_from_product_name(
+    db: AsyncSession,
+    rfq: Rfq,
+    rfq_data: dict,
+    *,
+    force: bool = False,
+) -> dict:
+    next_data = dict(rfq_data or {})
+    product_name = str(next_data.get("product_name") or "").strip()
+    if not product_name:
+        return next_data
+
+    matrix = await _resolve_validation_matrix_product(db, product_name)
+    if matrix is None:
+        if force:
+            next_data.pop("product_line_acronym", None)
+            rfq.product_line_acronym = None
+        return next_data
+
+    next_data["product_name"] = matrix.product_line
+    next_data["product_line_acronym"] = matrix.acronym
+    rfq.product_line_acronym = matrix.acronym
+    return next_data
+
+
+def _raise_for_conflicting_product_currencies(rfq_data: dict | None) -> None:
+    conflicting_currencies = get_conflicting_product_currencies(rfq_data)
+    if not conflicting_currencies:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "All product rows in one RFQ/RFI must use the same currency. "
+            f"Found: {', '.join(conflicting_currencies)}."
+        ),
+    )
+
+
+async def _sync_rfq_product_derived_fields(
+    rfq_data: dict | None,
+    *,
+    db3: AsyncSession | None,
+    require_strict_fx: bool = False,
+) -> dict:
+    next_data = normalize_rfq_data_products(rfq_data)
+    products = next_data.get("products")
+    if not isinstance(products, list) or not products:
+        next_data.pop("to_total_local", None)
+        return next_data
+
+    total_target_to = sum(
+        float(product.get("target_to") or 0.0)
+        for product in products
+        if isinstance(product, dict)
+    )
+    next_data["total_target_to"] = total_target_to
+
+    first_product = products[0] if products else {}
+    shared_currency = str(
+        (first_product or {}).get("currency")
+        or next_data.get("target_price_currency")
+        or "EUR"
+    ).strip().upper() or "EUR"
+    next_data["target_price_currency"] = shared_currency
+
+    routing_total_target_to = total_target_to
+    if shared_currency != "EUR":
+        if db3 is None:
+            if require_strict_fx:
+                raise ValueError(
+                    f"FX lookup is unavailable for {shared_currency}. "
+                    "Please restate the target prices directly in EUR."
+                )
+            next_data["to_total_local"] = total_target_to / 1000.0
+            next_data["to_total"] = total_target_to / 1000.0
+            return next_data
+
+        eur_rate = await get_eur_exchange_rate(shared_currency, db3=db3)
+        fallback_used = bool(shared_currency and eur_rate == 1.0)
+        if fallback_used and require_strict_fx:
+            raise ValueError(
+                f"FX lookup fallback prevented validator routing for {shared_currency}. "
+                "Please restate the target prices directly in EUR."
+            )
+
+        routing_total_target_to = sum(
+            float(product.get("target_to") or 0.0) * eur_rate
+            for product in products
+            if isinstance(product, dict)
+        )
+        next_data["to_total_local"] = total_target_to / 1000.0
+    else:
+        next_data.pop("to_total_local", None)
+
+    next_data["to_total"] = routing_total_target_to / 1000.0
+    return next_data
+
+
 async def _maybe_assign_systematic_rfq_id(
     db: AsyncSession,
     rfq: Rfq,
@@ -975,6 +1095,7 @@ async def _maybe_assign_systematic_rfq_id(
     next_data = normalize_rfq_data_products(rfq_data)
     if _is_potential(rfq):
         return next_data
+    next_data = await _sync_product_line_from_product_name(db, rfq, next_data)
     if next_data.get("systematic_rfq_id"):
         return next_data
 
@@ -1023,6 +1144,8 @@ async def _submit_rfq_for_validation_internal(
         )
 
     extracted_data = normalize_rfq_data_products(rfq.rfq_data)
+    extracted_data = await _sync_product_line_from_product_name(db, rfq, extracted_data)
+    _raise_for_conflicting_product_currencies(extracted_data)
     incomplete_product_fields = get_incomplete_product_fields(extracted_data)
     if incomplete_product_fields:
         raise HTTPException(
@@ -1111,6 +1234,7 @@ async def _submit_rfq_for_validation_internal(
 async def create_rfq(
     body: RfqCreateRequest | None = None,
     db: AsyncSession = Depends(get_db),
+    db3: AsyncSession = Depends(get_db3),
     current_user: User = Depends(
         require_role(UserRole.COMMERCIAL, UserRole.OWNER, UserRole.ZONE_MANAGER)
     ),
@@ -1137,6 +1261,20 @@ async def create_rfq(
         rfq_data=rfq_data,
         chat_history=[],
     )
+    rfq_data = await _sync_product_line_from_product_name(
+        db,
+        rfq,
+        rfq_data,
+        force="product_name" in rfq_data,
+    )
+    _raise_for_conflicting_product_currencies(rfq_data)
+    rfq_data = await _sync_rfq_product_derived_fields(rfq_data, db3=db3)
+    zone_manager_email = (
+        rfq_data.get("zone_manager_email") or rfq_data.get("validator_email") or None
+    )
+    rfq.product_line_acronym = rfq_data.get("product_line_acronym")
+    rfq.zone_manager_email = zone_manager_email
+    rfq.rfq_data = rfq_data
     rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, rfq_data)
     db.add(rfq)
     if document_type == RfqDocumentType.POTENTIAL:
@@ -1151,6 +1289,7 @@ async def update_rfq_data(
     rfq_id: str,
     body: RfqDataUpdateRequest,
     db: AsyncSession = Depends(get_db),
+    db3: AsyncSession = Depends(get_db3),
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
@@ -1158,22 +1297,24 @@ async def update_rfq_data(
 
     incoming_data = rfq_data_payload_to_dict(body.rfq_data)
     incoming_data.pop("rfq_files", None)
-    if "target_price_is_estimated" in incoming_data:
-        val = incoming_data["target_price_is_estimated"]
-        incoming_data["target_price_is_estimated"] = (
-            val if isinstance(val, bool)
-            else str(val).strip().lower() in ("true", "1", "yes")
-        )
     next_data = dict(rfq.rfq_data or {})
     next_data.update(incoming_data)
     next_data = normalize_rfq_data_products(
         next_data,
         products_authoritative="products" in incoming_data,
     )
+    next_data = await _sync_product_line_from_product_name(
+        db,
+        rfq,
+        next_data,
+        force="product_name" in incoming_data,
+    )
+    _raise_for_conflicting_product_currencies(next_data)
+    next_data = await _sync_rfq_product_derived_fields(next_data, db3=db3)
     rfq.rfq_data = next_data
 
-    if "product_line_acronym" in incoming_data:
-        rfq.product_line_acronym = incoming_data.get("product_line_acronym")
+    if "product_line_acronym" in incoming_data or "product_name" in incoming_data:
+        rfq.product_line_acronym = next_data.get("product_line_acronym")
     if "zone_manager_email" in incoming_data or "validator_email" in incoming_data:
         rfq.zone_manager_email = (
             incoming_data.get("zone_manager_email")
@@ -1190,6 +1331,7 @@ async def update_rfq_data(
 async def proceed_to_rfq(
     rfq_id: str,
     db: AsyncSession = Depends(get_db),
+    db3: AsyncSession = Depends(get_db3),
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
@@ -1223,6 +1365,7 @@ async def proceed_to_rfq(
     rfq.rfq_data = normalize_rfq_data_products(
         sync_potential_to_rfq_data(potential, rfq.rfq_data)
     )
+    rfq.rfq_data = await _sync_rfq_product_derived_fields(rfq.rfq_data, db3=db3)
     rfq.document_type = RfqDocumentType.RFQ
     rfq.phase = RfqPhase.RFQ
     rfq.sub_status = RfqSubStatus.NEW_RFQ

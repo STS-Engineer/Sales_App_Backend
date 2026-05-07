@@ -351,7 +351,7 @@ async def test_submit_revision_rejects_non_creator_and_wrong_state(
 
 
 @pytest.mark.asyncio
-async def test_update_rfq_data_normalizes_target_price_is_estimated_boolean(
+async def test_update_rfq_data_moves_legacy_target_price_is_estimated_into_products(
     client: AsyncClient,
     db_session: AsyncSession,
 ):
@@ -374,18 +374,48 @@ async def test_update_rfq_data_normalizes_target_price_is_estimated_boolean(
 
     true_response = await client.put(
         f"/api/rfq/{rfq.rfq_id}/data",
-        json={"rfq_data": {"target_price_is_estimated": "yes"}},
+        json={
+            "rfq_data": {
+                "products": [
+                    {
+                        "part_number": "PN-100",
+                        "revision_level": "A",
+                        "quantity": 1000,
+                        "target_price": 2.5,
+                        "currency": "EUR",
+                    }
+                ],
+                "target_price_is_estimated": "yes",
+            }
+        },
         headers=creator_headers,
     )
 
     assert true_response.status_code == 200
-    assert true_response.json()["rfq_data"]["target_price_is_estimated"] is True
+    true_payload = true_response.json()["rfq_data"]
+    assert true_payload["products"][0]["target_price_is_estimated"] is True
+    assert "target_price_is_estimated" not in true_payload
 
     false_response = await client.put(
         f"/api/rfq/{rfq.rfq_id}/data",
-        json={"rfq_data": {"target_price_is_estimated": "false"}},
+        json={
+            "rfq_data": {
+                "products": [
+                    {
+                        "part_number": "PN-100",
+                        "revision_level": "A",
+                        "quantity": 1000,
+                        "target_price": 2.5,
+                        "currency": "EUR",
+                    }
+                ],
+                "target_price_is_estimated": "false",
+            }
+        },
         headers=creator_headers,
     )
 
     assert false_response.status_code == 200
-    assert false_response.json()["rfq_data"]["target_price_is_estimated"] is False
+    false_payload = false_response.json()["rfq_data"]
+    assert false_payload["products"][0]["target_price_is_estimated"] is False
+    assert "target_price_is_estimated" not in false_payload

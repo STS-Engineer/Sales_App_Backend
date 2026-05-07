@@ -1210,6 +1210,17 @@ def _format_target_price_display(data: dict[str, Any]) -> str:
         data,
         ("target_price_is_estimated", "targetPriceIsEstimated"),
     )
+    if estimated_value is None:
+        first_product = (
+            data.get("products")[0]
+            if isinstance(data.get("products"), list) and data.get("products")
+            else {}
+        )
+        if isinstance(first_product, dict):
+            estimated_value = _pick_first_raw_value(
+                first_product,
+                ("target_price_is_estimated", "targetPriceIsEstimated"),
+            )
 
     eur_text = _stringify_value(eur_value).strip() if eur_value is not None else ""
     local_text = _stringify_value(local_value).strip() if local_value is not None else ""
