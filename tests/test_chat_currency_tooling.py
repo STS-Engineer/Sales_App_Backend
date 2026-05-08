@@ -509,8 +509,64 @@ async def test_retrieve_zone_manager_uses_saved_product_line_when_tool_arg_missi
     assert payload["zone_manager_email"] == "franck.lagadec@avocarbon.com"
 
 
+@pytest.mark.asyncio
+async def test_execute_tool_calls_uses_fx_for_non_eur_routing_without_mutating_products(monkeypatch):
+    fx_db = object()
+
+    async def _fake_get_rate(currency_code, db3):
+        assert currency_code == "INR"
+        assert db3 is fx_db
+        return 0.01
+
+    monkeypatch.setattr(chat, "get_eur_exchange_rate", _fake_get_rate)
+
+    extracted_data = {
+        "products": [
+            _build_product(
+                quantity=10,
+                target_price=2000,
+                currency="INR",
+                target_price_is_estimated=False,
+            )
+        ],
+        "total_target_to": 20000,
+        "target_price_currency": "INR",
+    }
+    tool_messages, auto_redirect = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "zone-5",
+                "name": "retrieveZoneManager",
+                "arguments": {
+                    "product_line_acronym": "BRU",
+                    "delivery_zone": "Europe",
+                },
+            }
+        ],
+        http_client=None,
+        db=_FakeDb(_build_matrix()),
+        db3=fx_db,
+        rfq=_build_rfq(),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert auto_redirect is False
+    assert payload["products"][0]["target_price"] == 2000
+    assert payload["products"][0]["currency"] == "INR"
+    assert payload["total_target_to"] == 20000
+    assert payload["to_total"] == 0.2
+    assert payload["to_total_local"] == "20.0"
+
+
 def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Always store dimension data in mm." in chat.SYSTEM_PROMPT
+    assert "strictly forbidden from calculating exchange rates or converting currencies yourself" in chat.SYSTEM_PROMPT
+    assert 'If the user says "2000 INR", you must save `target_price = 2000` and `currency = "INR"`' in chat.SYSTEM_PROMPT
     assert "CRITICAL NO-ROUNDING RULE" in chat.SYSTEM_PROMPT
     assert "Keep at most 5 digits after the decimal point." in chat.SYSTEM_PROMPT
     assert "save 0.19879 into the database" in chat.SYSTEM_PROMPT
@@ -529,6 +585,7 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "MUST call `get_eur_exchange_rate`" in chat.SYSTEM_PROMPT
     assert "truncate it instead of rounding" in chat.SYSTEM_PROMPT
     assert "Ask the user to restate the Target Price directly in EUR" in chat.SYSTEM_PROMPT
+    assert "You MUST NOT rewrite `products[*].target_price`" in chat.SYSTEM_PROMPT
     assert "MUST NEVER calculate the TO Total yourself" in chat.SYSTEM_PROMPT
     assert "return the calculated `to_total` to you" in chat.SYSTEM_PROMPT
     assert "exactly one of these 4 approved `delivery_zone` strings" in chat.SYSTEM_PROMPT
@@ -541,6 +598,15 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Request-level pricing metadata if still missing" not in chat.SYSTEM_PROMPT
     assert "MUST NOT jump to validator routing or ask for submission" in chat.SYSTEM_PROMPT
     assert "save both `product_name` and the authorized `product_line_acronym`" not in chat.SYSTEM_PROMPT
+
+
+def test_product_item_tool_schema_preserves_raw_currency_fields():
+    properties = chat.PRODUCT_ITEM_TOOL_SCHEMA["items"]["properties"]
+
+    assert "currency" in properties
+    assert "target_price_is_estimated" in properties
+    assert "Never convert currencies yourself" in properties["target_price"]["description"]
+    assert "Derived turnover only" in properties["target_to"]["description"]
 
 
 def test_dynamic_prompt_reinforces_delivery_zone_sync_rules():

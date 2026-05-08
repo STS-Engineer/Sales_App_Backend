@@ -58,6 +58,12 @@ class NotificationLogOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RfqFxRateOut(BaseModel):
+    currency_code: str
+    eur_rate: float
+    fallback_used: bool
+
+
 class ProductItem(BaseModel):
     part_number: str | None = None
     revision_level: str | None = None
@@ -228,8 +234,6 @@ def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
             (
                 "target_price",
                 "targetPrice",
-                "target_price_eur",
-                "targetPriceEur",
                 "price",
             ),
         )
@@ -305,7 +309,16 @@ def _legacy_product_from_data(data: dict[str, Any]) -> dict[str, Any] | None:
         "part_number": data.get("customer_pn") or data.get("customerPn"),
         "revision_level": data.get("revision_level") or data.get("revisionLevel"),
         "quantity": data.get("annual_volume") or data.get("qty_per_year") or data.get("qtyPerYear"),
-        "target_price": data.get("target_price_eur") or data.get("targetPrice"),
+        "target_price": _pick_first(
+            data,
+            (
+                "target_price_local",
+                "targetPriceLocal",
+                "target_price_eur",
+                "targetPriceEur",
+                "targetPrice",
+            ),
+        ),
         "currency": data.get("target_price_currency") or data.get("targetPriceCurrency"),
         "target_price_is_estimated": _pick_first(
             data,
@@ -374,15 +387,22 @@ def normalize_rfq_data_products(
             normalized["customer_pn"] = first_product.get("part_number") or ""
             normalized["revision_level"] = first_product.get("revision_level") or ""
             normalized["annual_volume"] = first_product.get("quantity") or ""
-            normalized["target_price_eur"] = first_product.get("target_price") or ""
-            normalized["target_price_currency"] = first_product.get("currency") or ""
+            normalized["target_price_local"] = (
+                first_product.get("target_price")
+                if first_product.get("target_price") is not None
+                else ""
+            )
+            normalized["target_price_currency"] = (
+                first_product.get("currency")
+                or fallback_currency
+                or ""
+            )
 
             existing_to_total_local = _coerce_float_or_none(normalized.get("to_total_local"))
             if existing_to_total_local is None:
-                local_price = _coerce_float_or_none(normalized.get("target_price_local"))
-                first_quantity = _coerce_float_or_none(first_product.get("quantity"))
-                if local_price is not None and first_quantity is not None:
-                    normalized["to_total_local"] = (local_price * first_quantity) / 1000.0
+                shared_currency = _normalize_currency_code(normalized.get("target_price_currency"))
+                if shared_currency and shared_currency != "EUR":
+                    normalized["to_total_local"] = total_target_to / 1000.0
 
     normalized.pop("target_price_is_estimated", None)
     normalized.pop("targetPriceIsEstimated", None)

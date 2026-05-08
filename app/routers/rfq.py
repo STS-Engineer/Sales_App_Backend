@@ -46,6 +46,7 @@ from app.schemas.rfq import (
     RequestRevisionRequest,
     RfqCreateRequest,
     RfqDataUpdateRequest,
+    RfqFxRateOut,
     RfqOut,
     ValidateRfqRequest,
     get_conflicting_product_currencies,
@@ -1047,12 +1048,21 @@ async def _sync_rfq_product_derived_fields(
     next_data["total_target_to"] = total_target_to
 
     first_product = products[0] if products else {}
+    first_local_target_price = (
+        first_product.get("target_price")
+        if isinstance(first_product.get("target_price"), (int, float))
+        else None
+    )
+    existing_target_price_eur = next_data.get("target_price_eur")
     shared_currency = str(
         (first_product or {}).get("currency")
         or next_data.get("target_price_currency")
         or "EUR"
     ).strip().upper() or "EUR"
     next_data["target_price_currency"] = shared_currency
+    next_data["target_price_local"] = (
+        first_local_target_price if first_local_target_price is not None else ""
+    )
 
     routing_total_target_to = total_target_to
     if shared_currency != "EUR":
@@ -1064,6 +1074,11 @@ async def _sync_rfq_product_derived_fields(
                 )
             next_data["to_total_local"] = total_target_to / 1000.0
             next_data["to_total"] = total_target_to / 1000.0
+            next_data["target_price_eur"] = (
+                existing_target_price_eur
+                if existing_target_price_eur not in (None, "")
+                else ""
+            )
             return next_data
 
         eur_rate = await get_eur_exchange_rate(shared_currency, db3=db3)
@@ -1080,8 +1095,18 @@ async def _sync_rfq_product_derived_fields(
             if isinstance(product, dict)
         )
         next_data["to_total_local"] = total_target_to / 1000.0
+        next_data["target_price_eur"] = (
+            first_local_target_price * eur_rate
+            if first_local_target_price is not None and not fallback_used
+            else existing_target_price_eur
+            if existing_target_price_eur not in (None, "")
+            else ""
+        )
     else:
         next_data.pop("to_total_local", None)
+        next_data["target_price_eur"] = (
+            first_local_target_price if first_local_target_price is not None else ""
+        )
 
     next_data["to_total"] = routing_total_target_to / 1000.0
     return next_data
@@ -1282,6 +1307,27 @@ async def create_rfq(
 
     await db.commit()
     return await _get_rfq_or_404(db, rfq.rfq_id)
+
+
+@router.get("/fx/eur-rate", response_model=RfqFxRateOut)
+async def get_rfq_eur_fx_rate(
+    currency_code: str = Query(..., min_length=1),
+    db3: AsyncSession = Depends(get_db3),
+    current_user: User = Depends(get_current_user),
+):
+    del current_user
+    sanitized_currency = "".join(
+        char for char in str(currency_code or "").upper() if char.isalpha()
+    )
+    eur_rate = await get_eur_exchange_rate(sanitized_currency, db3=db3)
+    fallback_used = bool(
+        sanitized_currency and sanitized_currency != "EUR" and eur_rate == 1.0
+    )
+    return RfqFxRateOut(
+        currency_code=sanitized_currency,
+        eur_rate=eur_rate,
+        fallback_used=fallback_used,
+    )
 
 
 @router.put("/{rfq_id}/data", response_model=RfqOut)

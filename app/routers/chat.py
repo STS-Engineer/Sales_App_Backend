@@ -266,8 +266,34 @@ PRODUCT_ITEM_TOOL_SCHEMA = {
             "part_number": {"type": "string"},
             "revision_level": {"type": "string"},
             "quantity": {"type": "number"},
-            "target_price": {"type": "number"},
-            "target_to": {"type": "number"},
+            "target_price": {
+                "type": "number",
+                "description": (
+                    "The exact raw local line price stated by the user. "
+                    "Never convert currencies yourself."
+                ),
+            },
+            "currency": {
+                "type": "string",
+                "description": (
+                    "The exact 3-letter currency code provided by the user "
+                    "for this product row."
+                ),
+            },
+            "target_price_is_estimated": {
+                "type": "boolean",
+                "description": (
+                    "true for Estimated by Avocarbon, false for Official "
+                    "Customer Price."
+                ),
+            },
+            "target_to": {
+                "type": "number",
+                "description": (
+                    "Derived turnover only. Do not invent it and do not "
+                    "currency-convert it yourself."
+                ),
+            },
         },
     },
 }
@@ -1147,6 +1173,11 @@ async def _execute_tool_calls(
                         + ", ".join(incomplete_product_fields)
                     )
 
+                products = (
+                    extracted_data.get("products")
+                    if isinstance(extracted_data.get("products"), list)
+                    else []
+                )
                 total_target_to = _coerce_numeric_value(
                     extracted_data.get("total_target_to")
                 )
@@ -1155,23 +1186,41 @@ async def _execute_tool_calls(
                         "total_target_to must be greater than zero before validator routing."
                     )
 
-                to_total_float = total_target_to / 1000.0
                 extracted_data["total_target_to"] = total_target_to
-                extracted_data["to_total"] = str(to_total_float)
+                first_product = products[0] if products else {}
+                shared_currency = str(
+                    first_product.get("currency")
+                    or extracted_data.get("target_price_currency")
+                    or "EUR"
+                ).strip().upper() or "EUR"
+                extracted_data["target_price_currency"] = shared_currency
 
-                # Also compute to_total_local for the user-facing UI
-                local_price_value = extracted_data.get("target_price_local")
-                if local_price_value not in (None, ""):
-                    try:
-                        local_price = _coerce_numeric_value(local_price_value)
-                        first_product = (extracted_data.get("products") or [{}])[0]
-                        first_quantity = _coerce_numeric_value(
-                            first_product.get("quantity")
+                first_product_price = first_product.get("target_price")
+                if first_product_price not in (None, ""):
+                    extracted_data["target_price_local"] = str(first_product_price)
+
+                if shared_currency != "EUR":
+                    if db3 is None:
+                        raise ValueError(
+                            f"FX lookup is unavailable for {shared_currency}. "
+                            "Please ask the user to restate the Target Price directly in EUR."
                         )
-                        to_total_local_float = (first_quantity * local_price) / 1000.0
-                        extracted_data["to_total_local"] = str(to_total_local_float)
-                    except (ValueError, TypeError):
-                        pass
+                    eur_rate = await get_eur_exchange_rate(shared_currency, db3=db3)
+                    fallback_used = bool(shared_currency and eur_rate == 1.0)
+                    if fallback_used:
+                        raise ValueError(
+                            f"FX lookup fallback prevented validator routing for {shared_currency}. "
+                            "Please ask the user to restate the Target Price directly in EUR."
+                        )
+                    extracted_data["to_total_local"] = str(total_target_to / 1000.0)
+                    to_total_float = (total_target_to * eur_rate) / 1000.0
+                else:
+                    extracted_data.pop("to_total_local", None)
+                    if first_product_price not in (None, ""):
+                        extracted_data["target_price_eur"] = str(first_product_price)
+                    to_total_float = total_target_to / 1000.0
+
+                extracted_data["to_total"] = str(to_total_float)
                 query = select(ValidationMatrix).where(
                     ValidationMatrix.acronym == acronym
                 )
@@ -1506,11 +1555,12 @@ NUMBERED OPTION FORMATTING RULE: When asking the user a question with multiple c
 FINAL CONFIRMATION RULE: When all required information is gathered and you ask the user whether to submit this request for validation, you MUST provide exactly two options: 'Yes' and 'No'. Do NOT format them as a numbered list or use bullet points (e.g., NEVER write '1. Yes' or '- Yes'). Output the options cleanly so the UI can parse them as strict boolean choices.
 NUMBERED OPTION PARSING RULE: When you provide a numbered list of options and the user replies with a single number, you MUST internally substitute that number with the exact text of the corresponding option before taking any further action or making tool calls. Never treat numeric replies as generic booleans.
 NUMERIC EXTRACTION RULE: When extracting numerical values (like volumes, prices, or quantities) from user text that contain spaces or commas (for example, "500 000" or "500,000"), you MUST remove all spaces and commas and output the continuous number in your tool calls. Preserve decimals for pricing fields when they are present.
-CRITICAL NO-ROUNDING RULE: When you convert a non-EUR currency to EUR using the exchange rate, or when you perform any calculations, you MUST NEVER round the result. Keep at most 5 digits after the decimal point. If the exact result has more than 5 digits after the decimal point, truncate it instead of rounding. For example, if the math results in 0.19879123, save 0.19879 into the database, never round it to 0.19880 or 0.20. Do not apply any 'arrondi' or formatting.
+CRITICAL DATA EXTRACTION RULE: You are strictly forbidden from calculating exchange rates or converting currencies yourself. You MUST extract the EXACT numerical value the user provides. If the user says "2000 INR", you must save `target_price = 2000` and `currency = "INR"`. Do not perform any math on the user's input price.
+CRITICAL NO-ROUNDING RULE: If a backend tool returns a converted EUR value, or if you perform any other allowed calculations, you MUST NEVER round the result. Keep at most 5 digits after the decimal point. If the exact result has more than 5 digits after the decimal point, truncate it instead of rounding. For example, if the math results in 0.19879123, save 0.19879 into the database, never round it to 0.19880 or 0.20. Do not apply any 'arrondi' or formatting.
 DIMENSION NORMALIZATION RULE: If the user provides physical dimensions or technical specifications in inches or any other non-mm unit, you MUST seamlessly convert them to millimeters (mm) before saving the data. Always store dimension data in mm.
 DELIVERY ZONE CLASSIFICATION RULE: When collecting the customer location or delivery destination, you MUST classify it into exactly one of these 4 approved `delivery_zone` strings: "asie est", "asie sud", "europe", "amerique". Never use any other spelling or region name. If the user gives a specific country, map it automatically to the correct approved zone (for example, France -> europe, Mexico -> amerique, China -> asie est, India -> asie sud). If you cannot confidently map it, ask the user to clarify before saving.
 FORM STATE SYNC RULE: On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data. Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 4 approved strings: "asie est", "asie sud", "europe", "amerique".
-MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, and Target Price for each product. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, and `target_price`. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
+MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, Target Price, Currency, and Price Source for each product. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
@@ -1520,7 +1570,7 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - product_line_acronym
 - project_name
 - costing_data (Format ALL costing parameters as a single formatted string/list here)
-- products (array of product rows: part_number, revision_level, quantity, target_price, target_to)
+- products (array of product rows: part_number, revision_level, quantity, target_price, currency, target_price_is_estimated; `target_to` is derived and must not be invented)
 - total_target_to
 - customer_pn
 - revision_level
@@ -1655,7 +1705,7 @@ Ask sequentially for:
 - Tooling Conditions
 - Entry Barriers
 CRITICAL TARGET PRICE RULE:
-1. When collecting product target prices, you MUST save each line price in the `products` array. You may also collect these request-level price metadata fields:
+1. When collecting product target prices, you MUST save each line price in the `products` array exactly as the user stated it. Save each product row with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` MUST remain the raw local amount the user provided. You may also collect these request-level price metadata fields:
    a. The target price amount for each product row in the user's local currency.
    b. The currency code for the provided product target prices (for example, EUR, USD, GBP, MXN, or CNY).
    c. Whether this price is 'Estimated by Avocarbon' or 'Given by Customer'.
@@ -1671,9 +1721,9 @@ OR:
    - `target_price_currency`: the 3-letter ISO currency code
    - `target_price_is_estimated`: true if estimated by Avocarbon, false if given by customer
    - `target_price_note`: any additional notes (or empty string)
-3. If the currency is NOT EUR, you MUST silently call `get_eur_exchange_rate` in the background, convert each local product target price to EUR, and save ONLY the converted EUR values in the `products` array. You MUST NOT save raw non-EUR line prices as canonical `target_price`.
-4. If the currency IS EUR, save the same product target prices directly in the `products` array.
-5. When converting, keep at most 5 digits after the decimal point and truncate extra digits instead of rounding.
+3. If the currency is NOT EUR, you MAY call `get_eur_exchange_rate` only for derived backend previews or validator-routing checks. You MUST NOT rewrite `products[*].target_price` or `products[*].target_to` with converted EUR values.
+4. If the currency IS EUR, save the same raw product target prices directly in the `products` array.
+5. When relaying any backend-derived conversion, keep at most 5 digits after the decimal point and truncate extra digits instead of rounding.
 CRITICAL PACKAGING RULE: When `type_of_packaging` is missing, you MUST ask the user to choose exactly one of these 3 options:
 1. carboard divider
 2. one way tray
@@ -1701,9 +1751,9 @@ You are STRICTLY FORBIDDEN from mentioning 'Validation', 'Submit', 'Step 4', 'Tu
 ### Step 4: Final Calculation & Routing
 CRITICAL STEP 4 RULES:
 1. Look at the missing fields list. If `to_total` or `zone_manager_email` are missing, DO NOT ask the user for them.
-2. Before validator routing, if the user provided product Target Prices in a non-EUR currency, you MUST call `get_eur_exchange_rate` to get the live EUR conversion rate, convert each product row's `target_price` into EUR, and save the converted prices in `products` with `updateFormFields`.
+2. Before validator routing, if the user provided product Target Prices in a non-EUR currency, you MUST call `get_eur_exchange_rate` only to check FX availability for derived routing totals. You MUST NOT rewrite `products[*].target_price`; keep the exact raw local values in `products`.
 3. If `get_eur_exchange_rate` returns `fallback_used: true` for a non-EUR currency, do NOT finalize validator routing. Ask the user to restate the Target Price directly in EUR, then wait for their answer.
-4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate every product row `target_to`, sum `total_target_to`, calculate the strict kEUR turnover, perform the matrix routing, and return the calculated `to_total` to you.
+4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate every product row `target_to`, sum the local `total_target_to`, calculate the strict kEUR turnover for routing, perform the matrix routing, and return the calculated `to_total` to you.
 5. You MUST use the `retrieveZoneManager` tool with `product_line_acronym` and the canonical `delivery_zone` to query the validation matrix and retrieve the backend-calculated `products`, `total_target_to`, `to_total`, `to_total_local`, Validator Email, and Validator Role.
 6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `products`, `total_target_to`, `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
 7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the request for validation, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.

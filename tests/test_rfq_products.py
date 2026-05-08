@@ -1,3 +1,6 @@
+import pytest
+
+from app.routers import rfq as rfq_router
 from app.schemas.rfq import (
     get_conflicting_product_currencies,
     get_incomplete_product_fields,
@@ -38,8 +41,9 @@ def test_normalize_multi_product_rows_computes_totals_and_legacy_mirrors():
     assert data["customer_pn"] == "PN-1"
     assert data["revision_level"] == "A"
     assert data["annual_volume"] == 1000
-    assert data["target_price_eur"] == 2.5
+    assert data["target_price_local"] == 2.5
     assert data["target_price_currency"] == "EUR"
+    assert "target_price_eur" not in data
     assert data["products"][0]["currency"] == "EUR"
     assert data["products"][1]["currency"] == "EUR"
     assert data["products"][0]["target_price_is_estimated"] is True
@@ -119,6 +123,43 @@ def test_legacy_target_price_currency_hydrates_product_currency():
     assert data["products"][0]["target_price_is_estimated"] is True
 
 
+def test_legacy_single_product_prefers_local_target_price_when_reconstructing_products():
+    data = normalize_rfq_data_products(
+        {
+            "customer_pn": "LEGACY-LOCAL",
+            "revision_level": "01",
+            "annual_volume": 10,
+            "target_price_local": 2000,
+            "target_price_eur": 22,
+            "target_price_currency": "inr",
+        }
+    )
+
+    assert data["products"][0]["target_price"] == 2000
+    assert data["products"][0]["currency"] == "INR"
+    assert data["products"][0]["target_to"] == 20000
+
+
+def test_product_rows_do_not_hydrate_target_price_from_target_price_eur_alias():
+    data = normalize_rfq_data_products(
+        {
+            "products": [
+                {
+                    "part_number": "PN-LEGACY",
+                    "revision_level": "A",
+                    "quantity": 100,
+                    "target_price_eur": 5.5,
+                    "currency": "USD",
+                }
+            ]
+        },
+        products_authoritative=True,
+    )
+
+    assert data["products"][0]["target_price"] is None
+    assert data["products"][0]["target_to"] is None
+
+
 def test_conflicting_product_currencies_are_reported():
     currencies = get_conflicting_product_currencies(
         {
@@ -142,4 +183,72 @@ def test_conflicting_product_currencies_are_reported():
     )
 
     assert currencies == ["EUR", "USD"]
+
+
+@pytest.mark.asyncio
+async def test_sync_rfq_product_derived_fields_derives_eur_mirrors_without_mutating_local_prices(monkeypatch):
+    async def _fake_get_rate(currency_code, db3):
+        assert currency_code == "INR"
+        assert db3 is not None
+        return 0.01
+
+    monkeypatch.setattr(rfq_router, "get_eur_exchange_rate", _fake_get_rate)
+
+    data = await rfq_router._sync_rfq_product_derived_fields(
+        {
+            "products": [
+                {
+                    "part_number": "PN-LOCAL",
+                    "revision_level": "A",
+                    "quantity": 10,
+                    "target_price": 2000,
+                    "currency": "INR",
+                    "target_price_is_estimated": False,
+                }
+            ]
+        },
+        db3=object(),
+    )
+
+    assert data["products"][0]["target_price"] == 2000
+    assert data["products"][0]["target_to"] == 20000
+    assert data["total_target_to"] == 20000
+    assert data["to_total_local"] == 20.0
+    assert data["to_total"] == 0.2
+    assert data["target_price_local"] == 2000
+    assert data["target_price_currency"] == "INR"
+    assert data["target_price_eur"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_sync_rfq_product_derived_fields_keeps_non_eur_eur_mirror_blank_on_fx_fallback(monkeypatch):
+    async def _fallback_get_rate(currency_code, db3):
+        assert currency_code == "MXN"
+        assert db3 is not None
+        return 1.0
+
+    monkeypatch.setattr(rfq_router, "get_eur_exchange_rate", _fallback_get_rate)
+
+    data = await rfq_router._sync_rfq_product_derived_fields(
+        {
+            "products": [
+                {
+                    "part_number": "PN-FALLBACK",
+                    "revision_level": "A",
+                    "quantity": 10,
+                    "target_price": 100,
+                    "currency": "MXN",
+                    "target_price_is_estimated": True,
+                }
+            ],
+            "target_price_eur": "",
+        },
+        db3=object(),
+    )
+
+    assert data["products"][0]["target_price"] == 100
+    assert data["products"][0]["target_to"] == 1000
+    assert data["target_price_local"] == 100
+    assert data["target_price_currency"] == "MXN"
+    assert data["target_price_eur"] == ""
 

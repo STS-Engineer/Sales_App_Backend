@@ -419,3 +419,158 @@ async def test_update_rfq_data_moves_legacy_target_price_is_estimated_into_produ
     false_payload = false_response.json()["rfq_data"]
     assert false_payload["products"][0]["target_price_is_estimated"] is False
     assert "target_price_is_estimated" not in false_payload
+
+
+@pytest.mark.asyncio
+async def test_get_rfq_eur_fx_rate_short_circuits_for_eur(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator, creator_headers = await _create_user_and_headers(
+        db_session,
+        role=UserRole.COMMERCIAL,
+        email_prefix="creator-fx-eur",
+    )
+
+    fx_calls: list[str] = []
+
+    async def _eur_get_rate(currency_code, *, db3):
+        assert db3 is not None
+        fx_calls.append(currency_code)
+        return 1.0
+
+    monkeypatch.setattr(rfq_router, "get_eur_exchange_rate", _eur_get_rate)
+
+    response = await client.get(
+        "/api/rfq/fx/eur-rate?currency_code=eur",
+        headers=creator_headers,
+    )
+
+    assert creator.email
+    assert response.status_code == 200
+    assert response.json() == {
+        "currency_code": "EUR",
+        "eur_rate": 1.0,
+        "fallback_used": False,
+    }
+    assert fx_calls == ["EUR"]
+
+
+@pytest.mark.asyncio
+async def test_get_rfq_eur_fx_rate_uses_existing_utility_for_non_eur(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    _, creator_headers = await _create_user_and_headers(
+        db_session,
+        role=UserRole.COMMERCIAL,
+        email_prefix="creator-fx-usd",
+    )
+    fx_calls: list[str] = []
+
+    async def _fake_get_rate(currency_code, db3):
+        assert db3 is not None
+        fx_calls.append(currency_code)
+        return 0.91
+
+    monkeypatch.setattr(rfq_router, "get_eur_exchange_rate", _fake_get_rate)
+
+    response = await client.get(
+        "/api/rfq/fx/eur-rate?currency_code=u$s$d",
+        headers=creator_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "currency_code": "USD",
+        "eur_rate": 0.91,
+        "fallback_used": False,
+    }
+    assert fx_calls == ["USD"]
+
+
+@pytest.mark.asyncio
+async def test_get_rfq_eur_fx_rate_flags_non_eur_fallback(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    _, creator_headers = await _create_user_and_headers(
+        db_session,
+        role=UserRole.COMMERCIAL,
+        email_prefix="creator-fx-fallback",
+    )
+
+    async def _fallback_get_rate(currency_code, db3):
+        assert currency_code == "MXN"
+        assert db3 is not None
+        return 1.0
+
+    monkeypatch.setattr(rfq_router, "get_eur_exchange_rate", _fallback_get_rate)
+
+    response = await client.get(
+        "/api/rfq/fx/eur-rate?currency_code=mxn",
+        headers=creator_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "currency_code": "MXN",
+        "eur_rate": 1.0,
+        "fallback_used": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_rfq_data_rejects_mixed_product_currencies(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    creator, creator_headers = await _create_user_and_headers(
+        db_session,
+        role=UserRole.COMMERCIAL,
+        email_prefix="creator-mixed-currency",
+    )
+    validator, _ = await _create_user_and_headers(
+        db_session,
+        role=UserRole.ZONE_MANAGER,
+        email_prefix="validator-mixed-currency",
+    )
+    rfq = await _create_rfq(
+        db_session,
+        creator_email=creator.email,
+        validator_email=validator.email,
+        sub_status=RfqSubStatus.NEW_RFQ,
+    )
+
+    response = await client.put(
+        f"/api/rfq/{rfq.rfq_id}/data",
+        json={
+            "rfq_data": {
+                "products": [
+                    {
+                        "part_number": "PN-100",
+                        "revision_level": "A",
+                        "quantity": 1000,
+                        "target_price": 2.5,
+                        "currency": "EUR",
+                        "target_price_is_estimated": False,
+                    },
+                    {
+                        "part_number": "PN-200",
+                        "revision_level": "B",
+                        "quantity": 500,
+                        "target_price": 3.75,
+                        "currency": "USD",
+                        "target_price_is_estimated": True,
+                    },
+                ]
+            }
+        },
+        headers=creator_headers,
+    )
+
+    assert response.status_code == 400
+    assert "All product rows in one RFQ/RFI must use the same currency." in response.json()["detail"]
