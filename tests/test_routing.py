@@ -1,21 +1,18 @@
 """
 Test module for the routing (escalation) service.
 
-These are pure unit tests — no DB required.
+These are pure unit tests -- no DB required.
 """
-import pytest
-
-
 def test_calculate_pte():
     from app.services.routing import calculate_pte
 
-    # 10 EUR * 50_000 = 500_000 → 500 KEUR
+    # 10 EUR * 50_000 = 500_000 -> 500 KEUR
     assert calculate_pte(10.0, 50_000) == 500.0
 
-    # 0.5 EUR * 100 = 50 → 0.05 KEUR
+    # 0.5 EUR * 100 = 50 -> 0.05 KEUR
     assert abs(calculate_pte(0.5, 100) - 0.05) < 1e-9
 
-    # 200 EUR * 1000 = 200_000 → 200 KEUR
+    # 200 EUR * 1000 = 200_000 -> 200 KEUR
     assert calculate_pte(200.0, 1000) == 200.0
 
 
@@ -37,34 +34,48 @@ def test_escalation_constants():
     assert N0_CEO_EMAIL == "olivier.spicker@avocarbon.com"
 
 
-def test_normalize_delivery_zone_handles_legacy_aliases():
+def test_normalize_delivery_zone_handles_new_zone_variants():
     from app.services.routing import normalize_delivery_zone
 
-    assert normalize_delivery_zone("asie est") == "asie est"
-    assert normalize_delivery_zone("east asia") == "asie est"
-    assert normalize_delivery_zone("south asia") == "asie sud"
-    assert normalize_delivery_zone("Europe") == "europe"
-    assert normalize_delivery_zone("amérique") == "amerique"
+    assert normalize_delivery_zone("Europe") == "Europe"
+    assert normalize_delivery_zone("north-america") == "North America"
+    assert normalize_delivery_zone("South America") == "South America"
+    assert normalize_delivery_zone("china/south pacific") == "China / South Pacific"
+    assert normalize_delivery_zone("korea japan") == "Korea / Japan"
+    assert normalize_delivery_zone("amerique") is None
+    assert normalize_delivery_zone("asie est") is None
     assert normalize_delivery_zone("unknown-zone") is None
 
 
 def test_get_zone_manager_email_uses_canonical_zone_mapping():
     from app.services.routing import get_zone_manager_email
 
-    assert get_zone_manager_email("europe") == (
+    assert get_zone_manager_email("Europe") == (
         "franck.lagadec@avocarbon.com",
-        "europe",
+        "Europe",
     )
-    assert get_zone_manager_email("america") == (
-        "dean.hayward@avocarbon.com",
-        "amerique",
+    assert get_zone_manager_email("Africa") == (
+        "franck.lagadec@avocarbon.com",
+        "Africa",
     )
-    assert get_zone_manager_email("east asia") == (
-        "tao.ren@avocarbon.com",
-        "asie est",
-    )
-    assert get_zone_manager_email("south asia") == (
+    assert get_zone_manager_email("India") == (
         "eipe.thomas@avocarbon.com",
-        "asie sud",
+        "India",
+    )
+    assert get_zone_manager_email("North America") == (
+        "dean.hayward@avocarbon.com",
+        "North America",
+    )
+    assert get_zone_manager_email("South America") == (
+        "dean.hayward@avocarbon.com",
+        "South America",
+    )
+    assert get_zone_manager_email("China / South Pacific") == (
+        "tao.ren@avocarbon.com",
+        "China / South Pacific",
+    )
+    assert get_zone_manager_email("Korea/Japan") == (
+        "tao.ren@avocarbon.com",
+        "Korea / Japan",
     )
     assert get_zone_manager_email("antarctica") == (None, None)

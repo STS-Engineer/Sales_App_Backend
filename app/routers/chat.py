@@ -1258,8 +1258,8 @@ async def _execute_tool_calls(
                                 {
                                     "error": (
                                         f"Unknown delivery zone '{raw_delivery_zone}'. "
-                                        "delivery_zone must be one of: asie est, "
-                                        "asie sud, europe, amerique."
+                                        "delivery_zone must be one of: "
+                                        f"{', '.join(APPROVED_DELIVERY_ZONES)}."
                                     ),
                                     "to_total": to_total_float,
                                     "delivery_zone": raw_delivery_zone,
@@ -1555,11 +1555,15 @@ SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """
 CRITICAL CONVERSATION RULES:
 1. NO CHATTER: Never say 'Update saved', 'I have processed your request', or 'Got it'. Just ask the exact next missing question.
 2. NO UNSOLICITED SUMMARIES: Never print out a summary of the request fields unless the user explicitly types 'summary'.
-3. STRICT ENGLISH TRANSLATION: You must seamlessly translate all delivery zones, regions, and countries into English before saving them. You MUST adhere to the following exact mappings for delivery zones:
-   - "asie sud" MUST be saved as "South Asia"
-   - "asie est" MUST be saved as "East Asia"
-   - "amerique" MUST be saved as "America"
-   - "europe" MUST be saved as "Europe"
+3. STRICT ENGLISH TRANSLATION: You must seamlessly translate all delivery zones, regions, and countries into English before saving them. The ONLY approved canonical `delivery_zone` strings are:
+   - "Europe"
+   - "Africa"
+   - "India"
+   - "North America"
+   - "South America"
+   - "China / South Pacific"
+   - "Korea / Japan"
+   Whenever the user directly chooses a delivery zone, you MUST save one of these exact strings with matching capitalization and punctuation.
 
 STRICT ANTI-HALLUCINATION DIRECTIVE:
 Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existence of a Customer, Product, Product Line, or Contact.
@@ -1576,8 +1580,8 @@ NUMERIC EXTRACTION RULE: When extracting numerical values (like volumes, prices,
 CRITICAL DATA EXTRACTION RULE: You are strictly forbidden from calculating exchange rates or converting currencies yourself. You MUST extract the EXACT numerical value the user provides. If the user says "2000 INR", you must save `target_price = 2000` and `currency = "INR"`. Do not perform any math on the user's input price.
 CRITICAL NO-ROUNDING RULE: If a backend tool returns a converted EUR value, or if you perform any other allowed calculations, you MUST NEVER round the result. Keep at most 5 digits after the decimal point. If the exact result has more than 5 digits after the decimal point, truncate it instead of rounding. For example, if the math results in 0.19879123, save 0.19879 into the database, never round it to 0.19880 or 0.20. Do not apply any 'arrondi' or formatting.
 DIMENSION NORMALIZATION RULE: If the user provides physical dimensions or technical specifications in inches or any other non-mm unit, you MUST seamlessly convert them to millimeters (mm) before saving the data. Always store dimension data in mm.
-DELIVERY ZONE CLASSIFICATION RULE: When collecting the customer location or delivery destination, you MUST classify it into exactly one of these 4 approved `delivery_zone` strings: "asie est", "asie sud", "europe", "amerique". Never use any other spelling or region name. If the user gives a specific country, map it automatically to the correct approved zone (for example, France -> europe, Mexico -> amerique, China -> asie est, India -> asie sud). If you cannot confidently map it, ask the user to clarify before saving.
-FORM STATE SYNC RULE: On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data. Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 4 approved strings: "asie est", "asie sud", "europe", "amerique".
+DELIVERY ZONE CLASSIFICATION RULE: When collecting the customer location or delivery destination, you MUST classify it into exactly one of these 7 approved `delivery_zone` strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". Never use any other spelling or region name. If the user gives a specific country, map it automatically to the correct approved zone (for example, France -> Europe, South Africa -> Africa, India -> India, United States -> North America, Brazil -> South America, China -> China / South Pacific, Japan -> Korea / Japan). If you cannot confidently map it, ask the user to clarify before saving. If you need the user to choose a delivery zone explicitly, you MUST present only these exact 7 options and no others.
+FORM STATE SYNC RULE: On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data. Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan".
 MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, Target Price, Currency, and Price Source for each product. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
 
 STRICT FORM FIELD MAPPING:
@@ -1700,7 +1704,7 @@ MULTI-PRODUCT SUPPORT:
 - When the user says no, move on to the remaining Step 1 fields.
 - You MUST NOT jump to validator routing or ask for submission while `products` still have missing fields (target_price, currency, quantity).
 CRITICAL PRODUCT COMPLETENESS RULE: A product row is NOT complete until it has ALL of: part_number, revision_level, quantity, target_price, currency, and target_price_is_estimated. If ANY of these are missing, you MUST ask for them BEFORE moving on. NEVER skip target_price or currency.
-CRITICAL DELIVERY ZONE RULE: Whenever you save `delivery_zone`, it MUST be exactly one of these 4 approved strings: "asie est", "asie sud", "europe", "amerique". If the user gives a country or city, convert it to the approved zone before calling `updateFormFields`. If you cannot confidently map it, ask a clarification question instead of guessing.
+CRITICAL DELIVERY ZONE RULE: Whenever you save `delivery_zone`, it MUST be exactly one of these 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". If the user gives a country or city, convert it to the approved zone before calling `updateFormFields`. If you cannot confidently map it, ask a clarification question instead of guessing. If you ask the user to choose a zone, you MUST present only those exact 7 options.
 
 STEP 1 VALIDATION RULE:
 Before moving to Step 2 (Commercial Expectations), you MUST verify Step 1 completeness using the CURRENT RFQ DATABASE STATE and the dynamically injected MISSING_FIELDS_PROMPT.
@@ -1913,7 +1917,7 @@ TOOLS = [
                     "product_line_acronym": {"type": "string", "description": "The acronym of the product line (e.g., ASS, BRU)."},
                     "delivery_zone": {
                         "type": "string",
-                        "description": "The canonical delivery zone. It MUST be exactly one of: asie est, asie sud, europe, amerique."
+                        "description": "The canonical delivery zone. It MUST be exactly one of: Europe, Africa, India, North America, South America, China / South Pacific, Korea / Japan."
                     }
                 },
                 "required": ["product_line_acronym", "delivery_zone"]
@@ -2179,8 +2183,8 @@ async def handle_chat(
 7. Then use the MISSING_FIELDS_PROMPT to identify only the missing fields for the CURRENT step.
 8. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.
 9. On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data.
-10. Whenever the user provides a delivery destination, customer location, or country, you MUST normalize `delivery_zone` to exactly one of these 4 approved values before calling `updateFormFields`: `asie est`, `asie sud`, `europe`, `amerique`.
-11. If you cannot confidently map a location or country to one of those 4 approved `delivery_zone` values, ask the user to clarify instead of guessing.
+10. Whenever the user provides a delivery destination, customer location, or country, you MUST normalize `delivery_zone` to exactly one of these 7 approved values before calling `updateFormFields`: `Europe`, `Africa`, `India`, `North America`, `South America`, `China / South Pacific`, `Korea / Japan`.
+11. If you cannot confidently map a location or country to one of those 7 approved `delivery_zone` values, ask the user to clarify instead of guessing. If you need the user to choose a zone explicitly, present only those exact 7 options.
 12. If a tool response or your own reasoning gives you a canonical `delivery_zone`, you MUST immediately persist that exact canonical string with `updateFormFields`.
 13. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
 14. If the MISSING_FIELDS_PROMPT says `total_target_to`, `to_total`, `zone_manager_email`, `validator_email`, or `validator_role` are missing, you MUST generate or retrieve them yourself. You MUST NOT ask the user to manually provide them.

@@ -190,7 +190,7 @@ async def test_execute_tool_calls_returns_zone_manager_payload_with_canonical_zo
                 "name": "retrieveZoneManager",
                 "arguments": {
                     "product_line_acronym": "BRU",
-                    "delivery_zone": "America",
+                    "delivery_zone": "North America",
                 },
             }
         ],
@@ -209,9 +209,9 @@ async def test_execute_tool_calls_returns_zone_manager_payload_with_canonical_zo
     assert auto_redirect is False
     assert payload["validator_role"] == "Zone Manager"
     assert payload["zone_manager_email"] == "dean.hayward@avocarbon.com"
-    assert payload["delivery_zone"] == "amerique"
+    assert payload["delivery_zone"] == "North America"
     assert payload["to_total"] == 625.0
-    assert extracted_data["delivery_zone"] == "amerique"
+    assert extracted_data["delivery_zone"] == "North America"
     assert extracted_data["to_total"] == "625.0"
 
 
@@ -245,10 +245,13 @@ async def test_execute_tool_calls_returns_error_for_unknown_zone_manager_zone():
 
     assert "error" in payload
     assert payload["approved_delivery_zones"] == [
-        "asie est",
-        "asie sud",
-        "europe",
-        "amerique",
+        "Europe",
+        "Africa",
+        "India",
+        "North America",
+        "South America",
+        "China / South Pacific",
+        "Korea / Japan",
     ]
     assert payload["to_total"] == 500.0
     assert extracted_data["to_total"] == "500.0"
@@ -668,7 +671,7 @@ async def test_retrieve_zone_manager_uses_saved_product_line_when_tool_arg_missi
 
     assert auto_redirect is False
     assert payload["validator_role"] == "Zone Manager"
-    assert payload["delivery_zone"] == "europe"
+    assert payload["delivery_zone"] == "Europe"
     assert payload["zone_manager_email"] == "franck.lagadec@avocarbon.com"
 
 
@@ -751,9 +754,10 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "You MUST NOT rewrite `products[*].target_price`" in chat.SYSTEM_PROMPT
     assert "MUST NEVER calculate the TO Total yourself" in chat.SYSTEM_PROMPT
     assert "return the calculated `to_total` to you" in chat.SYSTEM_PROMPT
-    assert "exactly one of these 4 approved `delivery_zone` strings" in chat.SYSTEM_PROMPT
-    assert "France -> europe, Mexico -> amerique, China -> asie est, India -> asie sud" in chat.SYSTEM_PROMPT
-    assert "Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 4 approved strings" in chat.SYSTEM_PROMPT
+    assert "exactly one of these 7 approved `delivery_zone` strings" in chat.SYSTEM_PROMPT
+    assert "France -> Europe, South Africa -> Africa, India -> India, United States -> North America, Brazil -> South America, China -> China / South Pacific, Japan -> Korea / Japan" in chat.SYSTEM_PROMPT
+    assert "Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 7 approved strings" in chat.SYSTEM_PROMPT
+    assert "you MUST present only these exact 7 options and no others" in chat.SYSTEM_PROMPT
     assert "Would you like to add another part number to this request?" in chat.SYSTEM_PROMPT
     assert "NEVER ask the user how many part numbers/products there are upfront." in chat.SYSTEM_PROMPT
     assert "NEVER ask the user for the Product Line acronym." in chat.SYSTEM_PROMPT
@@ -777,4 +781,4 @@ def test_dynamic_prompt_reinforces_delivery_zone_sync_rules():
     source = inspect.getsource(chat.handle_chat)
 
     assert "frontend form stays synchronized with the latest data" in source
-    assert "approved values before calling `updateFormFields`: `asie est`, `asie sud`, `europe`, `amerique`" in source
+    assert "approved values before calling `updateFormFields`: `Europe`, `Africa`, `India`, `North America`, `South America`, `China / South Pacific`, `Korea / Japan`" in source

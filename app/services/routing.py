@@ -17,40 +17,51 @@ N1_VP_EMAIL = "eric.suszylo@avocarbon.com"
 # N (CEO - above N-1 threshold)
 N0_CEO_EMAIL = "olivier.spicker@avocarbon.com"
 
-APPROVED_DELIVERY_ZONES = ("asie est", "asie sud", "europe", "amerique")
-ZONE_MANAGER_EMAILS = {
-    "asie est": N2_ASIA_EAST_EMAIL,
-    "asie sud": N2_ASIA_SOUTH_EMAIL,
-    "europe": N2_ZONE_EMAIL,
-    "amerique": N2_AMERICAS_EMAIL,
-}
-DELIVERY_ZONE_ALIASES = {
-    "east asia": "asie est",
-    "asia east": "asie est",
-    "south asia": "asie sud",
-    "asia south": "asie sud",
-    "europe": "europe",
-    "america": "amerique",
-    "americas": "amerique",
-    "amerique": "amerique",
-}
-
 
 def _normalize_zone_token(value: str | None) -> str:
     normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
     normalized = "".join(
         char for char in normalized if not unicodedata.combining(char)
     )
-    normalized = normalized.replace("_", " ").replace("-", " ")
+    normalized = normalized.replace("_", " ").replace("-", " ").replace("/", " / ")
     return " ".join(normalized.split())
+
+
+APPROVED_DELIVERY_ZONES = (
+    "Europe",
+    "Africa",
+    "India",
+    "North America",
+    "South America",
+    "China / South Pacific",
+    "Korea / Japan",
+)
+ZONE_MANAGER_EMAILS = {
+    "Europe": N2_ZONE_EMAIL,
+    "Africa": N2_ZONE_EMAIL,
+    "India": N2_ASIA_SOUTH_EMAIL,
+    "North America": N2_AMERICAS_EMAIL,
+    "South America": N2_AMERICAS_EMAIL,
+    "China / South Pacific": N2_ASIA_EAST_EMAIL,
+    "Korea / Japan": N2_ASIA_EAST_EMAIL,
+}
+CANONICAL_DELIVERY_ZONE_BY_TOKEN = {
+    _normalize_zone_token(zone): zone for zone in APPROVED_DELIVERY_ZONES
+}
+DELIVERY_ZONE_ALIASES = {
+    "northamerica": "North America",
+    "southamerica": "South America",
+    "china south pacific": "China / South Pacific",
+    "korea japan": "Korea / Japan",
+}
 
 
 def normalize_delivery_zone(value: str | None) -> str | None:
     normalized = _normalize_zone_token(value)
     if not normalized:
         return None
-    if normalized in APPROVED_DELIVERY_ZONES:
-        return normalized
+    if normalized in CANONICAL_DELIVERY_ZONE_BY_TOKEN:
+        return CANONICAL_DELIVERY_ZONE_BY_TOKEN[normalized]
     return DELIVERY_ZONE_ALIASES.get(normalized)
 
 

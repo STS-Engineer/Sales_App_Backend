@@ -31,6 +31,7 @@ async def sync_rfq_to_assembly(rfq: Rfq) -> bool:
         "rfq_data": json.dumps(rfq.rfq_data or {}),
         "created_at": timestamp,
         "updated_at": timestamp,
+        "created_by_email": getattr(rfq, "created_by_email", None),
     }
 
     try:
@@ -38,11 +39,12 @@ async def sync_rfq_to_assembly(rfq: Rfq) -> bool:
             await conn.execute(
                 text(
                     """
-                    INSERT INTO public.rfq (rfq_id, rfq_data, created_at, updated_at)
-                    VALUES (:rfq_id, CAST(:rfq_data AS jsonb), :created_at, :updated_at)
+                    INSERT INTO public.rfq (rfq_id, rfq_data, created_at, updated_at, created_by_email)
+                    VALUES (:rfq_id, CAST(:rfq_data AS jsonb), :created_at, :updated_at, :created_by_email)
                     ON CONFLICT (rfq_id) DO UPDATE
                     SET rfq_data = EXCLUDED.rfq_data,
-                        updated_at = EXCLUDED.updated_at
+                        updated_at = EXCLUDED.updated_at,
+                        created_by_email = COALESCE(public.rfq.created_by_email, EXCLUDED.created_by_email)
                     """
                 ),
                 payload,
