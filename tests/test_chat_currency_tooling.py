@@ -348,6 +348,74 @@ def test_normalize_tool_arguments_preserves_append_products_flag():
     assert normalized["append_products"] is True
 
 
+def test_normalize_tool_arguments_preserves_false_append_products_flag():
+    normalized = chat._normalize_tool_arguments(
+        "updateFormFields",
+        {
+            "append_products": False,
+            "fields_to_update": {"products": []},
+        },
+    )
+
+    assert normalized["append_products"] is False
+
+
+def test_update_form_fields_tool_schema_exposes_append_products():
+    update_form_fields_tool = next(
+        tool["function"]
+        for tool in chat.TOOLS
+        if tool["function"]["name"] == "updateFormFields"
+    )
+    properties = update_form_fields_tool["parameters"]["properties"]
+
+    assert "append_products" in properties
+    assert properties["append_products"]["type"] == "boolean"
+    assert (
+        properties["append_products"]["description"]
+        == "Set this to true when adding additional part numbers/products to an existing list. If false, it will overwrite the entire product list."
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_form_fields_initial_product_save_without_append_creates_products():
+    extracted_data = {}
+    tool_messages, _ = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "append-products-0",
+                "name": "updateFormFields",
+                "arguments": {
+                    "fields_to_update": {
+                        "products": [
+                            {
+                                "part_number": "PN-1",
+                                "revision_level": "A",
+                                "quantity": 100,
+                                "target_price": 2.5,
+                                "currency": "EUR",
+                                "target_price_is_estimated": True,
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+        http_client=None,
+        db=_FakeDb(_build_matrix()),
+        db3=None,
+        rfq=_build_rfq(),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert payload["success"] is True
+    assert [product["part_number"] for product in extracted_data["products"]] == ["PN-1"]
+
+
 @pytest.mark.asyncio
 async def test_update_form_fields_appends_products_sequentially():
     extracted_data = {
@@ -396,6 +464,101 @@ async def test_update_form_fields_appends_products_sequentially():
     ]
     assert extracted_data["products"][1]["currency"] == "EUR"
     assert extracted_data["products"][1]["target_price_is_estimated"] is False
+
+
+@pytest.mark.asyncio
+async def test_update_form_fields_appends_products_from_persisted_rfq_state():
+    extracted_data = {}
+    rfq = _build_rfq(
+        rfq_data={
+            "products": [
+                _build_product(part_number="PN-1", quantity=100, target_price=2.5)
+            ]
+        }
+    )
+    tool_messages, _ = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "append-products-persisted",
+                "name": "updateFormFields",
+                "arguments": {
+                    "append_products": True,
+                    "fields_to_update": {
+                        "products": [
+                            {
+                                "part_number": "PN-2",
+                                "revision_level": "B",
+                                "quantity": 200,
+                                "target_price": 3.0,
+                                "currency": "EUR",
+                                "target_price_is_estimated": False,
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+        http_client=None,
+        db=_FakeDb(_build_matrix()),
+        db3=None,
+        rfq=rfq,
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert payload["success"] is True
+    assert [product["part_number"] for product in extracted_data["products"]] == [
+        "PN-1",
+        "PN-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_form_fields_without_append_overwrites_products():
+    extracted_data = {
+        "products": [
+            _build_product(part_number="PN-1", quantity=100, target_price=2.5)
+        ]
+    }
+    tool_messages, _ = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "overwrite-products-1",
+                "name": "updateFormFields",
+                "arguments": {
+                    "fields_to_update": {
+                        "products": [
+                            {
+                                "part_number": "PN-9",
+                                "revision_level": "Z",
+                                "quantity": 900,
+                                "target_price": 9.0,
+                                "currency": "EUR",
+                                "target_price_is_estimated": False,
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+        http_client=None,
+        db=_FakeDb(_build_matrix()),
+        db3=None,
+        rfq=_build_rfq(),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert payload["success"] is True
+    assert [product["part_number"] for product in extracted_data["products"]] == ["PN-9"]
 
 
 @pytest.mark.asyncio
@@ -595,6 +758,7 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "NEVER ask the user how many part numbers/products there are upfront." in chat.SYSTEM_PROMPT
     assert "NEVER ask the user for the Product Line acronym." in chat.SYSTEM_PROMPT
     assert "append_products=true" in chat.SYSTEM_PROMPT
+    assert 'When the user agrees to add a second, third, or subsequent part number, you MUST call updateFormFields with the argument "append_products": true.' in chat.SYSTEM_PROMPT
     assert "Request-level pricing metadata if still missing" not in chat.SYSTEM_PROMPT
     assert "MUST NOT jump to validator routing or ask for submission" in chat.SYSTEM_PROMPT
     assert "save both `product_name` and the authorized `product_line_acronym`" not in chat.SYSTEM_PROMPT

@@ -764,10 +764,11 @@ def _normalize_tool_arguments(func_name: str, args: dict | None) -> dict:
         )
     elif func_name == "updateFormFields":
         # ── Preserve the append_products flag before flattening ──
-        raw_append = (
-            normalized.pop("append_products", None)
-            or normalized.pop("appendProducts", None)
-        )
+        raw_append = None
+        if "append_products" in normalized:
+            raw_append = normalized.pop("append_products")
+        elif "appendProducts" in normalized:
+            raw_append = normalized.pop("appendProducts")
         fields = normalized.get("fields_to_update")
         if not isinstance(fields, dict):
             fields = {
@@ -1437,14 +1438,30 @@ async def _execute_tool_calls(
             # ── append_products: merge new product rows into existing ones ──
             should_append = args.get("append_products") is True
             if should_append and "products" in filtered_fields:
-                new_products = filtered_fields["products"]
-                existing_products = extracted_data.get("products") or []
-                if isinstance(new_products, list) and isinstance(existing_products, list) and existing_products:
+                persisted_rfq_data = _normalize_rfq_data_fields(
+                    getattr(rfq, "rfq_data", None)
+                )
+                persisted_products = (
+                    persisted_rfq_data.get("products")
+                    if isinstance(persisted_rfq_data.get("products"), list)
+                    else []
+                )
+                in_memory_products = (
+                    extracted_data.get("products")
+                    if isinstance(extracted_data.get("products"), list)
+                    else []
+                )
+                existing_products = persisted_products or in_memory_products
+                normalized_new_products = normalize_rfq_data_products(
+                    {"products": filtered_fields["products"]},
+                    products_authoritative=True,
+                ).get("products", [])
+                if isinstance(existing_products, list) and isinstance(normalized_new_products, list) and existing_products:
                     # Reject mixed currencies
                     def _product_currency(p):
                         return str(p.get("currency") or "").strip().upper()
                     existing_currencies = {_product_currency(p) for p in existing_products if _product_currency(p)}
-                    new_currencies = {_product_currency(p) for p in new_products if _product_currency(p)}
+                    new_currencies = {_product_currency(p) for p in normalized_new_products if _product_currency(p)}
                     all_currencies = existing_currencies | new_currencies
                     if len(all_currencies) > 1:
                         tool_response_text = json.dumps({
@@ -1459,7 +1476,8 @@ async def _execute_tool_calls(
                             "content": tool_response_text,
                         })
                         continue
-                    filtered_fields["products"] = existing_products + new_products
+                if isinstance(existing_products, list) and isinstance(normalized_new_products, list):
+                    filtered_fields["products"] = existing_products + normalized_new_products
 
             products_are_authoritative = "products" in filtered_fields
             for key, value in filtered_fields.items():
@@ -1677,6 +1695,7 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
 MULTI-PRODUCT SUPPORT:
 - NEVER ask the user how many part numbers/products there are upfront.
 - After each part number is saved, ask: "Would you like to add another part number to this request?"
+- CRITICAL TOOL RULE: When you collect the very first part number, save it normally. When the user agrees to add a second, third, or subsequent part number, you MUST call updateFormFields with the argument "append_products": true. If you forget this flag, you will delete the user's previous parts.
 - When the user says yes, collect the new product row and call updateFormFields with `append_products=true` so the new rows are APPENDED to existing ones instead of replacing them.
 - When the user says no, move on to the remaining Step 1 fields.
 - You MUST NOT jump to validator routing or ask for submission while `products` still have missing fields (target_price, currency, quantity).
@@ -1957,7 +1976,15 @@ TOOLS = [
                         "type": "object",
                         "description": "Key-value pairs of fields to update.",
                         "properties": UPDATE_FORM_FIELD_PROPERTIES,
-                    }
+                    },
+                    "append_products": {
+                        "type": "boolean",
+                        "description": (
+                            "Set this to true when adding additional part "
+                            "numbers/products to an existing list. If false, "
+                            "it will overwrite the entire product list."
+                        ),
+                    },
                 },
                 "required": ["fields_to_update"],
             },
