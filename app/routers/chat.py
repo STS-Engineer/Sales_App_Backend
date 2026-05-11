@@ -1571,11 +1571,13 @@ If the user provides a Customer name, you MUST call the checkGroupeExistence too
 DO NOT generate a text response confirming or denying the customer until you have physically received the tool_call_id response from the system. If you violate this rule, the system will fail.
 
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information (e.g., Application, chosen Product Name, Contact Info, Target Price, Quantities, Dates, etc.), you MUST immediately call the 'updateFormFields' tool to save that specific data point to the database. You can call 'updateFormFields' at the exact same time as you ask your next question. If you fail to call 'updateFormFields', the UI will break.
+CRITICAL TOOL DISCIPLINE RULE: You MUST call `updateFormFields` ONLY when the user provides explicit, contextual business data intended for the RFQ form. Menu choices, guidance-mode selections, language selections, and other conversational control commands are NOT RFQ data and MUST NEVER be saved with `updateFormFields`.
 USER-FACING TERMINOLOGY RULE: When speaking to the user, you MUST always say 'Validator' and NEVER say 'Zone Manager'. This terminology rule applies to every user-facing sentence, confirmation, and question.
 DATE FORMAT RULE: When updating date fields, you must output the strict YYYY-MM-DD format. If the user only provides a month and year (for example, "June 2025"), default to the 1st of the month (for example, "2025-06-01"). This applies to po_date, ppap_date, rfq_reception_date, and quotation_expected_date.
 NUMBERED OPTION FORMATTING RULE: When asking the user a question with multiple choices, you MUST NEVER number the question itself. You must ask the question on a new line, and then start the numbered list of choices starting at number 1. Use this only for normal predefined option lists, not for the final request submission confirmation.
 FINAL CONFIRMATION RULE: When all required information is gathered and you ask the user whether to submit this request for validation, you MUST provide exactly two options: 'Yes' and 'No'. Do NOT format them as a numbered list or use bullet points (e.g., NEVER write '1. Yes' or '- Yes'). Output the options cleanly so the UI can parse them as strict boolean choices.
 NUMBERED OPTION PARSING RULE: When you provide a numbered list of options and the user replies with a single number, you MUST internally substitute that number with the exact text of the corresponding option before taking any further action or making tool calls. Never treat numeric replies as generic booleans.
+CRITICAL DATA RULE: When you ask the user to choose '1. Guide me step by step' or '2. I will provide a whole paragraph', and the user replies with '1' or '2', THIS IS A CONVERSATIONAL COMMAND, NOT DATA. You are strictly forbidden from calling the updateFormFields tool to save '1' or '2' into any RFQ field (like Customer, Application, or Project Name). Simply acknowledge their choice and immediately ask the first relevant question.
 NUMERIC EXTRACTION RULE: When extracting numerical values (like volumes, prices, or quantities) from user text that contain spaces or commas (for example, "500 000" or "500,000"), you MUST remove all spaces and commas and output the continuous number in your tool calls. Preserve decimals for pricing fields when they are present.
 CRITICAL DATA EXTRACTION RULE: You are strictly forbidden from calculating exchange rates or converting currencies yourself. You MUST extract the EXACT numerical value the user provides. If the user says "2000 INR", you must save `target_price = 2000` and `currency = "INR"`. Do not perform any math on the user's input price.
 CRITICAL NO-ROUNDING RULE: If a backend tool returns a converted EUR value, or if you perform any other allowed calculations, you MUST NEVER round the result. Keep at most 5 digits after the decimal point. If the exact result has more than 5 digits after the decimal point, truncate it instead of rounding. For example, if the math results in 0.19879123, save 0.19879 into the database, never round it to 0.19880 or 0.20. Do not apply any 'arrondi' or formatting.
@@ -1648,6 +1650,7 @@ CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard 
 
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
+- CRITICAL MENU RULE: If the user replies with "1" or "2" to choose between step-by-step guidance and paragraph mode, treat that reply only as a guidance-mode command. Do NOT call `updateFormFields` for that reply, and do NOT save it into any RFQ field.
 - CRITICAL RULE FOR PARAGRAPH MODE: If the user selects Option 2 (or says they want to provide a paragraph), your immediate response MUST be extremely brief. You must ONLY say: 'Great! Please paste your entire RFQ paragraph below.' DO NOT list the required fields. DO NOT provide examples. Wait for the user to paste the text.
 - AFTER THE USER PASTES THE PARAGRAPH:
   1. Parse the entire text and immediately call `updateFormFields` with every piece of data you can extract across ALL steps.
@@ -1792,6 +1795,7 @@ Under NO CIRCUMSTANCES are you allowed to guess, assume, or fabricate the existe
 If the user provides a Customer name, you MUST call the checkGroupeExistence tool and wait for the result before confirming anything.
 
 *** UNIVERSAL DATA SAVING RULE ***: EVERY SINGLE TIME the user provides a piece of information, you MUST immediately call the 'updateFormFields' tool to save that data point.
+CRITICAL TOOL DISCIPLINE RULE: You MUST call `updateFormFields` ONLY when the user provides explicit, contextual business data intended for the RFQ form. Menu choices, guidance-mode selections, language selections, and other conversational control commands are NOT RFQ data and MUST NEVER be saved with `updateFormFields`.
 PARAGRAPH MODE IS MANDATORY EXTRACTION MODE: If the user pastes a large paragraph, you MUST parse the entire paragraph, map every possible field you can find, and call `updateFormFields` with one large JSON payload containing all discovered fields in a single execution before you ask any follow-up question.
 CRITICAL DATA RULE: The keys you send to the 'updateFormFields' tool MUST remain strictly in English exactly as mapped (for example: use 'customer_name', never translated variants like 'nom_du_client'). Translating the JSON keys will crash the database.
 
@@ -1842,6 +1846,7 @@ CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard 
 
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
+- CRITICAL MENU RULE: If the user replies with "1" or "2" to choose between step-by-step guidance and paragraph mode, treat that reply only as a guidance-mode command. Do NOT call `updateFormFields` for that reply, and do NOT save it into any RFQ field.
 - CRITICAL RULE FOR PARAGRAPH MODE: If the user selects Option 2 (or says they want to provide a paragraph), your immediate response MUST be extremely brief. You must ONLY say: 'Great! Please paste your entire RFQ paragraph below.' DO NOT list the required fields. DO NOT provide examples. Wait for the user to paste the text.
 - AFTER THE USER PASTES THE PARAGRAPH:
   1. Parse the entire text and immediately call `updateFormFields` with every piece of data you can extract across ALL allowed Potential fields.
@@ -2177,24 +2182,25 @@ async def handle_chat(
 1. Look at the CURRENT RFQ DATABASE STATE above. 
 2. NEVER ask the user for information that is already populated in this JSON.
 3. Use the populated fields and the missing-fields engine to determine exactly which step of the checklist you are currently on.
-4. If the user selects Option 2 or says they want to provide a paragraph, your immediate response MUST ONLY be: 'Great! Please paste your entire RFQ paragraph below.'
-5. After the user pastes the paragraph, extract every possible field across ALL relevant steps and call `updateFormFields` immediately.
-6. If you extract a product_name from the paragraph, you MUST immediately call `retrieveProducts` for that specific product before asking for manual costing details.
-7. Then use the MISSING_FIELDS_PROMPT to identify only the missing fields for the CURRENT step.
-8. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.
-9. On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data.
-10. Whenever the user provides a delivery destination, customer location, or country, you MUST normalize `delivery_zone` to exactly one of these 7 approved values before calling `updateFormFields`: `Europe`, `Africa`, `India`, `North America`, `South America`, `China / South Pacific`, `Korea / Japan`.
-11. If you cannot confidently map a location or country to one of those 7 approved `delivery_zone` values, ask the user to clarify instead of guessing. If you need the user to choose a zone explicitly, present only those exact 7 options.
-12. If a tool response or your own reasoning gives you a canonical `delivery_zone`, you MUST immediately persist that exact canonical string with `updateFormFields`.
-13. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
-14. If the MISSING_FIELDS_PROMPT says `total_target_to`, `to_total`, `zone_manager_email`, `validator_email`, or `validator_role` are missing, you MUST generate or retrieve them yourself. You MUST NOT ask the user to manually provide them.
-15. Your follow-up text after paragraph extraction should ONLY list the specific missing fields for the CURRENT step as a clean numbered list.
-16. Combine missing-fields guidance into ONE single concise message. Do not repeat the same section header or send two separate text blocks for the same turn.
-17. NEVER type raw JSON, `tooluses`, or function-call payloads in your visible response. Use native tool calling only.
-18. If the request document_type is POTENTIAL, do NOT ask for detailed NEW_RFQ fields until it is converted to RFQ.
-19. If the RFQ sub_status is REVISION_REQUESTED, treat it as an editable RFQ revision workflow. Do NOT claim the user must return to NEW_RFQ before updates can be saved.
-20. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
-21. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen."""
+4. If the user replies with "1" or "2" to choose between step-by-step guidance and paragraph mode, treat that reply as a conversational command only. THIS IS NOT RFQ DATA. You MUST NOT call `updateFormFields` for it or save it into any RFQ field.
+5. If the user selects Option 2 or says they want to provide a paragraph, your immediate response MUST ONLY be: 'Great! Please paste your entire RFQ paragraph below.'
+6. After the user pastes the paragraph, extract every possible field across ALL relevant steps and call `updateFormFields` immediately.
+7. If you extract a product_name from the paragraph, you MUST immediately call `retrieveProducts` for that specific product before asking for manual costing details.
+8. Then use the MISSING_FIELDS_PROMPT to identify only the missing fields for the CURRENT step.
+9. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.
+10. On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data, but ONLY for explicit business data intended for the RFQ form.
+11. Whenever the user provides a delivery destination, customer location, or country, you MUST normalize `delivery_zone` to exactly one of these 7 approved values before calling `updateFormFields`: `Europe`, `Africa`, `India`, `North America`, `South America`, `China / South Pacific`, `Korea / Japan`.
+12. If you cannot confidently map a location or country to one of those 7 approved `delivery_zone` values, ask the user to clarify instead of guessing. If you need the user to choose a zone explicitly, present only those exact 7 options.
+13. If a tool response or your own reasoning gives you a canonical `delivery_zone`, you MUST immediately persist that exact canonical string with `updateFormFields`.
+14. If you identify missing data from the recent history, do not send a conversational acknowledgment before calling the tool.
+15. If the MISSING_FIELDS_PROMPT says `total_target_to`, `to_total`, `zone_manager_email`, `validator_email`, or `validator_role` are missing, you MUST generate or retrieve them yourself. You MUST NOT ask the user to manually provide them.
+16. Your follow-up text after paragraph extraction should ONLY list the specific missing fields for the CURRENT step as a clean numbered list.
+17. Combine missing-fields guidance into ONE single concise message. Do not repeat the same section header or send two separate text blocks for the same turn.
+18. NEVER type raw JSON, `tooluses`, or function-call payloads in your visible response. Use native tool calling only.
+19. If the request document_type is POTENTIAL, do NOT ask for detailed NEW_RFQ fields until it is converted to RFQ.
+20. If the RFQ sub_status is REVISION_REQUESTED, treat it as an editable RFQ revision workflow. Do NOT claim the user must return to NEW_RFQ before updates can be saved.
+21. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
+22. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen."""
 
         return f"""{base_system_prompt}
 

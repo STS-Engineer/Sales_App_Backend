@@ -749,6 +749,10 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "strict boolean choices" in chat.SYSTEM_PROMPT
     assert "target_price_is_estimated" in chat.SYSTEM_PROMPT
     assert "MUST call `get_eur_exchange_rate`" in chat.SYSTEM_PROMPT
+    assert "THIS IS A CONVERSATIONAL COMMAND, NOT DATA" in chat.SYSTEM_PROMPT
+    assert "strictly forbidden from calling the updateFormFields tool to save '1' or '2' into any RFQ field" in chat.SYSTEM_PROMPT
+    assert "ONLY when the user provides explicit, contextual business data intended for the RFQ form" in chat.SYSTEM_PROMPT
+    assert "Menu choices, guidance-mode selections, language selections, and other conversational control commands are NOT RFQ data" in chat.SYSTEM_PROMPT
     assert "truncate it instead of rounding" in chat.SYSTEM_PROMPT
     assert "Ask the user to restate the Target Price directly in EUR" in chat.SYSTEM_PROMPT
     assert "You MUST NOT rewrite `products[*].target_price`" in chat.SYSTEM_PROMPT
@@ -782,3 +786,5 @@ def test_dynamic_prompt_reinforces_delivery_zone_sync_rules():
 
     assert "frontend form stays synchronized with the latest data" in source
     assert "approved values before calling `updateFormFields`: `Europe`, `Africa`, `India`, `North America`, `South America`, `China / South Pacific`, `Korea / Japan`" in source
+    assert 'If the user replies with "1" or "2" to choose between step-by-step guidance and paragraph mode, treat that reply as a conversational command only.' in source
+    assert "You MUST NOT call `updateFormFields` for it or save it into any RFQ field." in source
