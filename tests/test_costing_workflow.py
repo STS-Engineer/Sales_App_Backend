@@ -1,3 +1,4 @@
+import datetime
 import uuid
 
 import pytest
@@ -37,6 +38,13 @@ def _headers_for(user: User) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {create_access_token(user.email, user.role.value)}"
     }
+
+
+def _assert_timezone_aware_iso_timestamp(value: str) -> datetime.datetime:
+    assert value
+    parsed = datetime.datetime.fromisoformat(value)
+    assert parsed.tzinfo is not None
+    return parsed
 
 
 async def _create_rfq(
@@ -1163,6 +1171,8 @@ async def test_pricing_validation_approval_keeps_rfq_offer_handoff(
     assert payload["phase"] == "OFFER"
     assert payload["sub_status"] == "PREPARATION"
     assert payload["costing_file_state"]["workflow_state"] == "APPROVED"
+    assert payload["costing_file_state"]["validation_by"] == plm_user.email
+    _assert_timezone_aware_iso_timestamp(payload["costing_file_state"]["validation_at"])
     assert email_calls == [
         (
             creator.email,
@@ -1237,12 +1247,107 @@ async def test_pricing_validation_approval_closes_rfi_and_emails_requester(
     assert payload["phase"] == "CLOSED"
     assert payload["sub_status"] == "RFI_COMPLETED"
     assert payload["costing_file_state"]["workflow_state"] == "APPROVED"
+    assert payload["costing_file_state"]["validation_by"] == plm_user.email
+    _assert_timezone_aware_iso_timestamp(payload["costing_file_state"]["validation_at"])
     assert email_calls == [
         (
             creator.email,
             str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
             f"http://localhost:5173/rfqs/new?id={rfq.rfq_id}",
             "https://example.com/rfi-costing.xlsx",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pricing_validation_rejection_records_timestamp_and_validator(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="pricing-reject-rfq-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Pricing Reject RFQ Creator",
+    )
+    costing_user = await _create_user(
+        db_session,
+        prefix="pricing-reject-rfq-costing",
+        role=UserRole.COSTING_TEAM,
+        full_name="Pricing Reject RFQ Costing",
+    )
+    plm_user = await _create_user(
+        db_session,
+        prefix="pricing-reject-rfq-plm",
+        role=UserRole.PLM,
+        full_name="Pricing Reject RFQ PLM",
+    )
+    _assign_matrix_contacts(
+        monkeypatch,
+        costing_email=costing_user.email,
+        plm_email=plm_user.email
+    )
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.PRICING,
+        costing_file_state={
+            "file_status": "UPLOADED",
+            "workflow_state": "PRICING_UPLOADED",
+        },
+    )
+    rfq.costing_files = [
+        {
+            "id": f"{rfq.rfq_id}-final-price",
+            "filename": "rejected-final-price.xlsx",
+            "url": "https://example.com/rejected-final-price.xlsx",
+            "file_role": "PRICING_FINAL_PRICE",
+            "phase": "PRICING",
+        }
+    ]
+    await db_session.commit()
+
+    email_calls: list[tuple[str, str, str, str, str]] = []
+    monkeypatch.setattr(
+        rfq_router.emails,
+        "send_costing_rejected_email",
+        lambda costing_agent_email, requester_email, systematic_rfq_id, rfq_link, reason: (
+            email_calls.append(
+                (
+                    costing_agent_email,
+                    requester_email,
+                    systematic_rfq_id,
+                    rfq_link,
+                    reason,
+                )
+            )
+            or True
+        ),
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/costing_validation",
+        json={"is_approved": False, "rejection_reason": "Need margin update"},
+        headers=_headers_for(plm_user),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["phase"] == "COSTING"
+    assert payload["sub_status"] == "PRICING"
+    assert payload["costing_file_state"]["workflow_state"] == "REJECTED"
+    assert payload["costing_file_state"]["validation_by"] == plm_user.email
+    _assert_timezone_aware_iso_timestamp(payload["costing_file_state"]["validation_at"])
+    assert payload["costing_file_state"]["rejection_reason"] == "Need margin update"
+    assert email_calls == [
+        (
+            costing_user.email,
+            creator.email,
+            str((rfq.rfq_data or {}).get("systematic_rfq_id") or ""),
+            f"http://localhost:5173/rfqs/new?id={rfq.rfq_id}",
+            "Need margin update",
         )
     ]
 

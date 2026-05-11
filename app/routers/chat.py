@@ -695,6 +695,17 @@ def _strip_fenced_payload(content: str) -> str:
     return text
 
 
+def _try_load_exact_json_payload(content: str):
+    text = _strip_fenced_payload(content)
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
 def _try_load_json_payload(content: str):
     text = _strip_fenced_payload(content)
     if not text:
@@ -712,10 +723,9 @@ def _try_load_json_payload(content: str):
         candidates.append(text[first_bracket : last_bracket + 1])
 
     for candidate in candidates:
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
+        parsed_payload = _try_load_exact_json_payload(candidate)
+        if parsed_payload is not None:
+            return parsed_payload
     return None
 
 
@@ -896,6 +906,10 @@ def _extract_tool_calls_from_text(
 
 def _payload_contains_internal_tool_markers(payload) -> bool:
     marker_keys = {
+        "fieldstoupdate",
+        "fields_to_update",
+        "appendproducts",
+        "append_products",
         "tooluses",
         "tool_uses",
         "tool_calls",
@@ -931,14 +945,101 @@ def _is_internal_tool_payload_text(content: str) -> bool:
     if not text:
         return False
 
-    lowered = text.lstrip().casefold()
-    if lowered.startswith('{"tooluses":') or lowered.startswith('{"tool_uses":'):
-        return True
-
-    parsed_payload = _try_load_json_payload(text)
+    parsed_payload = _try_load_exact_json_payload(text)
     if parsed_payload is None:
         return False
-    return _payload_contains_internal_tool_markers(parsed_payload)
+    return isinstance(parsed_payload, (dict, list))
+
+
+def _strip_fenced_json_blocks(content: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        payload = _try_load_exact_json_payload(match.group(1))
+        if isinstance(payload, (dict, list)):
+            return ""
+        return match.group(0)
+
+    return re.sub(r"```(?:json)?\s*([\s\S]*?)```", _replace, content, flags=re.IGNORECASE)
+
+
+def _find_json_block_end(content: str, start_index: int) -> int | None:
+    opening = content[start_index]
+    closing = "}" if opening == "{" else "]"
+    stack = [closing]
+    in_string = False
+    escape_next = False
+
+    for index in range(start_index + 1, len(content)):
+        char = content[index]
+        if in_string:
+            if escape_next:
+                escape_next = False
+            elif char == "\\":
+                escape_next = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            stack.append("}")
+            continue
+        if char == "[":
+            stack.append("]")
+            continue
+        if char in {"}", "]"}:
+            if not stack or char != stack[-1]:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+
+    return None
+
+
+def _strip_standalone_json_blocks(content: str) -> str:
+    text = content
+    ranges_to_remove: list[tuple[int, int]] = []
+    index = 0
+
+    while index < len(text):
+        if text[index] not in "{[":
+            index += 1
+            continue
+
+        end_index = _find_json_block_end(text, index)
+        if end_index is None:
+            index += 1
+            continue
+
+        payload = _try_load_exact_json_payload(text[index:end_index])
+        if not isinstance(payload, (dict, list)):
+            index += 1
+            continue
+
+        line_start = text.rfind("\n", 0, index) + 1
+        line_end = text.find("\n", end_index)
+        if line_end == -1:
+            line_end = len(text)
+
+        if text[line_start:index].strip() or text[end_index:line_end].strip():
+            index += 1
+            continue
+
+        ranges_to_remove.append((line_start, line_end))
+        index = line_end + 1
+
+    if not ranges_to_remove:
+        return text
+
+    cleaned_parts: list[str] = []
+    cursor = 0
+    for start_index, end_index in ranges_to_remove:
+        cleaned_parts.append(text[cursor:start_index])
+        cursor = end_index
+    cleaned_parts.append(text[cursor:])
+    return "".join(cleaned_parts)
 
 
 def _dedupe_adjacent_blocks(text: str) -> str:
@@ -962,6 +1063,12 @@ def _sanitize_assistant_text(content: str) -> str:
     text = str(content or "").strip()
     if not text:
         return ""
+
+    text = _strip_fenced_json_blocks(text).strip()
+    if _is_internal_tool_payload_text(text):
+        return ""
+
+    text = _strip_standalone_json_blocks(text).strip()
     if _is_internal_tool_payload_text(text):
         return ""
     return _dedupe_adjacent_blocks(text)
@@ -1023,12 +1130,11 @@ def _sanitize_chat_history(history: list[dict] | None) -> list[dict]:
         ):
             continue
 
-        if (
-            next_message.get("role") == "assistant"
-            and isinstance(content, str)
-            and _is_internal_tool_payload_text(content)
-        ):
-            continue
+        if next_message.get("role") == "assistant" and isinstance(content, str):
+            sanitized_content = _sanitize_assistant_text(content)
+            if not sanitized_content:
+                continue
+            next_message["content"] = sanitized_content
 
         tool_calls = next_message.get("tool_calls")
         if next_message.get("role") == "assistant" and tool_calls:
@@ -1665,6 +1771,7 @@ If an RFQ is rejected during the RFQ or COSTING phases, the terminal outcome MUS
 You are a rigorous, highly-structured B2B request assistant. Your primary goal is to guide the user through the active RFQ/RFI data collection process smoothly, in a strict order, utilizing the provided exact tools to extract and validate information into the database. Use the DOCUMENT_TYPE_CONTEXT section to decide whether visible wording should say RFQ or RFI.
 
 You are a state-aware assistant. Your progress is determined by the 'CURRENT RFQ DATABASE STATE'. If a field is filled in the state, consider that step 100% complete and move to the next logical question in your strict sequence.
+CRITICAL TOOL RULE: You must NEVER output raw JSON, tool call arguments, or data payloads in your conversational text responses. Tool calls must be made silently in the background. Your text responses to the user must be clean, natural language only.
 CRITICAL WORKFLOW RULES:
 1. Before asking anything, inspect BOTH the CURRENT RFQ DATABASE STATE and the injected MISSING_FIELDS_PROMPT.
 2. NEVER ask again for any field that is already populated in the CURRENT RFQ DATABASE STATE. This is especially critical after a Potential opportunity is promoted to formal RFQ because shared fields may already be prefilled.
@@ -1784,8 +1891,8 @@ CRITICAL STEP 4 RULES:
 6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `products`, `total_target_to`, `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
 7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the request for validation, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
 8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-9. CRITICAL SUBMISSION RULE: When you ask the user whether to submit this request for validation, you are waiting for a boolean confirmation. If the user replies "Yes" (or types the corresponding number, e.g., "1"), your IMMEDIATE AND ONLY action must be to execute the submitValidation tool. Do NOT generate another summary. Do NOT ask them to confirm a second time. Call the tool immediately.
-10. After `submitValidation` succeeds, clearly tell the user that the request was submitted and the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
+9. CRITICAL SUBMISSION RULE: When you ask "Do you want to submit this RFQ for validation? Yes/No", you MUST accept "Yes", "1", "y", "sure", or "ok" as an affirmative response. If the user replies with ANY of these, you MUST IMMEDIATELY trigger the submission tool/function. Treat "2", "No", or "n" as a negative response. You are strictly forbidden from asking for confirmation a second time. Acknowledge the submission and confirm it is PENDING_FOR_VALIDATION.
+10. After `submitValidation` succeeds, acknowledge exactly once that the RFQ or RFI was submitted, confirm that it is now `PENDING_FOR_VALIDATION`, and clearly tell the user that the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT. Do NOT ask for confirmation again.
 """
 
 POTENTIAL_SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """

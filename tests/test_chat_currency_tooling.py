@@ -48,6 +48,57 @@ def test_normalize_tool_arguments_maps_retrieve_zone_manager_delivery_zone_alias
     assert "to_total" not in normalized
 
 
+def test_sanitize_assistant_text_drops_raw_json_payload_variants():
+    assert (
+        chat._sanitize_assistant_text(
+            '{"fields_to_update": {"customer_name": "Nidec"}}'
+        )
+        == ""
+    )
+    assert (
+        chat._sanitize_assistant_text(
+            '{"fieldstoupdate": {"customer_name": "Nidec"}}'
+        )
+        == ""
+    )
+    assert chat._sanitize_assistant_text('["draft", "payload"]') == ""
+
+
+def test_sanitize_assistant_text_removes_json_blocks_and_preserves_prose():
+    content = (
+        "I saved the latest details.\n\n"
+        "```json\n"
+        '{"fields_to_update": {"customer_name": "Nidec"}}\n'
+        "```\n\n"
+        "Please continue with the next missing fields."
+    )
+
+    assert chat._sanitize_assistant_text(content) == (
+        "I saved the latest details.\n\n"
+        "Please continue with the next missing fields."
+    )
+
+
+def test_sanitize_chat_history_reuses_assistant_sanitizer_for_persisted_messages():
+    history = [
+        {
+            "role": "assistant",
+            "content": (
+                "Saved.\n\n"
+                '{"fields_to_update": {"customer_name": "Nidec"}}\n\n'
+                "Please continue."
+            ),
+        }
+    ]
+
+    assert chat._sanitize_chat_history(history) == [
+        {
+            "role": "assistant",
+            "content": "Saved.\n\nPlease continue.",
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_execute_tool_calls_returns_fx_payload(monkeypatch):
     fx_db = object()

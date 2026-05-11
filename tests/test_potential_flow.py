@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.potential import Potential
+from app.models.rfq import Rfq, RfqSubStatus
 from app.models.user import User, UserRole
 from app.routers import chat as formal_chat
 from app.routers import chat_potential
@@ -428,6 +429,190 @@ async def test_proceed_to_formal_rfq_syncs_fields_locks_potential_and_enables_fo
     )
     assert formal_chat_response.status_code == 200
     assert formal_chat_response.json()["response"] == "Formal RFQ chat is active."
+
+
+@pytest.mark.asyncio
+async def test_formal_chat_filters_raw_json_only_responses(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    headers = await _create_headers(db_session)
+    create_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "rfq"},
+        headers=headers,
+    )
+    rfq_id = create_response.json()["rfq_id"]
+    captured_system_prompts: list[str] = []
+
+    async def _fake_create(*args, **kwargs):
+        captured_system_prompts.append(kwargs["messages"][0]["content"])
+        return _build_completion(
+            content='{"fields_to_update": {"customer_name": "Nidec"}}'
+        )
+
+    monkeypatch.setattr(formal_chat.client.chat.completions, "create", _fake_create)
+
+    chat_response = await client.post(
+        "/api/chat",
+        json={"rfq_id": rfq_id, "message": "Customer is Nidec", "chat_mode": "rfq"},
+        headers=headers,
+    )
+
+    assert chat_response.status_code == 200
+    payload = chat_response.json()
+    assert payload["response"].startswith("**Update saved.**")
+    assert "fields_to_update" not in payload["response"]
+    assert captured_system_prompts
+    assert (
+        "CRITICAL TOOL RULE: You must NEVER output raw JSON, tool call arguments, "
+        "or data payloads in your conversational text responses."
+        in captured_system_prompts[0]
+    )
+
+    rfq = await db_session.get(Rfq, rfq_id)
+    await db_session.refresh(rfq)
+    assistant_messages = [
+        message
+        for message in (rfq.chat_history or [])
+        if message.get("role") == "assistant" and message.get("content")
+    ]
+    assert assistant_messages[-1]["content"].startswith("**Update saved.**")
+    assert all(
+        "fields_to_update" not in str(message.get("content"))
+        for message in assistant_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_formal_chat_yes_reply_submits_without_second_confirmation(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    headers = await _create_headers(db_session)
+    create_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "rfq"},
+        headers=headers,
+    )
+    rfq_id = create_response.json()["rfq_id"]
+
+    rfq = await db_session.get(Rfq, rfq_id)
+    rfq.product_line_acronym = "BRU"
+    rfq.zone_manager_email = "validator@example.com"
+    rfq.rfq_data = {
+        "customer_name": "Nidec",
+        "application": "Traction motor",
+        "product_name": "Brush Holder",
+        "product_line_acronym": "BRU",
+        "project_name": "Project Alpha",
+        "rfq_files": [{"name": "drawing.pdf"}],
+        "products": [
+            {
+                "part_number": "PN-001",
+                "revision_level": "A",
+                "quantity": 500000,
+                "target_price": 1.25,
+                "currency": "EUR",
+                "target_price_is_estimated": True,
+            }
+        ],
+        "delivery_zone": "Europe",
+        "delivery_plant": "Plant A",
+        "country": "France",
+        "po_date": "2026-04-20",
+        "ppap_date": "2026-05-20",
+        "sop_year": "2027",
+        "rfq_reception_date": "2026-04-10",
+        "quotation_expected_date": "2026-04-30",
+        "contact_email": "buyer@example.com",
+        "contact_name": "Jane Doe",
+        "contact_role": "Buyer",
+        "contact_phone": "+33 1 23 45 67 89",
+        "expected_delivery_conditions": "DAP",
+        "expected_payment_terms": "60 days",
+        "type_of_packaging": "returnable plastic tray",
+        "business_trigger": "Cost reduction",
+        "customer_tooling_conditions": "Customer owned",
+        "entry_barriers": "Qualification lead time",
+        "responsibility_design": "Design team",
+        "responsibility_validation": "Validation team",
+        "product_ownership": "Avocarbon",
+        "pays_for_development": "Customer",
+        "capacity_available": "Yes",
+        "scope": "In scope",
+        "strategic_note": "Aligned with strategy",
+        "final_recommendation": "Proceed",
+        "total_target_to": "625.0",
+        "to_total": "625.0",
+        "to_total_local": "625.0",
+        "zone_manager_email": "validator@example.com",
+        "validator_role": "Zone Manager",
+    }
+    await db_session.commit()
+
+    captured_system_prompts: list[str] = []
+    queued = iter(
+        [
+            _build_completion(
+                tool_calls=[
+                    _build_tool_call("submitValidation", {}, "submit-call-1")
+                ]
+            ),
+            _build_completion(
+                content=(
+                    "Your RFQ was submitted and is now PENDING_FOR_VALIDATION. "
+                    "The validation workflow has started."
+                )
+            ),
+        ]
+    )
+
+    async def _fake_create(*args, **kwargs):
+        captured_system_prompts.append(kwargs["messages"][0]["content"])
+        return next(queued)
+
+    async def _fake_submit_internal(*, rfq, db, current_user, send_email):
+        rfq.sub_status = RfqSubStatus.PENDING_FOR_VALIDATION
+        rfq.zone_manager_email = "validator@example.com"
+        await db.flush()
+        return {
+            "message": "RFQ submitted for validation.",
+            "email_sent": send_email,
+        }
+
+    monkeypatch.setattr(formal_chat.client.chat.completions, "create", _fake_create)
+    monkeypatch.setattr(
+        formal_chat,
+        "_submit_rfq_for_validation_internal",
+        _fake_submit_internal,
+    )
+
+    chat_response = await client.post(
+        "/api/chat",
+        json={"rfq_id": rfq_id, "message": "Yes", "chat_mode": "rfq"},
+        headers=headers,
+    )
+
+    assert chat_response.status_code == 200
+    payload = chat_response.json()
+    assert payload["response"] == (
+        "Your RFQ was submitted and is now PENDING_FOR_VALIDATION. "
+        "The validation workflow has started."
+    )
+    assert payload["tool_calls_used"] == ["submitValidation"]
+    assert "Do you want to submit" not in payload["response"]
+    assert captured_system_prompts
+    assert (
+        'CRITICAL SUBMISSION RULE: When you ask "Do you want to submit this RFQ '
+        'for validation?" and the user replies "Yes"'
+        in captured_system_prompts[0]
+    )
+
+    await db_session.refresh(rfq)
+    assert rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION
 
 
 @pytest.mark.asyncio
