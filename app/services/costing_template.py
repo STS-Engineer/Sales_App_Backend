@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from app.models.rfq import Rfq
+from app.schemas.rfq import normalize_rfq_data_products
 
 FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
     (
-        "Customer and product",
+        "Customer details",
         [
             ("Customer", ("customer_name", "customer", "client")),
             ("Application", ("application",)),
@@ -24,12 +25,10 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
             ("Product line", ("product_line_acronym", "productLine")),
             ("Project name", ("project_name", "projectName")),
             ("Costing data", ("costing_data", "costingData")),
-            ("Customer PN", ("customer_pn", "customerPn")),
-            ("Revision level", ("revision_level", "revisionLevel")),
         ],
     ),
     (
-        "Logistics and planning",
+        "Logistics details",
         [
             ("Delivery zone", ("delivery_zone", "deliveryZone")),
             ("Plant", ("delivery_plant", "plant")),
@@ -37,7 +36,6 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
             ("PO date", ("po_date", "poDate")),
             ("PPAP date", ("ppap_date", "ppapDate")),
             ("SOP year", ("sop_year", "sop")),
-            ("Quantity per year", ("annual_volume", "qty_per_year", "qtyPerYear")),
             ("RFQ reception date", ("rfq_reception_date", "rfqReceptionDate")),
             ("Expected quotation date", ("quotation_expected_date", "expectedQuotationDate")),
         ],
@@ -54,7 +52,6 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
     (
         "Commercial expectations",
         [
-            ("Target price", ("target_price_eur", "targetPrice")),
             (
                 "Expected delivery conditions",
                 ("expected_delivery_conditions", "expectedDeliveryConditions"),
@@ -70,7 +67,7 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
         ],
     ),
     (
-        "Commercial Questions",
+        "Commercial questions",
         [
             (
                 "Design responsible",
@@ -102,11 +99,11 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
         ],
     ),
     (
-        "Validation routing",
+        "RFQ validation and submission",
         [
-            ("TO total", ("to_total", "toTotal")),
+            ("Total Turnover", ("to_total", "toTotal")),
             (
-                "Validator email",
+                "Validator Email",
                 ("zone_manager_email", "validator_email", "validatorEmail"),
             ),
         ],
@@ -146,6 +143,15 @@ _BROWSER_CANDIDATE_PATHS = (
 
 
 
+def _build_costing_template_data(rfq: Rfq) -> dict[str, Any]:
+    data = dict(normalize_rfq_data_products(rfq.rfq_data) or {})
+    if rfq.zone_manager_email and not _has_meaningful_value(data.get("zone_manager_email")):
+        data["zone_manager_email"] = rfq.zone_manager_email
+    if rfq.product_line_acronym and not _has_meaningful_value(data.get("product_line_acronym")):
+        data["product_line_acronym"] = rfq.product_line_acronym
+    return data
+
+
 def build_costing_template_filename(rfq: Rfq) -> str:
     data = dict(rfq.rfq_data or {})
     base_name = _stringify_value(data.get("systematic_rfq_id") or rfq.rfq_id)
@@ -157,12 +163,7 @@ def render_costing_template_pdf(rfq: Rfq) -> bytes:
     return _render_reportlab_pdf(rfq)
 
 def render_costing_template_html(rfq: Rfq) -> str:
-    data = dict(rfq.rfq_data or {})
-    if rfq.zone_manager_email and not _has_meaningful_value(data.get("zone_manager_email")):
-        data["zone_manager_email"] = rfq.zone_manager_email
-    if rfq.product_line_acronym and not _has_meaningful_value(data.get("product_line_acronym")):
-        data["product_line_acronym"] = rfq.product_line_acronym
-
+    data = _build_costing_template_data(rfq)
     systematic_rfq_id = _stringify_value(data.get("systematic_rfq_id") or "Pending assignment")
     approved_by = _stringify_value(data.get("zone_manager_email")) or None
     approval_date = _stringify_value(rfq.approved_at) or None
@@ -171,14 +172,12 @@ def render_costing_template_html(rfq: Rfq) -> str:
     customer = _pick_first_value(data, ("customer_name", "customer", "client"))
     phase = _stringify_value(getattr(rfq.phase, "value", getattr(rfq, "phase", None))) or None
     sub_status = _stringify_value(getattr(rfq.sub_status, "value", getattr(rfq, "sub_status", None))) or None
+    product_rows = _build_product_reference_rows(data)
 
     meta_cards = [
         ("RFQ ID", systematic_rfq_id),
         ("Created by", rfq.created_by_email),
         ("Approved by", approved_by),
-        ("Approved at", approval_date),
-        ("Customer", customer if customer != "-" else None),
-        ("Product line", product_line if product_line != "-" else None),
     ]
 
     meta_cards_html = "".join(
@@ -190,7 +189,7 @@ def render_costing_template_html(rfq: Rfq) -> str:
     badge_sub = f'<span class="pill">Sub-status\u00a0: {escape(sub_status or "—")}</span>' if sub_status else ""
 
     sections_html = "".join(
-        _render_field_group(title, fields, data, index)
+        _render_field_group(title, fields, data, index, product_rows=product_rows)
         for index, (title, fields) in enumerate(FIELD_GROUPS)
     )
 
@@ -250,7 +249,7 @@ def render_costing_template_html(rfq: Rfq) -> str:
       display: inline-block;
       background: rgba(255, 255, 255, 0.97);
       border-radius: 12pt;
-      padding: 9pt 12pt;
+      padding: 9pt 8pt;
       margin-bottom: 12pt;
     }}
     .logo-wrap img {{
@@ -413,6 +412,12 @@ def render_costing_template_html(rfq: Rfq) -> str:
     .section-body {{
       padding: 4pt 14pt 12pt 14pt;
     }}
+    .section-copy {{
+      margin: 2pt 0 10pt 0;
+      font-size: 9pt;
+      line-height: 1.6;
+      color: #607588;
+    }}
     table.fields {{
       border-collapse: collapse;
       width: 100%;
@@ -450,6 +455,45 @@ def render_costing_template_html(rfq: Rfq) -> str:
       color: #b8c9d6;
       font-style: italic;
       word-break: break-word;
+    }}
+    table.reference-table {{
+      width: 100%;
+      border-collapse: collapse;
+      border: 1pt solid #dce8f0;
+      border-radius: 10pt;
+      overflow: hidden;
+    }}
+    table.reference-table th {{
+      padding: 7pt 8pt;
+      border: none;
+      background: #0e4e78;
+      color: #ffffff;
+      font-size: 7.6pt;
+      font-weight: bold;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      text-align: left;
+    }}
+    table.reference-table td {{
+      padding: 7pt 8pt;
+      border: none;
+      border-top: 0.8pt solid #eef3f7;
+      font-size: 9.2pt;
+      line-height: 1.55;
+      color: #223040;
+      vertical-align: top;
+      word-break: break-word;
+    }}
+    table.reference-table tr:first-child td {{
+      border-top: none;
+    }}
+    table.reference-table tbody tr:nth-child(even) td {{
+      background: #f8fbfd;
+    }}
+    .reference-index {{
+      width: 5%;
+      color: #6b84a0;
+      font-weight: bold;
     }}
 
     /* ── Note ── */
@@ -493,9 +537,6 @@ def render_costing_template_html(rfq: Rfq) -> str:
           <td class="hero-content">
             <p class="kicker">Review snapshot</p>
             <p class="content-title">Commercial-to-costing handoff</p>
-            <p class="content-copy">
-              The RFQ information below is organized for feasibility assessment, costing preparation, and internal alignment.
-            </p>
             <div class="pill-row">
               {badge_phase}{badge_sub}
             </div>
@@ -506,11 +547,6 @@ def render_costing_template_html(rfq: Rfq) -> str:
         </tr>
       </table>
     </div>
-
-    <p class="doc-meta">
-      <span class="doc-meta-right">Internal document - Restricted use</span>
-      Generated on {escape(generated_at)}
-    </p>
 
     {sections_html}
 
@@ -761,12 +797,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         )
         return pill
 
-    data = dict(rfq.rfq_data or {})
-    if rfq.zone_manager_email and not _has_meaningful_value(data.get("zone_manager_email")):
-        data["zone_manager_email"] = rfq.zone_manager_email
-    if rfq.product_line_acronym and not _has_meaningful_value(data.get("product_line_acronym")):
-        data["product_line_acronym"] = rfq.product_line_acronym
-
+    data = _build_costing_template_data(rfq)
     systematic_rfq_id = _stringify_value(data.get("systematic_rfq_id") or "Pending assignment")
     approved_by = _stringify_value(data.get("zone_manager_email")) or "-"
     approval_date = _stringify_value(rfq.approved_at) or "-"
@@ -775,6 +806,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     customer = _pick_first_value(data, ("customer_name", "customer", "client"))
     phase = _stringify_value(getattr(rfq.phase, "value", getattr(rfq, "phase", None))) or "-"
     sub_status = _stringify_value(getattr(rfq.sub_status, "value", getattr(rfq, "sub_status", None))) or "-"
+    product_rows = _build_product_reference_rows(data)
 
     tide = colors.HexColor("#046eaf")
     sun = colors.HexColor("#ef7807")
@@ -828,9 +860,13 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     meta_line_style = ParagraphStyle("MetaLineStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=11, textColor=text_muted)
     section_number_style = ParagraphStyle("SectionNumberStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=9, leading=11, alignment=1, textColor=colors.white)
     section_title_style = ParagraphStyle("SectionTitleStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=ink)
+    section_copy_style = ParagraphStyle("SectionCopyStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=8.7, leading=12, textColor=text_muted)
     field_label_style = ParagraphStyle("FieldLabelStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.3, leading=10, textColor=text_muted)
     field_value_style = ParagraphStyle("FieldValueStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9.4, leading=13, textColor=ink)
     field_empty_style = ParagraphStyle("FieldEmptyStyle", parent=field_value_style, textColor=colors.HexColor("#b8c9d6"), fontName="Helvetica-Oblique")
+    reference_header_style = ParagraphStyle("ReferenceHeaderStyle", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.1, leading=8.5, textColor=colors.white)
+    reference_value_style = ParagraphStyle("ReferenceValueStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=8.6, leading=11.2, textColor=ink)
+    reference_empty_style = ParagraphStyle("ReferenceEmptyStyle", parent=reference_value_style, textColor=colors.HexColor("#b8c9d6"), fontName="Helvetica-Oblique")
     note_style = ParagraphStyle("NoteStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=9, leading=13.5, textColor=colors.HexColor("#7a5e38"))
     footer_style = ParagraphStyle("FooterStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=7.8, leading=10, textColor=text_muted)
 
@@ -840,24 +876,24 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
         ("RFQ ID", systematic_rfq_id),
         ("Created by", rfq.created_by_email),
         ("Approved by", approved_by),
-        ("Approved at", approval_date),
-        ("Customer", customer if customer != "-" else None),
-        ("Product line", product_line if product_line != "-" else None),
     ]
 
     class ReportLabHeroHeader(Flowable):
         def __init__(self) -> None:
             super().__init__()
-            self.width = document.width - 5 * mm
-            self.height = 116 * mm
+            self.card_rows = max(1, (len(meta_cards_rl) + 2) // 3)
+            self.width = document.width
+            self.hero_width = 180 * mm
+            self.height = 76 * mm if self.card_rows == 1 else 116 * mm
 
         def wrap(self, availWidth: float, availHeight: float) -> tuple[float, float]:
             return self.width, self.height
 
         def draw(self) -> None:
             canv = self.canv
-            width = self.width
+            width = self.hero_width
             height = self.height
+            hero_x = 3 * mm
             left_width = 57 * mm
             right_x = left_width
             outer_radius = 5 * mm
@@ -867,11 +903,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
             card_width = (width - right_x - 11 * mm - (2 * card_gap)) / 3
             cards_x = right_x + 5.5 * mm
             row_gap = 4 * mm
-
-            # On descend légèrement tout le bloc des cards
-            bottom_cards_y = 5.0 * mm
-            top_cards_y = bottom_cards_y + card_height + row_gap
-            pills_y = top_cards_y + card_height + 4.2 * mm
+            card_rows = self.card_rows
 
             def draw_paragraph(text_value: str, style: ParagraphStyle, x: float, top_y: float, max_width: float) -> float:
                 paragraph = Paragraph(text_value, style)
@@ -906,6 +938,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
                 canv.restoreState()
 
             canv.saveState()
+            canv.translate(hero_x, 0)
             canv.setFillColor(tide)
             canv.roundRect(0, 0, width, height, outer_radius, fill=1, stroke=0)
 
@@ -934,7 +967,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
 
                 logo_box_x = 7.0 * mm
                 logo_box_y = height - 15.0 * mm
-                logo_box_width = 50 * mm
+                logo_box_width = 44 * mm
                 logo_box_height = 12.0 * mm
 
                 canv.setFillColor(colors.white)
@@ -949,7 +982,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
                 )
 
                 # marges internes plus confortables
-                padding_x = 4.0 * mm
+                padding_x = 3.0 * mm
                 padding_y = 1.4 * mm
                 available_w = logo_box_width - (2 * padding_x)
                 available_h = logo_box_height - (2 * padding_y)
@@ -977,8 +1010,6 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
                 )
             left_text_x = 8 * mm
             left_current_top = height - 22 * mm
-            left_current_top -= draw_paragraph('COSTING HANDOFF', eyebrow_style, left_text_x, left_current_top, left_width - 16 * mm)
-            left_current_top -= 4 * mm
             left_current_top -= draw_paragraph('Costing<br/>Feasibility<br/>Template', hero_title_style, left_text_x, left_current_top, left_width - 16 * mm)
             left_current_top -= 5 * mm
             draw_paragraph('Structured RFQ snapshot prepared for the costing review phase.', hero_body_style, left_text_x, left_current_top, left_width - 16 * mm)
@@ -1005,16 +1036,12 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
             )
             current_top -= 3 * mm
 
-            current_top -= draw_paragraph(
-                'The RFQ information below is organized for feasibility assessment, costing preparation, and internal alignment.',
-                content_body_style,
-                right_text_x,
-                current_top,
-                right_content_width,
-            )
 
             # Les badges se placent maintenant juste sous le texte
             pills_y = current_top - 10 * mm
+            cards_stack_height = card_height + ((card_rows - 1) * (card_height + row_gap))
+            bottom_cards_y = max(5.0 * mm, pills_y - (7.0 * mm + cards_stack_height))
+            top_cards_y = bottom_cards_y + ((card_rows - 1) * (card_height + row_gap))
 
             draw_pill(
                 f'<b>Phase :</b> {escape(phase)}',
@@ -1036,7 +1063,6 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
 
     story.extend([ReportLabHeroHeader(), Spacer(1, 10)])
 
-    story.append(Paragraph(f"Generated on {escape(generated_at)}<br/>Internal document - Restricted use", meta_line_style))
     story.append(Spacer(1, 10))
 
     for index, (title, fields) in enumerate(FIELD_GROUPS):
@@ -1065,7 +1091,7 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
 
         field_rows = []
         for label, keys in fields:
-            display_value = _get_field_display_value(label, keys, data)
+            display_value = _get_field_display_value(label, keys, data, product_rows=product_rows)
             value_style = field_empty_style if display_value == "-" else field_value_style
             field_rows.append([
                 Paragraph(escape(label.upper()), field_label_style),
@@ -1084,7 +1110,52 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
             ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
         ]))
 
-        story.extend([header, body, Spacer(1, 10)])
+        story.extend([header, body])
+
+        if index == 0 and product_rows:
+            reference_table_rows = [
+                [
+                    Paragraph(text, reference_header_style)
+                    for text in ("#", "Part number", "Revision", "Qty/year", "Target price", "Price source", "Target TO")
+                ]
+            ]
+            for row in product_rows:
+                reference_table_rows.append(
+                    [
+                        Paragraph(escape(row["index"]), reference_value_style),
+                        Paragraph(_paragraph_html(row["part_number"]), reference_empty_style if row["part_number"] == "-" else reference_value_style),
+                        Paragraph(_paragraph_html(row["revision_level"]), reference_empty_style if row["revision_level"] == "-" else reference_value_style),
+                        Paragraph(_paragraph_html(row["quantity"]), reference_empty_style if row["quantity"] == "-" else reference_value_style),
+                        Paragraph(_paragraph_html(row["target_price_display"]), reference_empty_style if row["target_price_display"] == "-" else reference_value_style),
+                        Paragraph(_paragraph_html(row["price_source"]), reference_empty_style if row["price_source"] == "-" else reference_value_style),
+                        Paragraph(_paragraph_html(row["target_to_display"]), reference_empty_style if row["target_to_display"] == "-" else reference_value_style),
+                    ]
+                )
+
+            reference_table = Table(
+                reference_table_rows,
+                colWidths=[10 * mm, 32 * mm, 20 * mm, 24 * mm, 44 * mm, 22 * mm, 28 * mm],
+                repeatRows=1,
+            )
+            reference_table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), mint),
+                        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fbfd")]),
+                        ("BOX", (0, 0), (-1, -1), 0.8, border_color),
+                        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#eef3f7")),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                        ("TOPPADDING", (0, 0), (-1, -1), 6),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ]
+                )
+            )
+            story.extend([Spacer(1, 5), reference_table])
+
+        story.extend([Spacer(1, 10)])
 
     note = Table(
         [[Paragraph("<b>Note:</b> Empty fields are displayed as &mdash;. This document is generated automatically from the RFQ system and does not constitute a contractual commitment.", note_style)]],
@@ -1113,13 +1184,16 @@ def _render_field_group(
     fields: list[tuple[str, tuple[str, ...]]],
     data: dict[str, Any],
     index: int,
+    *,
+    product_rows: list[dict[str, str]] | None = None,
 ) -> str:
     accent, head_bg, num_bg, num_color = SECTION_ACCENTS[index % len(SECTION_ACCENTS)]
     section_number = index + 1
     rows: list[str] = []
+    extra_body = ""
 
     for label, keys in fields:
-        display_value = _get_field_display_value(label, keys, data)
+        display_value = _get_field_display_value(label, keys, data, product_rows=product_rows)
         is_empty = display_value == "-"
         cell_class = "value-empty" if is_empty else "value"
         cell_content = "&mdash;" if is_empty else _format_html_value(display_value)
@@ -1129,6 +1203,9 @@ def _render_field_group(
             f'<td class="{cell_class}">{cell_content}</td>'
             f'</tr>'
         )
+
+    if index == 0 and product_rows:
+        extra_body = _render_product_reference_table_html(product_rows)
 
     border_color = accent + "33"
 
@@ -1143,6 +1220,7 @@ def _render_field_group(
       </div>
       <div class="section-body">
         <table class="fields">{''.join(rows)}</table>
+        {extra_body}
       </div>
     </div>
     """
@@ -1160,6 +1238,41 @@ def _render_meta_card(label: str, value: Any) -> str:
         f'{value_html}'
         '</div>'
     )
+
+
+def _render_product_reference_table_html(product_rows: list[dict[str, str]]) -> str:
+    table_rows = "".join(
+        (
+            "<tr>"
+            f'<td class="reference-index">{escape(row["index"])}</td>'
+            f"<td>{escape(row['part_number'])}</td>"
+            f"<td>{escape(row['revision_level'])}</td>"
+            f"<td>{escape(row['quantity'])}</td>"
+            f"<td>{escape(row['target_price_display'])}</td>"
+            f"<td>{escape(row['price_source'])}</td>"
+            f"<td>{escape(row['target_to_display'])}</td>"
+            "</tr>"
+        )
+        for row in product_rows
+    )
+
+    return f"""
+    <p class="section-copy">Products</p>
+    <table class="reference-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Part number</th>
+          <th>Revision</th>
+          <th>Qty/year</th>
+          <th>Target price</th>
+          <th>Price source</th>
+          <th>Target TO</th>
+        </tr>
+      </thead>
+      <tbody>{table_rows}</tbody>
+    </table>
+    """
 
 
 def _render_logo_html() -> str:
@@ -1196,54 +1309,233 @@ def _get_field_display_value(
     label: str,
     keys: tuple[str, ...],
     data: dict[str, Any],
+    *,
+    product_rows: list[dict[str, str]] | None = None,
 ) -> str:
+    if label == "Total Turnover":
+        return _format_total_turnover_display(data)
+    multi_reference_display = _build_multi_reference_field_display(
+        label,
+        product_rows if product_rows is not None else _build_product_reference_rows(data),
+    )
+    if multi_reference_display is not None:
+        return multi_reference_display
     if label == "Target price":
         return _format_target_price_display(data)
     return _pick_first_value(data, keys)
 
 
 def _format_target_price_display(data: dict[str, Any]) -> str:
-    eur_value = _pick_first_raw_value(data, ("target_price_eur", "targetPrice"))
+    shared_currency = _resolve_shared_product_currency(data)
     local_value = _pick_first_raw_value(data, ("target_price_local", "targetPriceLocal"))
-    local_currency = _pick_first_raw_value(data, ("target_price_currency", "targetPriceCurrency"))
-    estimated_value = _pick_first_raw_value(
-        data,
-        ("target_price_is_estimated", "targetPriceIsEstimated"),
-    )
-    if estimated_value is None:
-        first_product = (
-            data.get("products")[0]
-            if isinstance(data.get("products"), list) and data.get("products")
-            else {}
-        )
+    eur_value = _pick_first_raw_value(data, ("target_price_eur", "targetPriceEur", "targetPrice"))
+    if local_value is None:
+        first_product = data.get("products")[0] if isinstance(data.get("products"), list) and data.get("products") else {}
         if isinstance(first_product, dict):
-            estimated_value = _pick_first_raw_value(
-                first_product,
-                ("target_price_is_estimated", "targetPriceIsEstimated"),
-            )
+            local_value = _pick_first_raw_value(first_product, ("target_price", "targetPrice", "price"))
+            if eur_value is None and shared_currency == "EUR":
+                eur_value = local_value
 
-    eur_text = _stringify_value(eur_value).strip() if eur_value is not None else ""
-    local_text = _stringify_value(local_value).strip() if local_value is not None else ""
-    local_currency_text = (
-        _stringify_value(local_currency).strip().upper()
-        if local_currency is not None
-        else ""
+    return _format_dual_currency_price_display(
+        local_value,
+        shared_currency,
+        eur_value=eur_value,
+        eur_rate=_derive_eur_rate(data, shared_currency),
     )
 
-    if not eur_text and not local_text:
+def _build_product_reference_rows(data: dict[str, Any]) -> list[dict[str, str]]:
+    products = data.get("products")
+    if not isinstance(products, list):
+        return []
+
+    shared_currency = _resolve_shared_product_currency(data)
+    eur_rate = _derive_eur_rate(data, shared_currency)
+    rows: list[dict[str, str]] = []
+    for index, product in enumerate(products, start=1):
+        if not isinstance(product, dict):
+            continue
+
+        quantity_raw = _pick_first_raw_value(
+            product,
+            ("quantity", "qty", "annual_volume", "annualVolume", "qty_per_year", "qtyPerYear"),
+        )
+        target_price_raw = _pick_first_raw_value(product, ("target_price", "targetPrice", "price"))
+        row_currency = _stringify_value(
+            _pick_first_raw_value(
+                product,
+                ("currency", "target_price_currency", "targetPriceCurrency", "target_currency", "targetCurrency"),
+            )
+        ).strip().upper() or shared_currency
+        estimated_value = _pick_first_raw_value(
+            product,
+            ("target_price_is_estimated", "targetPriceIsEstimated", "price_source", "priceSource"),
+        )
+        target_to_raw = _pick_first_raw_value(product, ("target_to", "targetTo", "turnover"))
+
+        quantity_number = _coerce_float_value(quantity_raw)
+        target_price_number = _coerce_float_value(target_price_raw)
+        if target_to_raw is None and quantity_number is not None and target_price_number is not None:
+            target_to_raw = quantity_number * target_price_number
+
+        target_price_display = _format_dual_currency_price_display(
+            target_price_raw,
+            row_currency,
+            eur_rate=eur_rate if row_currency == shared_currency else None,
+        )
+        price_source_display = _format_price_source_display(estimated_value)
+        target_to_display = _format_dual_currency_turnover_display(
+            target_to_raw,
+            row_currency,
+            eur_rate=eur_rate if row_currency == shared_currency else None,
+        )
+
+        rows.append(
+            {
+                "index": str(index),
+                "part_number": _pick_first_value(product, ("part_number", "partNumber", "customer_pn", "customerPn")),
+                "revision_level": _pick_first_value(product, ("revision_level", "revisionLevel", "revision")),
+                "quantity": _format_numeric_display(quantity_raw),
+                "target_price_display": target_price_display,
+                "price_source": price_source_display,
+                "target_price_summary": target_price_display,
+                "target_to_display": target_to_display,
+            }
+        )
+
+    return rows
+
+
+def _build_multi_reference_field_display(
+    label: str,
+    product_rows: list[dict[str, str]],
+) -> str | None:
+    if len(product_rows) <= 1:
+        return None
+
+    field_name = {
+        "Customer PN": "part_number",
+        "Revision level": "revision_level",
+        "Quantity per year": "quantity",
+        "Target price": "target_price_summary",
+    }.get(label)
+    if not field_name:
+        return None
+
+    return "\n".join(f"{row['index']}. {row[field_name]}" for row in product_rows)
+
+
+def _resolve_shared_product_currency(data: dict[str, Any]) -> str:
+    products = data.get("products")
+    if isinstance(products, list):
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            currency = _stringify_value(
+                _pick_first_raw_value(
+                    product,
+                    ("currency", "target_price_currency", "targetPriceCurrency", "target_currency", "targetCurrency"),
+                )
+            ).strip().upper()
+            if currency:
+                return currency
+    return _stringify_value(
+        _pick_first_raw_value(data, ("target_price_currency", "targetPriceCurrency"))
+    ).strip().upper()
+
+
+def _derive_eur_rate(data: dict[str, Any], currency: str | None) -> float | None:
+    normalized_currency = str(currency or "").strip().upper()
+    if not normalized_currency:
+        return None
+    if normalized_currency == "EUR":
+        return 1.0
+
+    local_k_value = _coerce_float_value(_pick_first_raw_value(data, ("to_total_local", "toTotalLocal")))
+    eur_k_value = _coerce_float_value(_pick_first_raw_value(data, ("to_total", "toTotal")))
+    if local_k_value not in (None, 0.0) and eur_k_value is not None:
+        if not _floats_close(local_k_value, eur_k_value):
+            return eur_k_value / local_k_value
+
+    local_price_value = _coerce_float_value(_pick_first_raw_value(data, ("target_price_local", "targetPriceLocal")))
+    eur_price_value = _coerce_float_value(_pick_first_raw_value(data, ("target_price_eur", "targetPriceEur", "targetPrice")))
+    if local_price_value not in (None, 0.0) and eur_price_value is not None:
+        return eur_price_value / local_price_value
+
+    return None
+
+
+def _floats_close(left: float, right: float, tolerance: float = 1e-9) -> bool:
+    return abs(left - right) <= tolerance
+
+
+def _format_dual_currency_price_display(
+    local_value: Any,
+    currency: str | None,
+    *,
+    eur_value: Any | None = None,
+    eur_rate: float | None = None,
+) -> str:
+    normalized_currency = str(currency or "").strip().upper() or "EUR"
+    local_segment = _format_currency_amount_display(local_value, normalized_currency)
+    if local_segment == "-":
+        if normalized_currency == "EUR":
+            return _format_currency_amount_display(eur_value, "EUR")
         return "-"
+    if normalized_currency == "EUR":
+        return local_segment
 
-    status_label = "estimated" if _coerce_bool(estimated_value) else "customer price"
+    eur_number = _coerce_float_value(eur_value)
+    if eur_number is None and eur_rate is not None:
+        local_number = _coerce_float_value(local_value)
+        if local_number is not None:
+            eur_number = local_number * eur_rate
+    eur_segment = _format_currency_amount_display(eur_number, "EUR") if eur_number is not None else "EUR unavailable"
+    return f"{local_segment} / {eur_segment}"
 
-    if eur_text and local_text and local_currency_text != "EUR":
-        local_segment = f"{local_text} {local_currency_text}".strip()
-        return f"{eur_text} EUR / {local_segment} ({status_label})"
 
-    if eur_text:
-        return f"{eur_text} EUR ({status_label})"
+def _format_dual_currency_turnover_display(
+    local_value: Any,
+    currency: str | None,
+    *,
+    eur_k_value: Any | None = None,
+    eur_rate: float | None = None,
+) -> str:
+    normalized_currency = str(currency or "").strip().upper() or "EUR"
+    local_segment = _format_target_to_display(local_value, normalized_currency)
+    if local_segment == "-":
+        if normalized_currency == "EUR":
+            return _format_k_amount_display(eur_k_value, "EUR")
+        return "-"
+    if normalized_currency == "EUR":
+        return local_segment
 
-    local_segment = f"{local_text} {local_currency_text}".strip()
-    return f"{local_segment} ({status_label})"
+    eur_k_number = _coerce_float_value(eur_k_value)
+    if eur_k_number is None and eur_rate is not None:
+        local_number = _coerce_float_value(local_value)
+        if local_number is not None:
+            eur_k_number = (local_number * eur_rate) / 1000.0
+    eur_segment = _format_k_amount_display(eur_k_number, "EUR") if eur_k_number is not None else "EUR unavailable"
+    return f"{local_segment} / {eur_segment}"
+
+
+def _format_total_turnover_display(data: dict[str, Any]) -> str:
+    shared_currency = _resolve_shared_product_currency(data) or "EUR"
+    eur_rate = _derive_eur_rate(data, shared_currency)
+    total_local_value = _coerce_float_value(_pick_first_raw_value(data, ("total_target_to",)))
+    if total_local_value is None:
+        total_local_k = _coerce_float_value(_pick_first_raw_value(data, ("to_total_local", "toTotalLocal")))
+        if total_local_k is not None:
+            total_local_value = total_local_k * 1000.0
+
+    total_eur_k_value = _coerce_float_value(_pick_first_raw_value(data, ("to_total", "toTotal")))
+    if shared_currency != "EUR" and eur_rate is None:
+        total_eur_k_value = None
+    return _format_dual_currency_turnover_display(
+        total_local_value,
+        shared_currency,
+        eur_k_value=total_eur_k_value,
+        eur_rate=eur_rate,
+    )
 
 
 def _pick_first_raw_value(data: dict[str, Any], keys: tuple[str, ...]) -> Any | None:
@@ -1261,6 +1553,60 @@ def _pick_first_value(data: dict[str, Any], keys: tuple[str, ...]) -> str:
     if value is None:
         return "-"
     return _stringify_value(value)
+
+
+def _coerce_float_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_numeric_display(value: Any) -> str:
+    number = _coerce_float_value(value)
+    if number is None:
+        return "-"
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.5f}".rstrip("0").rstrip(".")
+
+
+def _format_currency_amount_display(value: Any, currency: str | None) -> str:
+    amount = _format_numeric_display(value)
+    if amount == "-":
+        return "-"
+    return f"{amount} {currency}".strip()
+
+
+def _format_k_amount_display(value: Any, currency: str | None) -> str:
+    amount = _format_numeric_display(value)
+    if amount == "-":
+        return "-"
+    unit = f"k{currency}" if currency else "k"
+    return f"{amount} {unit}".strip()
+
+
+def _format_target_to_display(value: Any, currency: str | None) -> str:
+    number = _coerce_float_value(value)
+    if number is None:
+        return "-"
+    return _format_k_amount_display(number / 1000.0, currency)
+
+
+def _format_price_source_display(value: Any) -> str:
+    if value is None:
+        return "-"
+    text = _stringify_value(value)
+    if not text:
+        return "-"
+    return "Estimated" if _coerce_bool(value) else "Official customer price"
 
 
 def _coerce_bool(value: Any) -> bool:
