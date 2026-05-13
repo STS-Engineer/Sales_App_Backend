@@ -94,10 +94,37 @@ def test_partial_product_rows_are_allowed_until_submission():
 
     assert data["products"][0]["part_number"] == "DRAFT-PN"
     assert get_incomplete_product_fields(data) == [
+        "products[1].quantity",
+        "products[1].currency",
+        "products[1].target_price_is_estimated",
+    ]
+    assert get_incomplete_product_fields(data, include_optional=True) == [
         "products[1].revision_level",
         "products[1].quantity",
         "products[1].currency",
         "products[1].target_price_is_estimated",
+    ]
+
+
+def test_optional_revision_level_does_not_block_product_completion():
+    data = rfq_data_payload_to_dict(
+        {
+            "products": [
+                {
+                    "part_number": "READY-PN",
+                    "revision_level": "",
+                    "quantity": 1200,
+                    "target_price": 1.8,
+                    "currency": "EUR",
+                    "target_price_is_estimated": True,
+                }
+            ]
+        }
+    )
+
+    assert get_incomplete_product_fields(data) == []
+    assert get_incomplete_product_fields(data, include_optional=True) == [
+        "products[1].revision_level"
     ]
 
 

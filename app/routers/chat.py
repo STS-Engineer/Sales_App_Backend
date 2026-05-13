@@ -314,57 +314,127 @@ POTENTIAL_STEPS: list[tuple[int, list[str]]] = [
     (2, ["contact_email"]),
     (3, ["contact_name", "contact_role", "contact_phone"]),
 ]
-RFQ_STEPS: list[tuple[int, list[str]]] = [
+
+
+def _step_field(name: str, *, is_optional: bool = False) -> dict[str, object]:
+    return {"name": name, "is_optional": is_optional}
+
+
+RFQ_STEPS: list[tuple[int, list[dict[str, object]]]] = [
     (
         1,
         [
-            "customer_name",
-            "application",
-            "product_name",
-            "product_line_acronym",
-            "project_name",
-            "rfq_files",
-            "products",
-            "delivery_zone",
-            "delivery_plant",
-            "country",
-            "po_date",
-            "ppap_date",
-            "sop_year",
-            "rfq_reception_date",
-            "quotation_expected_date",
-            "contact_email",
-            "contact_name",
-            "contact_role",
-            "contact_phone",
+            _step_field("customer_name"),
+            _step_field("application"),
+            _step_field("product_name"),
+            _step_field("product_line_acronym"),
+            _step_field("project_name"),
+            _step_field("costing_data", is_optional=True),
+            _step_field("rfq_files"),
+            _step_field("products"),
+            _step_field("delivery_zone"),
+            _step_field("delivery_plant"),
+            _step_field("country"),
+            _step_field("po_date"),
+            _step_field("ppap_date", is_optional=True),
+            _step_field("sop_year"),
+            _step_field("rfq_reception_date"),
+            _step_field("quotation_expected_date"),
+            _step_field("contact_name"),
+            _step_field("contact_role"),
+            _step_field("contact_phone"),
+            _step_field("contact_email"),
         ],
     ),
     (
         2,
         [
-            "expected_delivery_conditions",
-            "expected_payment_terms",
-            "type_of_packaging",
-            "business_trigger",
-            "customer_tooling_conditions",
-            "entry_barriers",
+            _step_field("expected_delivery_conditions"),
+            _step_field("expected_payment_terms"),
+            _step_field("type_of_packaging", is_optional=True),
+            _step_field("business_trigger", is_optional=True),
+            _step_field("customer_tooling_conditions", is_optional=True),
+            _step_field("entry_barriers", is_optional=True),
         ],
     ),
     (
         3,
         [
-            "responsibility_design",
-            "responsibility_validation",
-            "product_ownership",
-            "pays_for_development",
-            "capacity_available",
-            "scope",
-            "strategic_note",
-            "final_recommendation",
+            _step_field("responsibility_design"),
+            _step_field("responsibility_validation"),
+            _step_field("product_ownership"),
+            _step_field("pays_for_development"),
+            _step_field("capacity_available"),
+            _step_field("scope"),
+            _step_field("strategic_note"),
+            _step_field("final_recommendation"),
         ],
     ),
-    (4, ["total_target_to", "to_total", "zone_manager_email", "validator_role"]),
+    (
+        4,
+        [
+            _step_field("total_target_to"),
+            _step_field("to_total"),
+            _step_field("zone_manager_email"),
+            _step_field("validator_role"),
+        ],
+    ),
 ]
+
+RFQ_OPTIONAL_FIELDS = {
+    str(step_field.get("name") or "").strip()
+    for _, step_fields in RFQ_STEPS
+    for step_field in step_fields
+    if bool(step_field.get("is_optional"))
+}
+RFQ_OPTIONAL_PRODUCT_FIELDS = {"revision_level"}
+FIELD_LABELS = {
+    "customer_name": "Customer",
+    "application": "Application",
+    "product_name": "Product name",
+    "product_line_acronym": "Product line",
+    "project_name": "Project name",
+    "costing_data": "Costing data",
+    "products": "Products",
+    "rfq_files": "RFQ Files",
+    "delivery_zone": "Delivery zone",
+    "delivery_plant": "Plant",
+    "country": "Country",
+    "po_date": "PO date",
+    "ppap_date": "PPAP date",
+    "sop_year": "SOP year",
+    "rfq_reception_date": "RFQ reception date",
+    "quotation_expected_date": "Expected quotation date",
+    "contact_email": "Contact email",
+    "contact_name": "Contact name",
+    "contact_role": "Contact function",
+    "contact_phone": "Contact phone",
+    "expected_delivery_conditions": "Expected Delivery Conditions",
+    "expected_payment_terms": "Expected Payment Terms",
+    "type_of_packaging": "Type of Packaging",
+    "business_trigger": "Business Trigger",
+    "customer_tooling_conditions": "Customer Tooling Conditions",
+    "entry_barriers": "Entry Barriers",
+    "responsibility_design": "Design responsible",
+    "responsibility_validation": "Validation responsible",
+    "product_ownership": "Design owner",
+    "pays_for_development": "Development costs",
+    "capacity_available": "Technical capacity",
+    "scope": "Scope",
+    "strategic_note": "Strategic note",
+    "final_recommendation": "Final recommendation",
+    "total_target_to": "Total target TO",
+    "to_total": "Total turnover",
+    "to_total_local": "Total turnover (local)",
+    "zone_manager_email": "Validator Email",
+    "validator_role": "Validator role",
+    "part_number": "Part Number",
+    "revision_level": "Revision level",
+    "quantity": "Quantity",
+    "target_price": "Target Price",
+    "currency": "Currency",
+    "target_price_is_estimated": "Price source",
+}
 
 
 def _normalize_scope_value(value):
@@ -385,6 +455,138 @@ def _normalize_rfq_data_fields(data: dict | None) -> dict:
     if "scope" not in normalized and legacy_scope is not None:
         normalized["scope"] = _normalize_scope_value(legacy_scope)
     return normalize_rfq_data_products(normalized)
+
+
+def _get_step_field_name(step_field: dict[str, object] | str | None) -> str:
+    if isinstance(step_field, dict):
+        return str(step_field.get("name") or "").strip()
+    return str(step_field or "").strip()
+
+
+def _is_optional_step_field(step_field: dict[str, object] | str | None) -> bool:
+    return isinstance(step_field, dict) and bool(step_field.get("is_optional"))
+
+
+def _get_step_fields(
+    step_fields: dict[str, list[str]] | list[dict[str, object]] | list[str],
+    *,
+    include_optional: bool = True,
+) -> list[str]:
+    if isinstance(step_fields, dict):
+        fields = list(step_fields.get("required", []))
+        if include_optional:
+            fields.extend(step_fields.get("optional", []))
+        return fields
+    fields: list[str] = []
+    for step_field in step_fields or []:
+        if not include_optional and _is_optional_step_field(step_field):
+            continue
+        field_name = _get_step_field_name(step_field)
+        if field_name:
+            fields.append(field_name)
+    return fields
+
+
+def _humanize_field_name(field_name: str) -> str:
+    text = str(field_name or "").strip().replace("_", " ")
+    return text[:1].upper() + text[1:] if text else ""
+
+
+def _strip_prompt_examples(label: str) -> str:
+    cleaned = re.sub(
+        r"\s*\((?:e\.g\.|eg\.?|for example|example:)[^)]+\)",
+        "",
+        str(label or ""),
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def _is_optional_field(field_name: str) -> bool:
+    normalized_field_name = str(field_name or "").strip()
+    if normalized_field_name in RFQ_OPTIONAL_FIELDS:
+        return True
+    product_field_match = re.fullmatch(
+        r"products\[(\d+)\]\.([A-Za-z0-9_]+)",
+        normalized_field_name,
+    )
+    return bool(
+        product_field_match
+        and product_field_match.group(2) in RFQ_OPTIONAL_PRODUCT_FIELDS
+    )
+
+
+def _format_field_for_prompt(field_name: str) -> str:
+    normalized_field_name = str(field_name or "").strip()
+    product_field_match = re.fullmatch(
+        r"products\[(\d+)\]\.([A-Za-z0-9_]+)",
+        normalized_field_name,
+    )
+    if product_field_match:
+        product_index = product_field_match.group(1)
+        product_field_name = product_field_match.group(2)
+        base_label = _strip_prompt_examples(
+            FIELD_LABELS.get(
+                product_field_name,
+                _humanize_field_name(product_field_name),
+            )
+        )
+        label = f"Product {product_index} {base_label}"
+    else:
+        label = _strip_prompt_examples(
+            FIELD_LABELS.get(
+                normalized_field_name,
+                _humanize_field_name(normalized_field_name),
+            )
+        )
+    if _is_optional_field(normalized_field_name):
+        label = f"{label} (OPTIONAL)"
+    return label
+
+
+def _format_field_list_for_prompt(field_names: list[str]) -> str:
+    return json.dumps(
+        [_format_field_for_prompt(field_name) for field_name in field_names],
+        ensure_ascii=False,
+    )
+
+
+def _get_missing_fields_for_step(
+    data: dict,
+    step_fields: dict[str, list[str]] | list[str],
+) -> list[str]:
+    missing_fields: list[str] = []
+    for field_name in _get_step_fields(step_fields, include_optional=True):
+        if field_name == "products":
+            product_missing_fields = get_incomplete_product_fields(
+                data,
+                include_optional=True,
+            )
+            if product_missing_fields:
+                missing_fields.extend(product_missing_fields)
+            continue
+        if not _is_field_filled(data, field_name):
+            missing_fields.append(field_name)
+    return missing_fields
+
+
+def _get_missing_required_fields_for_step(
+    data: dict,
+    step_fields: dict[str, list[str]] | list[str],
+) -> list[str]:
+    missing_fields: list[str] = []
+    for field_name in _get_step_fields(step_fields, include_optional=False):
+        if field_name == "products":
+            product_missing_fields = get_incomplete_product_fields(
+                data,
+                include_optional=False,
+            )
+            if product_missing_fields:
+                missing_fields.extend(product_missing_fields)
+            continue
+        if not _is_field_filled(data, field_name, include_optional=False):
+            missing_fields.append(field_name)
+    return missing_fields
 
 
 def _coerce_numeric_value(value) -> float:
@@ -580,9 +782,12 @@ def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
 """
 
 
-def _is_field_filled(data: dict, field_name: str) -> bool:
+def _is_field_filled(data: dict, field_name: str, *, include_optional: bool = True) -> bool:
     if field_name == "products":
-        return not get_incomplete_product_fields(data)
+        return not get_incomplete_product_fields(
+            data,
+            include_optional=include_optional,
+        )
     if field_name == "rfq_files":
         value = (
             data.get("rfq_files")
@@ -611,7 +816,15 @@ def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[in
     else:
         steps = RFQ_STEPS
     for step_number, fields in steps:
-        missing_fields = [field for field in fields if not _is_field_filled(data, field)]
+        missing_fields = (
+            [
+                field
+                for field in fields
+                if not _is_field_filled(data, field)
+            ]
+            if chat_mode == "potential"
+            else _get_missing_required_fields_for_step(data, fields)
+        )
         if missing_fields:
             return step_number, missing_fields
     return steps[-1][0], []
@@ -625,17 +838,33 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
     current_step, missing_fields = _get_current_step_and_missing_fields(chat_mode, data)
     current_step_fields = next(
         (fields for step_number, fields in steps if step_number == current_step),
-        [],
+        {} if chat_mode != "potential" else [],
     )
-    filled_fields = [field for field in current_step_fields if field not in missing_fields]
+    current_step_field_names = _get_step_fields(
+        current_step_fields,
+        include_optional=False,
+    )
+    filled_fields = [
+        field
+        for field in current_step_field_names
+        if _is_field_filled(data, field, include_optional=False)
+    ]
     user_keys_missing = [key for key in missing_fields if key not in AI_GENERATED_STEP_FIELDS]
     ai_keys_missing = [key for key in missing_fields if key in AI_GENERATED_STEP_FIELDS]
+    next_field_to_ask = user_keys_missing[0] if user_keys_missing else (
+        ai_keys_missing[0] if ai_keys_missing else ""
+    )
     prompt = (
         f"STATE RECONCILIATION FOR STEP {current_step}:\n"
-        f"- Fields already present and MUST NOT be asked again: {filled_fields}\n"
-        f"- Missing fields you must ASK THE USER for: {user_keys_missing}\n"
-        f"- Missing fields YOU MUST GENERATE/CALCULATE yourself: {ai_keys_missing}"
+        f"- Fields already present and MUST NOT be asked again: {_format_field_list_for_prompt(filled_fields)}\n"
+        f"- Missing fields you must ASK THE USER for: {_format_field_list_for_prompt(user_keys_missing)}\n"
+        f"- Missing fields YOU MUST GENERATE/CALCULATE yourself: {_format_field_list_for_prompt(ai_keys_missing)}"
     )
+    if next_field_to_ask:
+        prompt += (
+            "\n- Next field to ask for: "
+            f"{_format_field_for_prompt(next_field_to_ask)}"
+        )
     if not missing_fields:
         prompt += (
             "\nAll required fields for this step are already present, so move to the next "
@@ -645,13 +874,13 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
     # ── Strict Step 4 blocking when Steps 2 or 3 are incomplete ──
     if chat_mode != "potential" and current_step < 4:
         step2_fields = next(
-            (fields for step_number, fields in steps if step_number == 2), []
+            (fields for step_number, fields in steps if step_number == 2), {}
         )
         step3_fields = next(
-            (fields for step_number, fields in steps if step_number == 3), []
+            (fields for step_number, fields in steps if step_number == 3), {}
         )
-        step2_missing = [f for f in step2_fields if not _is_field_filled(data, f)]
-        step3_missing = [f for f in step3_fields if not _is_field_filled(data, f)]
+        step2_missing = _get_missing_required_fields_for_step(data, step2_fields)
+        step3_missing = _get_missing_required_fields_for_step(data, step3_fields)
 
         if step2_missing or step3_missing:
             prompt += (
@@ -661,9 +890,15 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
                 "'Turnover', 'TO Total', or 'Zone Manager' until Steps 2 AND 3 are 100% complete."
             )
             if step2_missing:
-                prompt += f"\n- Step 2 still missing: {step2_missing}"
+                prompt += (
+                    "\n- Step 2 still missing: "
+                    f"{_format_field_list_for_prompt(step2_missing)}"
+                )
             if step3_missing:
-                prompt += f"\n- Step 3 still missing: {step3_missing}"
+                prompt += (
+                    "\n- Step 3 still missing: "
+                    f"{_format_field_list_for_prompt(step3_missing)}"
+                )
             prompt += (
                 "\nYou MUST ask about the current step's missing fields ONLY. "
                 "If the current step is Step 1 and it is complete, move to Step 2 "
@@ -1690,7 +1925,7 @@ CRITICAL NO-ROUNDING RULE: If a backend tool returns a converted EUR value, or i
 DIMENSION NORMALIZATION RULE: If the user provides physical dimensions or technical specifications in inches or any other non-mm unit, you MUST seamlessly convert them to millimeters (mm) before saving the data. Always store dimension data in mm.
 DELIVERY ZONE CLASSIFICATION RULE: When collecting the customer location or delivery destination, you MUST classify it into exactly one of these 7 approved `delivery_zone` strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". Never use any other spelling or region name. If the user gives a specific country, map it automatically to the correct approved zone (for example, France -> Europe, South Africa -> Africa, India -> India, United States -> North America, Brazil -> South America, China -> China / South Pacific, Japan -> Korea / Japan). If you cannot confidently map it, ask the user to clarify before saving. If you need the user to choose a delivery zone explicitly, you MUST present only these exact 7 options and no others.
 FORM STATE SYNC RULE: On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data. Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan".
-MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, Target Price, Currency, and Price Source for each product. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
+MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, Target Price, Currency, and Price Source for each product. Revision Level is OPTIONAL and the user may skip it. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
@@ -1746,10 +1981,11 @@ If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combin
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 FORMATTING RULE: When a missing field has allowed options, keep those options inline or nested under that field; never promote option values into separate top-level numbered items.
+CRITICAL OPTIONAL FIELD RULE: If the next missing field is marked as (OPTIONAL), you MUST explicitly tell the user it is not mandatory. Example: "What is the Revision level? This is optional, so if you don't have it, just type 'skip'." If the user indicates they want to skip it, you MUST call the updateFormFields tool and set that field's value to "N/A" or "Not provided" so it is removed from the missing fields list, and immediately move to the next question.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
-2. NO GUESSING/PROPOSITIONS: When asking the user for missing information, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples for open-ended fields (e.g., do not say 'What is the volume? Is it 500?').
-3. ENUM EXCEPTION: You may ONLY provide options if the field is strictly constrained to a predefined list (e.g., you MUST list the exact options for 'Price source' or 'Incoterms' as previously instructed).
+2. NO GUESSING/PROPOSITIONS: When asking the user for missing information, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples, parenthetical hints, or sample values for open-ended fields.
+3. ENUM EXCEPTION: You may ONLY provide options if the field is strictly constrained to a predefined list already instructed by the system.
 STRICT CHECKLIST RULE: You MUST ONLY ask the user for the exact fields explicitly listed in the injected MISSING_FIELDS_PROMPT. You are strictly FORBIDDEN from inventing new questions, fields, or requirements (such as "delivery city", "full address", or "zip code"). If it is not in the missing fields array, do not ask for it.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
 CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
@@ -1805,7 +2041,7 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save `product_name` with `updateFormFields` and map it to the authorized `product_line_acronym` to lock them in.
 6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
 7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-8. Ask only for the remaining missing Step 1 fields among product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Revision Level, Quantity, and Target Price.
+8. Ask only for the remaining missing Step 1 fields among product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL.
 MULTI-PRODUCT SUPPORT:
 - NEVER ask the user how many part numbers/products there are upfront.
 - After each part number is saved, ask: "Would you like to add another part number to this request?"
@@ -1813,7 +2049,7 @@ MULTI-PRODUCT SUPPORT:
 - When the user says yes, collect the new product row and call updateFormFields with `append_products=true` so the new rows are APPENDED to existing ones instead of replacing them.
 - When the user says no, move on to the remaining Step 1 fields.
 - You MUST NOT jump to validator routing or ask for submission while `products` still have missing fields (target_price, currency, quantity).
-CRITICAL PRODUCT COMPLETENESS RULE: A product row is NOT complete until it has ALL of: part_number, revision_level, quantity, target_price, currency, and target_price_is_estimated. If ANY of these are missing, you MUST ask for them BEFORE moving on. NEVER skip target_price or currency.
+CRITICAL PRODUCT COMPLETENESS RULE: A product row is NOT complete until it has ALL of: part_number, quantity, target_price, currency, and target_price_is_estimated. `revision_level` is OPTIONAL. If ANY required product fields are missing, you MUST ask for them BEFORE moving on. NEVER skip target_price or currency.
 CRITICAL DELIVERY ZONE RULE: Whenever you save `delivery_zone`, it MUST be exactly one of these 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". If the user gives a country or city, convert it to the approved zone before calling `updateFormFields`. If you cannot confidently map it, ask a clarification question instead of guessing. If you ask the user to choose a zone, you MUST present only those exact 7 options.
 
 STEP 1 VALIDATION RULE:
@@ -1891,7 +2127,7 @@ CRITICAL STEP 4 RULES:
 6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `products`, `total_target_to`, `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
 7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the request for validation, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
 8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-9. CRITICAL SUBMISSION RULE: When you ask "Do you want to submit this RFQ for validation? Yes/No", you MUST accept "Yes", "1", "y", "sure", or "ok" as an affirmative response. If the user replies with ANY of these, you MUST IMMEDIATELY trigger the submission tool/function. Treat "2", "No", or "n" as a negative response. You are strictly forbidden from asking for confirmation a second time. Acknowledge the submission and confirm it is PENDING_FOR_VALIDATION.
+9. CRITICAL SUBMISSION RULE: When the user confirms submission, you MUST ONLY invoke the submitValidation tool. Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool. Just trigger the function.
 10. After `submitValidation` succeeds, acknowledge exactly once that the RFQ or RFI was submitted, confirm that it is now `PENDING_FOR_VALIDATION`, and clearly tell the user that the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT. Do NOT ask for confirmation again.
 """
 

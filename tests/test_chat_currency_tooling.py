@@ -821,6 +821,9 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Request-level pricing metadata if still missing" not in chat.SYSTEM_PROMPT
     assert "MUST NOT jump to validator routing or ask for submission" in chat.SYSTEM_PROMPT
     assert "save both `product_name` and the authorized `product_line_acronym`" not in chat.SYSTEM_PROMPT
+    assert "When the user confirms submission, you MUST ONLY invoke the submitValidation tool." in chat.SYSTEM_PROMPT
+    assert "Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool." in chat.SYSTEM_PROMPT
+    assert "Acknowledge the submission and confirm it is PENDING_FOR_VALIDATION." not in chat.SYSTEM_PROMPT
 
 
 def test_product_item_tool_schema_preserves_raw_currency_fields():

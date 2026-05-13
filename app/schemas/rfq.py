@@ -409,7 +409,11 @@ def normalize_rfq_data_products(
     return normalized
 
 
-def get_incomplete_product_fields(data: dict[str, Any] | None) -> list[str]:
+def get_incomplete_product_fields(
+    data: dict[str, Any] | None,
+    *,
+    include_optional: bool = False,
+) -> list[str]:
     raw_products = data.get("products") if isinstance(data, dict) else None
     products_authoritative = bool(
         isinstance(raw_products, list)
@@ -433,7 +437,7 @@ def get_incomplete_product_fields(data: dict[str, Any] | None) -> list[str]:
             continue
         if not _clean_text(product.get("part_number")):
             missing_fields.append(f"products[{index}].part_number")
-        if not _clean_text(product.get("revision_level")):
+        if include_optional and not _clean_text(product.get("revision_level")):
             missing_fields.append(f"products[{index}].revision_level")
         quantity = _coerce_float_or_none(product.get("quantity"))
         if quantity is None or quantity <= 0:
