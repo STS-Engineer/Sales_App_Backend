@@ -20,6 +20,7 @@ from app.models.contact import Contact
 from app.models.discussion import DiscussionMessage
 from app.models.notification_log import NotificationLog
 from app.models.potential import Potential
+from app.models.product_line_routing import ProductLineRoutingRole
 from app.models.rfq import (
     ALLOWED_TRANSITIONS,
     Rfq,
@@ -84,6 +85,11 @@ from app.services.notifications import (
     record_notification_sent,
 )
 from app.services.offer_preparation_store import get_offer_preparation_data_snapshot
+from app.services.routing import (
+    get_assigned_product_line_acronyms,
+    resolve_product_line_role_assignment,
+    resolve_product_line_role_email,
+)
 from app.utils import emails
 from app.utils.currency import get_eur_exchange_rate
 
@@ -93,50 +99,6 @@ TERMINAL_SUBSTATUSES = {RfqSubStatus.LOST, RfqSubStatus.CANCELED}
 RFI_BLOCKED_FORWARD_PHASES = {RfqPhase.OFFER, RfqPhase.PO, RfqPhase.PROTOTYPE}
 RFQ_FILES_CONTAINER = "rfq-files"
 COSTING_DISCUSSION_PHASES = {RfqSubStatus.FEASIBILITY, RfqSubStatus.PRICING}
-PRODUCT_LINE_MATRIX = {
-    "Chokes": {
-        "email": "ons.ghariani@avocarbon.com",
-        "code": "CHO",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
-    },
-    "Brushes": {
-        "email": "ons.ghariani@avocarbon.com",
-        "code": "BRU",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
-    },
-    "Seals": {
-        "email": "ons.ghariani@avocarbon.com",
-        "code": "SEA",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
-    },
-    "Assembly": {
-        "email": "ons.ghariani@avocarbon.com",
-        "code": "ASS",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
-    },
-    "Advanced material": {
-        "email": "ons.ghariani@avocarbon.com",
-        "code": "ADM",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
-    },
-    "Friction": {
-        "email": "ons.ghariani@avocarbon.com",
-        "code": "FRI",
-        "costing_agent_email": "ons.ghariani@avocarbon.com",
-        "plm_email": "ons.ghariani@avocarbon.com",
-        "rnd_email": "ons.ghariani@avocarbon.com",
-    },
-}
 COSTING_FILE_STATUS_PENDING = "PENDING"
 COSTING_FILE_STATUS_UPLOADED = "UPLOADED"
 COSTING_FILE_STATUS_NA = "NA"
@@ -353,26 +315,23 @@ def _assert_terminal_status_allowed(rfq: Rfq, target_sub_status: RfqSubStatus) -
         )
 
 
-def _can_view_rfq(current_user: User, rfq: Rfq) -> bool:
+async def _can_view_rfq(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
+    if current_user.role == UserRole.OWNER:
+        return True
+    if current_user.role == UserRole.COSTING_TEAM:
+        return await _is_assigned_costing_agent(db, current_user, rfq)
+    if current_user.role == UserRole.RND:
+        return rfq.phase == RfqPhase.COSTING and await _is_assigned_rnd(db, current_user, rfq)
+    if current_user.role == UserRole.PLM:
+        return await _is_assigned_plm(db, current_user, rfq)
     return (
-        current_user.role == UserRole.OWNER
-        or (
-            current_user.role == UserRole.COSTING_TEAM
-            and _is_assigned_costing_agent(current_user, rfq)
-        )
-        or (
-            current_user.role == UserRole.RND
-            and rfq.phase == RfqPhase.COSTING
-            and _is_assigned_rnd(current_user, rfq)
-        )
-        or (current_user.role == UserRole.PLM and _is_assigned_plm(current_user, rfq))
-        or rfq.created_by_email == current_user.email
+        rfq.created_by_email == current_user.email
         or rfq.zone_manager_email == current_user.email
     )
 
 
-def _assert_can_view_rfq(current_user: User, rfq: Rfq) -> None:
-    if not _can_view_rfq(current_user, rfq):
+async def _assert_can_view_rfq(db: AsyncSession, current_user: User, rfq: Rfq) -> None:
+    if not await _can_view_rfq(db, current_user, rfq):
         raise HTTPException(status_code=403, detail="Not authorized to access this RFQ.")
 
 
@@ -429,13 +388,15 @@ def _assert_can_edit_base_rfq_data(current_user: User, rfq: Rfq) -> None:
     )
 
 
-def _assert_can_directly_update_status(
+async def _assert_can_directly_update_status(
+    db: AsyncSession,
     current_user: User,
     rfq: Rfq,
     target_phase: RfqPhase,
 ) -> None:
     if rfq.phase == RfqPhase.COSTING:
-        _assert_costing_phase_assignment(
+        await _assert_costing_phase_assignment(
+            db,
             current_user,
             rfq,
             allow_rnd=True,
@@ -459,7 +420,8 @@ def _assert_can_directly_update_status(
         return
 
     if target_phase == RfqPhase.COSTING:
-        _assert_costing_phase_assignment(
+        await _assert_costing_phase_assignment(
+            db,
             current_user,
             rfq,
             allow_rnd=True,
@@ -553,49 +515,6 @@ async def _get_offer_creator_profile(db: AsyncSession, rfq: Rfq) -> dict[str, st
     }
 
 
-def _normalize_product_line_key(value: str | None) -> str:
-    return str(value or "").strip().casefold()
-
-
-def get_costing_agent_email(acronym: str) -> str | None:
-    normalized_acronym = str(acronym or "").strip().casefold()
-    if not normalized_acronym:
-        return None
-
-    for entry in PRODUCT_LINE_MATRIX.values():
-        entry_code = str(entry.get("code") or "").strip().casefold()
-        if entry_code == normalized_acronym:
-            return str(entry.get("costing_agent_email") or "").strip() or None
-
-    return None
-
-
-def get_plm_email(acronym: str) -> str | None:
-    normalized_acronym = str(acronym or "").strip().casefold()
-    if not normalized_acronym:
-        return None
-
-    for entry in PRODUCT_LINE_MATRIX.values():
-        entry_code = str(entry.get("code") or "").strip().casefold()
-        if entry_code == normalized_acronym:
-            return str(entry.get("plm_email") or "").strip() or None
-
-    return None
-
-
-def get_rnd_email(acronym: str) -> str | None:
-    normalized_acronym = str(acronym or "").strip().casefold()
-    if not normalized_acronym:
-        return None
-
-    for entry in PRODUCT_LINE_MATRIX.values():
-        entry_code = str(entry.get("code") or "").strip().casefold()
-        if entry_code == normalized_acronym:
-            return str(entry.get("rnd_email") or "").strip() or None
-
-    return None
-
-
 def _default_pricing_workflow_state() -> dict[str, object | None]:
     return {
         "workflow_state": PRICING_WORKFLOW_STATE_WAITING_BOM,
@@ -674,40 +593,35 @@ def _set_pricing_workflow_state(rfq: Rfq, **updates: object | None) -> None:
     rfq.costing_file_state = next_state
 
 
-def _get_product_line_acronyms_for_email(contact_key: str, email: str | None) -> list[str]:
-    normalized_email = _normalize_email(email)
-    if not normalized_email:
-        return []
-
-    acronyms: list[str] = []
-    for entry in PRODUCT_LINE_MATRIX.values():
-        if _normalize_email(entry.get(contact_key)) != normalized_email:
-            continue
-        code = str(entry.get("code") or "").strip().upper()
-        if code:
-            acronyms.append(code)
-    return acronyms
-
-
-def _is_assigned_plm(current_user: User, rfq: Rfq) -> bool:
-    return _normalize_email(current_user.email) == _normalize_email(
-        get_plm_email(rfq.product_line_acronym or "")
+async def _is_assigned_plm(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
+    email = await resolve_product_line_role_email(
+        db,
+        role=ProductLineRoutingRole.PLM,
+        acronym=rfq.product_line_acronym,
     )
+    return _normalize_email(current_user.email) == _normalize_email(email)
 
 
-def _is_assigned_costing_agent(current_user: User, rfq: Rfq) -> bool:
-    return _normalize_email(current_user.email) == _normalize_email(
-        get_costing_agent_email(rfq.product_line_acronym or "")
+async def _is_assigned_costing_agent(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
+    email = await resolve_product_line_role_email(
+        db,
+        role=ProductLineRoutingRole.COSTING,
+        acronym=rfq.product_line_acronym,
     )
+    return _normalize_email(current_user.email) == _normalize_email(email)
 
 
-def _is_assigned_rnd(current_user: User, rfq: Rfq) -> bool:
-    return _normalize_email(current_user.email) == _normalize_email(
-        get_rnd_email(rfq.product_line_acronym or "")
+async def _is_assigned_rnd(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
+    email = await resolve_product_line_role_email(
+        db,
+        role=ProductLineRoutingRole.RND,
+        acronym=rfq.product_line_acronym,
     )
+    return _normalize_email(current_user.email) == _normalize_email(email)
 
 
-def _assert_costing_phase_assignment(
+async def _assert_costing_phase_assignment(
+    db: AsyncSession,
     current_user: User,
     rfq: Rfq,
     *,
@@ -718,7 +632,7 @@ def _assert_costing_phase_assignment(
         return
 
     if current_user.role == UserRole.COSTING_TEAM:
-        if not _is_assigned_costing_agent(current_user, rfq):
+        if not await _is_assigned_costing_agent(db, current_user, rfq):
             raise HTTPException(
                 status_code=403,
                 detail="You are not assigned as the costing agent for this RFQ.",
@@ -726,7 +640,7 @@ def _assert_costing_phase_assignment(
         return
 
     if allow_rnd and current_user.role == UserRole.RND:
-        if not _is_assigned_rnd(current_user, rfq):
+        if not await _is_assigned_rnd(db, current_user, rfq):
             raise HTTPException(
                 status_code=403,
                 detail="You are not assigned as the R&D contact for this RFQ.",
@@ -734,7 +648,7 @@ def _assert_costing_phase_assignment(
         return
 
     if allow_plm and current_user.role == UserRole.PLM:
-        if not _is_assigned_plm(current_user, rfq):
+        if not await _is_assigned_plm(db, current_user, rfq):
             raise HTTPException(
                 status_code=403,
                 detail="You are not assigned as the PLM for this RFQ.",
@@ -755,34 +669,6 @@ def _append_revision_note(existing_notes: str | None, prefix: str, detail: str |
     if not current_notes:
         return note_line
     return f"{current_notes}\n{note_line}"
-
-
-def _resolve_product_line_route(rfq: Rfq) -> dict[str, str] | None:
-    rfq_data = dict(rfq.rfq_data or {})
-    candidates = [
-        rfq_data.get("product_name"),
-        rfq_data.get("product_line"),
-        rfq_data.get("productLine"),
-        rfq_data.get("product_line_name"),
-        rfq.product_line_acronym,
-        rfq_data.get("product_line_acronym"),
-    ]
-    normalized_lookup: dict[str, dict[str, str]] = {}
-    for product_line, entry in PRODUCT_LINE_MATRIX.items():
-        normalized_lookup[_normalize_product_line_key(product_line)] = {
-            **entry,
-            "product_line": product_line,
-        }
-        normalized_lookup[_normalize_product_line_key(entry.get("code"))] = {
-            **entry,
-            "product_line": product_line,
-        }
-
-    for candidate in candidates:
-        resolved = normalized_lookup.get(_normalize_product_line_key(candidate))
-        if resolved:
-            return resolved
-    return None
 
 
 def _default_costing_file_state() -> dict[str, str | None]:
@@ -1610,13 +1496,15 @@ async def list_rfqs(
 
     if current_user.role != UserRole.OWNER:
         if current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}:
-            contact_key = {
-                UserRole.COSTING_TEAM: "costing_agent_email",
-                UserRole.RND: "rnd_email",
-                UserRole.PLM: "plm_email",
+            routing_role = {
+                UserRole.COSTING_TEAM: ProductLineRoutingRole.COSTING,
+                UserRole.RND: ProductLineRoutingRole.RND,
+                UserRole.PLM: ProductLineRoutingRole.PLM,
             }[current_user.role]
-            assigned_acronyms = _get_product_line_acronyms_for_email(
-                contact_key, current_user.email
+            assigned_acronyms = await get_assigned_product_line_acronyms(
+                db,
+                role=routing_role,
+                email=current_user.email,
             )
             if not assigned_acronyms:
                 query = query.where(Rfq.rfq_id == "__unassigned__")
@@ -1645,7 +1533,7 @@ async def get_rfq(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
     return rfq
 
 
@@ -1657,7 +1545,7 @@ async def get_rfq_discussion(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     result = await db.execute(
         select(DiscussionMessage, User)
@@ -1682,7 +1570,7 @@ async def create_rfq_discussion_message(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     message = DiscussionMessage(
         rfq_id=rfq_id,
@@ -1704,7 +1592,7 @@ async def get_costing_messages(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     result = await db.execute(
         select(DiscussionMessage, User)
@@ -1729,8 +1617,14 @@ async def create_costing_message(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
-    _assert_costing_phase_assignment(current_user, rfq, allow_rnd=True, allow_plm=True)
+    await _assert_can_view_rfq(db, current_user, rfq)
+    await _assert_costing_phase_assignment(
+        db,
+        current_user,
+        rfq,
+        allow_rnd=True,
+        allow_plm=True,
+    )
 
     if (rfq.phase, rfq.sub_status) not in {
         (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),
@@ -1781,7 +1675,7 @@ async def download_costing_template(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     if rfq.phase == RfqPhase.RFQ and rfq.approved_at is None:
         raise HTTPException(
@@ -1815,7 +1709,7 @@ async def preview_offer_template(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     if rfq.phase != RfqPhase.OFFER:
         raise HTTPException(
@@ -1849,7 +1743,7 @@ async def download_offer_template(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     if rfq.phase != RfqPhase.OFFER:
         raise HTTPException(
@@ -2010,7 +1904,7 @@ async def update_rfq_status(
     ),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_directly_update_status(current_user, rfq, body.phase)
+    await _assert_can_directly_update_status(db, current_user, rfq, body.phase)
 
     effective_phase = body.phase
     if body.sub_status in TERMINAL_SUBSTATUSES:
@@ -2038,7 +1932,7 @@ async def submit_autopsy(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     if rfq.sub_status not in TERMINAL_SUBSTATUSES:
         raise HTTPException(
@@ -2063,7 +1957,7 @@ async def get_audit_logs(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     query = select(AuditLog).where(AuditLog.rfq_id == rfq_id).order_by(AuditLog.timestamp.desc())
     logs = await db.execute(query)
@@ -2077,7 +1971,7 @@ async def get_notification_logs(
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_view_rfq(current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq)
 
     query = (
         select(NotificationLog)
@@ -2151,14 +2045,18 @@ async def validate_rfq(
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
     if body.approved:
-        route_entry = _resolve_product_line_route(refreshed_rfq)
+        route_entry = await resolve_product_line_role_assignment(
+            db,
+            role=ProductLineRoutingRole.COSTING,
+            acronym=refreshed_rfq.product_line_acronym,
+        )
         if route_entry:
             refreshed_data = dict(refreshed_rfq.rfq_data or {})
             recipient_email = str(route_entry.get("email") or "")
             email_sent = emails.send_costing_entry_email(
                 recipient_email,
                 str(route_entry.get("product_line") or ""),
-                str(route_entry.get("code") or ""),
+                str(route_entry.get("acronym") or ""),
                 str(refreshed_data.get("systematic_rfq_id") or ""),
                 _build_rfq_link(refreshed_rfq.rfq_id),
             )
@@ -2181,7 +2079,7 @@ async def costing_review(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_costing_phase_assignment(current_user, rfq)
+    await _assert_costing_phase_assignment(db, current_user, rfq)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY):
         raise HTTPException(
@@ -2236,13 +2134,17 @@ async def costing_review(
         )
 
     if body.scope:
-        route_entry = _resolve_product_line_route(refreshed_rfq)
+        route_entry = await resolve_product_line_role_assignment(
+            db,
+            role=ProductLineRoutingRole.COSTING,
+            acronym=refreshed_rfq.product_line_acronym,
+        )
         if route_entry:
             recipient_email = str(route_entry.get("email") or "")
             handoff_email_sent = emails.send_costing_handoff_email(
                 recipient_email,
                 str(route_entry.get("product_line") or ""),
-                str(route_entry.get("code") or ""),
+                str(route_entry.get("acronym") or ""),
                 systematic_rfq_id,
                 rfq_link,
             )
@@ -2270,7 +2172,7 @@ async def submit_costing_file_action(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.RND, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_costing_phase_assignment(current_user, rfq, allow_rnd=True)
+    await _assert_costing_phase_assignment(db, current_user, rfq, allow_rnd=True)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY):
         raise HTTPException(
@@ -2385,7 +2287,7 @@ async def upload_pricing_bom_file(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_costing_phase_assignment(current_user, rfq)
+    await _assert_costing_phase_assignment(db, current_user, rfq)
 
     if rfq.phase != RfqPhase.COSTING or rfq.sub_status != RfqSubStatus.PRICING:
         raise HTTPException(
@@ -2445,7 +2347,11 @@ async def upload_pricing_bom_file(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
-    recipient_email = get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or ""
+    recipient_email = await resolve_product_line_role_email(
+        db,
+        role=ProductLineRoutingRole.COSTING,
+        acronym=refreshed_rfq.product_line_acronym,
+    ) or ""
     email_sent = emails.send_bom_ready_email(
         recipient_email,
         str(refreshed_data.get("systematic_rfq_id") or ""),
@@ -2470,7 +2376,7 @@ async def upload_pricing_final_price_file(
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_costing_phase_assignment(current_user, rfq)
+    await _assert_costing_phase_assignment(db, current_user, rfq)
 
     if rfq.phase != RfqPhase.COSTING or rfq.sub_status != RfqSubStatus.PRICING:
         raise HTTPException(
@@ -2542,7 +2448,11 @@ async def upload_pricing_final_price_file(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
-    recipient_email = get_plm_email(refreshed_rfq.product_line_acronym or "") or ""
+    recipient_email = await resolve_product_line_role_email(
+        db,
+        role=ProductLineRoutingRole.PLM,
+        acronym=refreshed_rfq.product_line_acronym,
+    ) or ""
     email_sent = emails.send_pricing_ready_email(
         recipient_email,
         str(refreshed_data.get("systematic_rfq_id") or ""),
@@ -2566,7 +2476,7 @@ async def costing_validation(
     current_user: User = Depends(require_role(UserRole.PLM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_costing_phase_assignment(current_user, rfq, allow_plm=True)
+    await _assert_costing_phase_assignment(db, current_user, rfq, allow_plm=True)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.PRICING):
         raise HTTPException(
@@ -2663,9 +2573,11 @@ async def costing_validation(
                 email_type=email_type,
             )
     else:
-        costing_agent_email = (
-            get_costing_agent_email(refreshed_rfq.product_line_acronym or "") or ""
-        )
+        costing_agent_email = await resolve_product_line_role_email(
+            db,
+            role=ProductLineRoutingRole.COSTING,
+            acronym=refreshed_rfq.product_line_acronym,
+        ) or ""
         email_sent = emails.send_costing_rejected_email(
             costing_agent_email,
             refreshed_rfq.created_by_email,
@@ -2708,9 +2620,9 @@ async def advance_status(
         _assert_can_edit_offer_phase(current_user, rfq)
     elif rfq.phase == RfqPhase.COSTING:
         if current_user.role == UserRole.COSTING_TEAM:
-            _assert_costing_phase_assignment(current_user, rfq)
+            await _assert_costing_phase_assignment(db, current_user, rfq)
         elif current_user.role == UserRole.PLM:
-            _assert_costing_phase_assignment(current_user, rfq, allow_plm=True)
+            await _assert_costing_phase_assignment(db, current_user, rfq, allow_plm=True)
         elif current_user.role != UserRole.OWNER:
             raise HTTPException(
                 status_code=403,

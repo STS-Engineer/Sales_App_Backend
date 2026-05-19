@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.notification_log import NotificationLog
+from app.models.product_line_routing import ProductLineRouting, ProductLineRoutingRole
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
 from app.models.user import User, UserRole
 from app.models.validation_matrix import ValidationMatrix
@@ -34,6 +35,42 @@ async def _ensure_matrix(db_session: AsyncSession, acronym: str = "BRU") -> None
             n1_vp_limit=30,
         )
     )
+    await db_session.commit()
+
+
+async def _ensure_routing(
+    db_session: AsyncSession,
+    *,
+    acronym: str = "BRU",
+    email: str = "ons.ghariani@avocarbon.com",
+) -> None:
+    await _ensure_matrix(db_session, acronym)
+    matrix = (
+        await db_session.execute(
+            select(ValidationMatrix).where(ValidationMatrix.acronym == acronym)
+        )
+    ).scalar_one()
+    for role in (
+        ProductLineRoutingRole.COSTING,
+        ProductLineRoutingRole.RND,
+        ProductLineRoutingRole.PLM,
+    ):
+        existing = (
+            await db_session.execute(
+                select(ProductLineRouting).where(
+                    ProductLineRouting.product_line == matrix.product_line,
+                    ProductLineRouting.role == role,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db_session.add(
+                ProductLineRouting(
+                    product_line=matrix.product_line,
+                    role=role,
+                    email=email,
+                )
+            )
     await db_session.commit()
 
 
@@ -73,6 +110,7 @@ async def _create_rfq(
     updated_at: datetime.datetime | None = None,
 ) -> Rfq:
     await _ensure_matrix(db_session, product_line_acronym)
+    await _ensure_routing(db_session, acronym=product_line_acronym)
     creator = await _create_user(db_session, prefix="followup-creator")
     rfq = Rfq(
         phase=phase,

@@ -4,13 +4,10 @@ import logging
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.product_line_routing import ProductLineRoutingRole
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
-from app.routers.rfq import (
-    _build_rfq_link,
-    _effective_pricing_workflow_state,
-    get_costing_agent_email,
-    get_rnd_email,
-)
+from app.routers.rfq import _build_rfq_link, _effective_pricing_workflow_state
+from app.services.routing import resolve_product_line_role_email
 from app.services.notifications import (
     EMAIL_SLA_REMINDER,
     add_notification_logs,
@@ -42,19 +39,32 @@ def _systematic_rfq_id(rfq: Rfq) -> str:
     return str(rfq_data.get("systematic_rfq_id") or "").strip()
 
 
-def _resolve_followup_blocker(rfq: Rfq) -> tuple[str | None, str | None]:
+async def _resolve_followup_blocker(
+    db: AsyncSession,
+    rfq: Rfq,
+) -> tuple[str | None, str | None]:
     if rfq.phase == RfqPhase.RFQ and rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
         return rfq.zone_manager_email, "Commercial Validation"
 
     if rfq.phase == RfqPhase.COSTING and rfq.sub_status == RfqSubStatus.FEASIBILITY:
         state = dict(rfq.costing_file_state or {})
         if not str(state.get("feasibility_status") or "").strip():
-            return get_rnd_email(rfq.product_line_acronym or ""), "R&D Feasibility Assessment"
+            recipient = await resolve_product_line_role_email(
+                db,
+                role=ProductLineRoutingRole.RND,
+                acronym=rfq.product_line_acronym,
+            )
+            return recipient, "R&D Feasibility Assessment"
 
     if rfq.phase == RfqPhase.COSTING and rfq.sub_status == RfqSubStatus.PRICING:
         pricing_state = _effective_pricing_workflow_state(rfq)
         if not isinstance(pricing_state.get("bom_file"), dict):
-            return get_costing_agent_email(rfq.product_line_acronym or ""), "BOM Upload"
+            recipient = await resolve_product_line_role_email(
+                db,
+                role=ProductLineRoutingRole.COSTING,
+                acronym=rfq.product_line_acronym,
+            )
+            return recipient, "BOM Upload"
 
     return None, None
 
@@ -77,7 +87,7 @@ async def run_followup_sweep(db: AsyncSession) -> dict[str, int]:
             summary["skipped"] += 1
             continue
 
-        recipient_email, action_description = _resolve_followup_blocker(rfq)
+        recipient_email, action_description = await _resolve_followup_blocker(db, rfq)
         if not recipient_email or not action_description:
             summary["skipped"] += 1
             continue

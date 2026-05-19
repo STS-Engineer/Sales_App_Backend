@@ -7,7 +7,19 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.routers import actions, auth, chat, chat_offer, chat_potential, internal, owner, products, rfq, users
+from app.routers import (
+    actions,
+    auth,
+    chat,
+    chat_offer,
+    chat_potential,
+    internal,
+    owner,
+    products,
+    rfq,
+    routing_config,
+    users,
+)
 
 app = FastAPI(
     title="RFQ Management API",
@@ -59,6 +71,7 @@ app.include_router(rfq.router)
 app.include_router(products.router)
 app.include_router(actions.router)
 app.include_router(owner.router)
+app.include_router(routing_config.router)
 app.include_router(chat.router)
 app.include_router(chat_offer.router)
 app.include_router(chat_potential.router)

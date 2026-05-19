@@ -1,8 +1,9 @@
 import unicodedata
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.product_line_routing import ProductLineRouting, ProductLineRoutingRole
 from app.models.validation_matrix import ValidationMatrix
 
 # Fixed escalation emails
@@ -70,6 +71,131 @@ def get_zone_manager_email(delivery_zone: str | None) -> tuple[str | None, str |
     if not canonical_zone:
         return None, None
     return ZONE_MANAGER_EMAILS.get(canonical_zone), canonical_zone
+
+
+def _normalize_email(value: str | None) -> str:
+    return str(value or "").strip().casefold()
+
+
+async def _get_validation_matrix_by_identifier(
+    db: AsyncSession,
+    identifier: str | None,
+) -> ValidationMatrix | None:
+    normalized_identifier = str(identifier or "").strip()
+    if not normalized_identifier:
+        return None
+
+    result = await db.execute(
+        select(ValidationMatrix).where(
+            or_(
+                func.lower(ValidationMatrix.product_line) == normalized_identifier.casefold(),
+                func.lower(ValidationMatrix.acronym) == normalized_identifier.casefold(),
+            )
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def resolve_product_line_context(
+    db: AsyncSession,
+    *,
+    identifier: str | None = None,
+    product_line: str | None = None,
+    acronym: str | None = None,
+) -> dict[str, str] | None:
+    matrix = None
+
+    for candidate in (acronym, product_line, identifier):
+        matrix = await _get_validation_matrix_by_identifier(db, candidate)
+        if matrix is not None:
+            break
+
+    if matrix is None:
+        return None
+
+    return {
+        "product_line": str(matrix.product_line or "").strip(),
+        "acronym": str(matrix.acronym or "").strip(),
+    }
+
+
+async def resolve_product_line_role_email(
+    db: AsyncSession,
+    *,
+    role: ProductLineRoutingRole,
+    identifier: str | None = None,
+    product_line: str | None = None,
+    acronym: str | None = None,
+) -> str | None:
+    context = await resolve_product_line_context(
+        db,
+        identifier=identifier,
+        product_line=product_line,
+        acronym=acronym,
+    )
+    if context is None:
+        return None
+
+    result = await db.execute(
+        select(ProductLineRouting.email).where(
+            ProductLineRouting.product_line == context["product_line"],
+            ProductLineRouting.role == role,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def resolve_product_line_role_assignment(
+    db: AsyncSession,
+    *,
+    role: ProductLineRoutingRole,
+    identifier: str | None = None,
+    product_line: str | None = None,
+    acronym: str | None = None,
+) -> dict[str, str] | None:
+    context = await resolve_product_line_context(
+        db,
+        identifier=identifier,
+        product_line=product_line,
+        acronym=acronym,
+    )
+    if context is None:
+        return None
+
+    email = await resolve_product_line_role_email(
+        db,
+        role=role,
+        product_line=context["product_line"],
+    )
+    if not email:
+        return None
+
+    return {**context, "email": email}
+
+
+async def get_assigned_product_line_acronyms(
+    db: AsyncSession,
+    *,
+    role: ProductLineRoutingRole,
+    email: str | None,
+) -> list[str]:
+    normalized_email = _normalize_email(email)
+    if not normalized_email:
+        return []
+
+    result = await db.execute(
+        select(ValidationMatrix.acronym)
+        .join(
+            ProductLineRouting,
+            ProductLineRouting.product_line == ValidationMatrix.product_line,
+        )
+        .where(
+            ProductLineRouting.role == role,
+            func.lower(ProductLineRouting.email) == normalized_email,
+        )
+        .order_by(ValidationMatrix.acronym.asc())
+    )
+    return [str(value or "").strip().upper() for value in result.scalars().all() if value]
 
 
 def calculate_pte(target_price: float, qty_per_year: int) -> float:

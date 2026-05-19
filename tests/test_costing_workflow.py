@@ -8,10 +8,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
 from app.models.discussion import DiscussionMessage
+from app.models.product_line_routing import ProductLineRouting, ProductLineRoutingRole
 from app.models.rfq import Rfq, RfqDocumentType, RfqPhase, RfqSubStatus
 from app.models.user import User, UserRole
+from app.models.validation_matrix import ValidationMatrix
 from app.routers import rfq as rfq_router
 from app.routers.auth import create_access_token
+
+
+PRODUCT_LINE_BY_ACRONYM = {
+    "CHO": "Chokes",
+    "BRU": "Brushes",
+    "SEA": "Seals",
+    "ASS": "Assembly",
+    "ADM": "Advanced material",
+    "FRI": "Friction",
+}
+DEFAULT_ROUTING_EMAIL = "ons.ghariani@avocarbon.com"
 
 
 async def _create_user(
@@ -59,6 +72,11 @@ async def _create_rfq(
     product_name: str = "Brushes",
     document_type: RfqDocumentType = RfqDocumentType.RFQ,
 ) -> Rfq:
+    await _ensure_default_routing(
+        db_session,
+        acronym=product_line_acronym,
+        product_line=product_name,
+    )
     rfq = Rfq(
         document_type=document_type,
         phase=phase,
@@ -81,32 +99,89 @@ async def _create_rfq(
     return rfq
 
 
-def _assign_matrix_contacts(
-    monkeypatch,
+async def _ensure_matrix(
+    db_session: AsyncSession,
+    *,
+    acronym: str,
+    product_line: str | None = None,
+) -> ValidationMatrix:
+    normalized_acronym = str(acronym or "").strip().upper()
+    result = await db_session.execute(
+        select(ValidationMatrix).where(ValidationMatrix.acronym == normalized_acronym)
+    )
+    matrix = result.scalar_one_or_none()
+    if matrix is not None:
+        return matrix
+
+    matrix = ValidationMatrix(
+        product_line=product_line or PRODUCT_LINE_BY_ACRONYM.get(normalized_acronym, normalized_acronym),
+        acronym=normalized_acronym,
+        n3_kam_limit=10,
+        n2_zone_limit=20,
+        n1_vp_limit=30,
+    )
+    db_session.add(matrix)
+    await db_session.commit()
+    await db_session.refresh(matrix)
+    return matrix
+
+
+async def _assign_matrix_contacts(
+    db_session: AsyncSession,
     *,
     product_line_acronym: str = "BRU",
     costing_email: str | None = None,
     rnd_email: str | None = None,
     plm_email: str | None = None,
 ) -> None:
-    next_matrix = {
-        product_line: dict(entry)
-        for product_line, entry in rfq_router.PRODUCT_LINE_MATRIX.items()
-    }
     normalized_acronym = str(product_line_acronym or "").strip().upper()
+    matrix = await _ensure_matrix(
+        db_session,
+        acronym=normalized_acronym,
+        product_line=PRODUCT_LINE_BY_ACRONYM.get(normalized_acronym, normalized_acronym),
+    )
+    updates = {
+        ProductLineRoutingRole.COSTING: costing_email,
+        ProductLineRoutingRole.RND: rnd_email,
+        ProductLineRoutingRole.PLM: plm_email,
+    }
 
-    for entry in next_matrix.values():
-        if str(entry.get("code") or "").strip().upper() != normalized_acronym:
+    for role, email in updates.items():
+        if email is None:
             continue
-        if costing_email is not None:
-            entry["costing_agent_email"] = costing_email
-        if rnd_email is not None:
-            entry["rnd_email"] = rnd_email
-        if plm_email is not None:
-            entry["plm_email"] = plm_email
-        break
+        result = await db_session.execute(
+            select(ProductLineRouting).where(
+                ProductLineRouting.product_line == matrix.product_line,
+                ProductLineRouting.role == role,
+            )
+        )
+        entry = result.scalar_one_or_none()
+        if entry is None:
+            entry = ProductLineRouting(
+                product_line=matrix.product_line,
+                role=role,
+                email=email,
+            )
+            db_session.add(entry)
+        else:
+            entry.email = email
 
-    monkeypatch.setattr(rfq_router, "PRODUCT_LINE_MATRIX", next_matrix)
+    await db_session.commit()
+
+
+async def _ensure_default_routing(
+    db_session: AsyncSession,
+    *,
+    acronym: str,
+    product_line: str | None = None,
+) -> None:
+    await _assign_matrix_contacts(
+        db_session,
+        product_line_acronym=acronym,
+        costing_email=DEFAULT_ROUTING_EMAIL,
+        rnd_email=DEFAULT_ROUTING_EMAIL,
+        plm_email=DEFAULT_ROUTING_EMAIL,
+    )
 
 
 @pytest.mark.asyncio
@@ -198,7 +273,7 @@ async def test_costing_review_approval_sends_reception_and_handoff_emails(
         role=UserRole.COSTING_TEAM,
         full_name="Costing Reviewer",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -294,8 +369,8 @@ async def test_costing_review_approval_syncs_assembly_rfq_only_for_ass_product_l
         role=UserRole.COSTING_TEAM,
         full_name="Assembly Costing Reviewer",
     )
-    _assign_matrix_contacts(
-        monkeypatch,
+    await _assign_matrix_contacts(
+        db_session,
         product_line_acronym="ASS",
         costing_email=costing_user.email,
     )
@@ -363,7 +438,7 @@ async def test_costing_review_rejection_sends_reception_email_without_handoff(
         role=UserRole.COSTING_TEAM,
         full_name="Reject Reviewer",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -449,7 +524,7 @@ async def test_costing_file_action_supports_na_and_uploaded(
         role=UserRole.COSTING_TEAM,
         full_name="File Reviewer",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     feasibility_email_calls: list[tuple[str, str, str, str]] = []
     monkeypatch.setattr(
         rfq_router.emails,
@@ -554,7 +629,7 @@ async def test_rnd_can_submit_feasibility_file_action_with_status(
         role=UserRole.RND,
         full_name="RND Engineer",
     )
-    _assign_matrix_contacts(monkeypatch, rnd_email=rnd_user.email)
+    await _assign_matrix_contacts(db_session, rnd_email=rnd_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -640,7 +715,7 @@ async def test_costing_file_action_rejects_invalid_feasibility_status(
         role=UserRole.COSTING_TEAM,
         full_name="Invalid Status Reviewer",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -687,7 +762,7 @@ async def test_unassigned_rnd_cannot_submit_feasibility_file_action(
         role=UserRole.RND,
         full_name="Unassigned RND Engineer",
     )
-    _assign_matrix_contacts(monkeypatch, rnd_email=assigned_rnd_user.email)
+    await _assign_matrix_contacts(db_session, rnd_email=assigned_rnd_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -747,7 +822,7 @@ async def test_list_rfqs_filters_assigned_product_lines_for_matrix_roles(
     else:
         assign_kwargs["plm_email"] = matrix_user.email
 
-    _assign_matrix_contacts(monkeypatch, product_line_acronym="BRU", **assign_kwargs)
+    await _assign_matrix_contacts(db_session, product_line_acronym="BRU", **assign_kwargs)
 
     assigned_costing_rfq = await _create_rfq(
         db_session,
@@ -812,7 +887,7 @@ async def test_unassigned_costing_user_cannot_run_costing_review(
         role=UserRole.COSTING_TEAM,
         full_name="Unassigned Costing Reviewer",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=assigned_costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=assigned_costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -849,7 +924,7 @@ async def test_advance_to_pricing_requires_costing_file_action(
         role=UserRole.COSTING_TEAM,
         full_name="Advance Reviewer",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -894,7 +969,7 @@ async def test_costing_messages_store_recipient_and_unify_costing_thread(
         role=UserRole.COSTING_TEAM,
         full_name="Message Sender",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -987,7 +1062,7 @@ async def test_pricing_bom_upload_persists_file_in_costing_files(
         role=UserRole.COSTING_TEAM,
         full_name="Pricing BOM User",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -1050,7 +1125,7 @@ async def test_pricing_final_price_upload_requires_bom_and_persists_file(
         role=UserRole.COSTING_TEAM,
         full_name="Pricing User",
     )
-    _assign_matrix_contacts(monkeypatch, costing_email=costing_user.email)
+    await _assign_matrix_contacts(db_session, costing_email=costing_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -1129,7 +1204,7 @@ async def test_pricing_validation_approval_keeps_rfq_offer_handoff(
         role=UserRole.PLM,
         full_name="Pricing Approve RFQ PLM",
     )
-    _assign_matrix_contacts(monkeypatch, plm_email=plm_user.email)
+    await _assign_matrix_contacts(db_session, plm_email=plm_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -1200,7 +1275,7 @@ async def test_pricing_validation_approval_closes_rfi_and_emails_requester(
         role=UserRole.PLM,
         full_name="Pricing Approve RFI PLM",
     )
-    _assign_matrix_contacts(monkeypatch, plm_email=plm_user.email)
+    await _assign_matrix_contacts(db_session, plm_email=plm_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
@@ -1283,8 +1358,8 @@ async def test_pricing_validation_rejection_records_timestamp_and_validator(
         role=UserRole.PLM,
         full_name="Pricing Reject RFQ PLM",
     )
-    _assign_matrix_contacts(
-        monkeypatch,
+    await _assign_matrix_contacts(
+        db_session,
         costing_email=costing_user.email,
         plm_email=plm_user.email
     )
@@ -1370,7 +1445,7 @@ async def test_rfi_cannot_be_advanced_to_offer_with_generic_transition(
         role=UserRole.PLM,
         full_name="RFI No Offer PLM",
     )
-    _assign_matrix_contacts(monkeypatch, plm_email=plm_user.email)
+    await _assign_matrix_contacts(db_session, plm_email=plm_user.email)
     rfq = await _create_rfq(
         db_session,
         creator=creator,
