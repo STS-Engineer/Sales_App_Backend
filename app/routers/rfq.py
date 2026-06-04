@@ -44,6 +44,7 @@ from app.schemas.rfq import (
     CostingReviewRequest,
     NotificationLogOut,
     PhaseStatusUpdateRequest,
+    ProceedToFormalRequest,
     RequestRevisionRequest,
     RfqCreateRequest,
     RfqDataUpdateRequest,
@@ -1262,10 +1263,19 @@ async def update_rfq_data(
 @router.post("/{rfq_id}/proceed-to-rfq", response_model=RfqOut)
 async def proceed_to_rfq(
     rfq_id: str,
+    body: ProceedToFormalRequest | None = None,
     db: AsyncSession = Depends(get_db),
     db3: AsyncSession = Depends(get_db3),
     current_user: User = Depends(get_current_user),
 ):
+    request_body = body or ProceedToFormalRequest()
+    target_type = request_body.document_type
+    if target_type not in {RfqDocumentType.RFQ, RfqDocumentType.RFI}:
+        raise HTTPException(
+            status_code=400,
+            detail="Potential can only be converted to RFQ or RFI.",
+        )
+
     rfq = await _get_rfq_or_404(db, rfq_id)
     _assert_can_edit_rfq_phase(current_user, rfq)
 
@@ -1277,7 +1287,7 @@ async def proceed_to_rfq(
     if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ):
         raise HTTPException(
             status_code=409,
-            detail="Only Potential requests in RFQ/NEW_RFQ can be converted to RFQ.",
+            detail="Only Potential requests in RFQ/NEW_RFQ can be converted to RFQ or RFI.",
         )
 
     potential = rfq.potential
@@ -1298,11 +1308,12 @@ async def proceed_to_rfq(
         sync_potential_to_rfq_data(potential, rfq.rfq_data)
     )
     rfq.rfq_data = await _sync_rfq_product_derived_fields(rfq.rfq_data, db3=db3)
-    rfq.document_type = RfqDocumentType.RFQ
+    rfq.document_type = target_type
     rfq.phase = RfqPhase.RFQ
     rfq.sub_status = RfqSubStatus.NEW_RFQ
 
-    await log_action(db, rfq_id, "Potential promoted to formal RFQ", current_user.email)
+    label = target_type.value
+    await log_action(db, rfq_id, f"Potential promoted to formal {label}", current_user.email)
     await db.commit()
     return await _get_rfq_or_404(db, rfq_id)
 

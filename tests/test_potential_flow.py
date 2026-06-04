@@ -371,6 +371,42 @@ async def test_potential_chat_updates_fields_calculates_margin_and_formal_chat_i
 
 
 @pytest.mark.asyncio
+async def test_potential_step_by_step_prompt_does_not_force_product_count_first(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    headers = await _create_headers(db_session)
+    create_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "potential"},
+        headers=headers,
+    )
+    rfq_id = create_response.json()["rfq_id"]
+    captured_system_prompts: list[str] = []
+
+    async def _fake_create(*args, **kwargs):
+        captured_system_prompts.append(kwargs["messages"][0]["content"])
+        return _build_completion(content="Who is the customer and where are they located?")
+
+    monkeypatch.setattr(chat_potential.client.chat.completions, "create", _fake_create)
+
+    chat_response = await client.post(
+        "/api/chat/potential",
+        json={"rfq_id": rfq_id, "message": "1"},
+        headers=headers,
+    )
+
+    assert chat_response.status_code == 200
+    assert captured_system_prompts
+    system_prompt = captured_system_prompts[0]
+    assert "Do NOT start by asking how many part numbers/products are included in the request." in system_prompt
+    assert "Only collect product rows if the user voluntarily provides product details or explicitly asks to add products." in system_prompt
+    assert "Current next question:\nWho is the customer and where are they located?" in system_prompt
+    assert "First, ask the user how many part numbers/products are included in this request." not in system_prompt
+
+
+@pytest.mark.asyncio
 async def test_proceed_to_formal_rfq_syncs_fields_locks_potential_and_enables_formal_chat(
     client: AsyncClient,
     db_session: AsyncSession,

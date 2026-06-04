@@ -495,6 +495,11 @@ class RfqCreateRequest(BaseModel):
     rfq_data: RfqDataPayload | None = None
 
 
+class ProceedToFormalRequest(BaseModel):
+    """Body for POST /api/rfq/{id}/proceed-to-rfq — choose RFQ or RFI."""
+    document_type: RfqDocumentType = RfqDocumentType.RFQ
+
+
 class RfqDataUpdateRequest(BaseModel):
     rfq_data: RfqDataPayload
 

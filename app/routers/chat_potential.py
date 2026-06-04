@@ -99,20 +99,6 @@ POTENTIAL_TOOL_FIELD_PROPERTIES = {
     field_name: {"type": "number" if field_type == "float" else "string"}
     for field_name, field_type in POTENTIAL_ALLOWED_FIELDS.items()
 }
-POTENTIAL_TOOL_FIELD_PROPERTIES["products"] = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "properties": {
-            "part_number": {"type": "string"},
-            "revision_level": {"type": "string"},
-            "quantity": {"type": "number"},
-            "target_price": {"type": "number"},
-            "target_to": {"type": "number"},
-        },
-    },
-}
-POTENTIAL_TOOL_FIELD_PROPERTIES["total_target_to"] = {"type": "number"}
 
 TOOLS = [
     {
@@ -169,10 +155,17 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class ChatEditRequest(BaseModel):
+    rfq_id: str
+    visible_message_index: int
+    message: str
+
+
 class ChatResponse(BaseModel):
     response: str
     tool_calls_used: list[str] | None = None
     rfq: RfqOut | None = None
+    lock_chat: bool = False
 
 
 def _can_view_rfq(current_user: User, rfq: Rfq) -> bool:
@@ -204,7 +197,7 @@ def _find_next_question(potential: Potential) -> tuple[str, list[str]]:
         if missing:
             return question, missing
     return (
-        "All Potential fields are already captured. Summarize the opportunity and invite the user to proceed to the formal RFQ.",
+        "All Potential fields are captured. Output ONLY this exact sentence and nothing else: 'If you're ready, we can proceed to the formal RFQ or RFI.'",
         [],
     )
 
@@ -302,6 +295,179 @@ def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
     return text
 
 
+def _sanitize_chat_history(history: list[dict] | None) -> list[dict]:
+    raw_history = list(history or [])
+    valid_tool_call_ids = {
+        message.get("tool_call_id")
+        for message in raw_history
+        if isinstance(message, dict) and message.get("role") == "tool"
+    }
+
+    sanitized_history: list[dict] = []
+    for message in raw_history:
+        if not isinstance(message, dict):
+            continue
+
+        next_message = dict(message)
+        role = next_message.get("role")
+        content = next_message.get("content")
+
+        if role == "assistant":
+            tool_calls = next_message.get("tool_calls")
+            if tool_calls:
+                filtered_tool_calls = [
+                    tool_call
+                    for tool_call in list(tool_calls)
+                    if tool_call.get("id") in valid_tool_call_ids
+                ]
+                if filtered_tool_calls:
+                    next_message["tool_calls"] = filtered_tool_calls
+                else:
+                    next_message.pop("tool_calls", None)
+                    if not next_message.get("content"):
+                        continue
+
+            if isinstance(content, str):
+                sanitized_content = _sanitize_assistant_text(content)
+                if sanitized_content:
+                    next_message["content"] = sanitized_content
+                elif not next_message.get("tool_calls"):
+                    continue
+                else:
+                    next_message["content"] = None
+
+        elif role == "user":
+            if not isinstance(content, str) or not content.strip():
+                continue
+            next_message["content"] = str(content).strip()
+
+        elif role == "tool":
+            if not next_message.get("tool_call_id"):
+                continue
+            if not isinstance(content, str):
+                next_message["content"] = json.dumps(content or {})
+        else:
+            continue
+
+        sanitized_history.append(next_message)
+
+    return sanitized_history
+
+
+def _slice_history_for_llm(history: list[dict], max_messages: int = 20) -> list[dict]:
+    if len(history) <= max_messages:
+        return list(history)
+
+    start_idx = max(0, len(history) - max_messages)
+    while start_idx > 0 and history[start_idx].get("role") == "tool":
+        start_idx -= 1
+
+    if (
+        start_idx > 0
+        and history[start_idx - 1].get("role") == "assistant"
+        and history[start_idx - 1].get("tool_calls")
+    ):
+        start_idx -= 1
+
+    return list(history)[start_idx:]
+
+
+def _map_visible_potential_chat_entries(history: list[dict] | None) -> list[dict]:
+    visible_entries: list[dict] = []
+    for raw_index, entry in enumerate(list(history or [])):
+        if not isinstance(entry, dict):
+            continue
+
+        role = entry.get("role")
+        content = entry.get("content")
+        if role not in {"assistant", "user"}:
+            continue
+        if role == "assistant" and entry.get("tool_calls"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        visible_entries.append(
+            {
+                "raw_index": raw_index,
+                "role": role,
+                "content": content,
+            }
+        )
+
+    return visible_entries
+
+
+def _truncate_potential_chat_history_for_edit(
+    history: list[dict] | None,
+    visible_message_index: int,
+) -> list[dict]:
+    if visible_message_index < 0:
+        raise ValueError("Invalid chat message index.")
+
+    raw_history = [dict(entry) for entry in list(history or []) if isinstance(entry, dict)]
+    visible_history = _map_visible_potential_chat_entries(raw_history)
+
+    if visible_message_index >= len(visible_history):
+        raise LookupError("Chat message not found.")
+
+    target_entry = visible_history[visible_message_index]
+    if target_entry["role"] != "user":
+        raise ValueError("Only user messages can be edited.")
+
+    return list(raw_history[: target_entry["raw_index"]])
+
+
+def _build_dynamic_prompt(
+    *, potential: Potential, rfq: Rfq, next_question: str, missing_fields: list[str]
+) -> str:
+    return f"""
+You are the Potential Opportunity Intake Assistant. This is a pre-sales assessment before a formal RFQ exists.
+
+You must ONLY use these database fields:
+{json.dumps(sorted(POTENTIAL_ALLOWED_FIELDS.keys()), indent=2)}
+
+Math rule:
+- When the user provides Sales (k€) and Margin (%), you must calculate Margin (k€) autonomously and save it with updatePotentialFields.
+
+Guided interview questions. Use these exact questions as your guide:
+1. Who is the customer and where are they located?
+2. What is the application, and what industry is this product serving (Auto, Consumer, Industry...)?
+3. What kind of product do we plan to deliver (Assemblies, brushes, chokes, etc.)?
+4. Why do we engage in such a project? Give reasons. Whose idea is this (Ours or The customer's)?
+5. Who is supplying the function today? (List competition)
+6. Why do we think we can take this business? (Competitiveness, Know-how, Proximity, Flexibility)
+7. Do we have technical capabilities? (Yes it is easy, Moderately complicated, Complex)
+8. Is it related to our strategy? (Integrates several components, Good margin, Mandatory to move forward)
+9. What are the business perspectives? (Sales in k€, Margin in %, Start of production)
+10. What are the development efforts to integrate (High, Medium, Low)?
+11. What are the side effects of engaging (Gain more business, Acquire skills)?
+12. What are the risks TO DO? (e.g., Lose IP, Spend money for nothing, Engage in price war)
+13. What are the risks NOT TO DO? (e.g., Lose opportunity, Decrease current business)
+
+Core rules:
+- Save every valid user-provided field immediately with updatePotentialFields before you continue.
+- Never ask for fields that are already populated in the current database state.
+- Ask one focused question at a time unless the user chooses to provide a paragraph.
+- If the user gives a full paragraph, extract every possible Potential field and save them in one updatePotentialFields call.
+- Use checkGroupeExistence when the customer is provided.
+- Use checkContactExistence when the contact email is provided.
+- The guided interview order and the current next question take priority.
+- Keep responses concise and in Markdown.
+- Do NOT ask about products, part numbers, quantities, or target prices at any point.
+- When all fields are captured, output ONLY this exact sentence and nothing else: "If you're ready, we can proceed to the formal RFQ or RFI."
+
+Current next question:
+{next_question}
+
+Current missing fields for that question:
+{json.dumps(missing_fields)}
+
+Current Potential database state:
+{json.dumps(_serialize_potential_state(potential), indent=2)}
+""".strip()
+
+
 async def _execute_tool_calls(
     *,
     db: AsyncSession,
@@ -363,33 +529,22 @@ async def _execute_tool_calls(
         elif func_name == "updatePotentialFields":
             fields = args.get("fields_to_update", {})
             fields = dict(fields) if isinstance(fields, dict) else {}
-            product_fields = {
-                key: fields.pop(key)
-                for key in ("products", "total_target_to")
-                if key in fields
-            }
+            for key in ("products", "total_target_to"):
+                fields.pop(key, None)
             filtered_fields, ignored_fields = await update_potential_fields(
                 db=db,
                 potential=potential,
                 fields_to_update=fields,
             )
-            if product_fields:
-                next_rfq_data = dict(rfq.rfq_data or {})
-                next_rfq_data.update(product_fields)
-                rfq.rfq_data = normalize_rfq_data_products(
-                    next_rfq_data,
-                    products_authoritative="products" in product_fields,
-                )
             await db.flush()
             tool_response_text = json.dumps(
                 {
                     "success": True,
-                    "fields_updated": list(filtered_fields.keys()) + list(product_fields.keys()),
+                    "fields_updated": list(filtered_fields.keys()),
                     "ignored_fields": ignored_fields,
                     "potential_systematic_id": potential.potential_systematic_id,
                     "margin_keur": potential.margin_keur,
                     "potential": _serialize_potential_state(potential),
-                    "rfq_data": rfq.rfq_data,
                 }
             )
         else:
@@ -407,6 +562,135 @@ async def _execute_tool_calls(
         )
 
     return tool_messages
+
+
+async def _generate_potential_response(
+    *,
+    db: AsyncSession,
+    rfq: Rfq,
+    potential: Potential,
+    history: list[dict],
+    messages_for_llm: list[dict],
+) -> tuple[str, list[str]]:
+    tool_calls_used: list[str] = []
+    remaining_tool_rounds = 2
+
+    while True:
+        completion_kwargs = {
+            "model": "gpt-5.2",
+            "messages": messages_for_llm,
+            "temperature": 0.2,
+        }
+        if remaining_tool_rounds > 0:
+            completion_kwargs["tools"] = TOOLS
+            completion_kwargs["tool_choice"] = "auto"
+
+        completion = await client.chat.completions.create(**completion_kwargs)
+        ai_message = completion.choices[0].message
+        normalized_tool_calls = (
+            _normalize_tool_calls(getattr(ai_message, "tool_calls", None))
+            if remaining_tool_rounds > 0
+            else []
+        )
+
+        if not normalized_tool_calls:
+            return _sanitize_assistant_text(ai_message.content), tool_calls_used
+
+        assistant_tool_message = _build_tool_call_assistant_message(normalized_tool_calls)
+        history.append(assistant_tool_message)
+        messages_for_llm.append(assistant_tool_message)
+
+        tool_messages = await _execute_tool_calls(
+            db=db,
+            rfq=rfq,
+            potential=potential,
+            tool_calls=normalized_tool_calls,
+            tool_calls_used=tool_calls_used,
+        )
+        for tool_message in tool_messages:
+            history.append(tool_message)
+            messages_for_llm.append(tool_message)
+
+        remaining_tool_rounds -= 1
+        next_question, missing_fields = _find_next_question(potential)
+        messages_for_llm[0] = {
+            "role": "system",
+            "content": _build_dynamic_prompt(
+                potential=potential,
+                rfq=rfq,
+                next_question=next_question,
+                missing_fields=missing_fields,
+            ),
+        }
+
+        if remaining_tool_rounds <= 0:
+            final_completion = await client.chat.completions.create(
+                model="gpt-5.2",
+                messages=messages_for_llm,
+                temperature=0.2,
+            )
+            return (
+                _sanitize_assistant_text(final_completion.choices[0].message.content),
+                tool_calls_used,
+            )
+
+
+@router.post("/edit", response_model=ChatResponse)
+async def edit_potential_chat_message(
+    req: ChatEditRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Rfq)
+        .options(selectinload(Rfq.potential))
+        .where(Rfq.rfq_id == req.rfq_id)
+    )
+    rfq = result.scalar_one_or_none()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="RFQ not found")
+    if not _can_view_rfq(current_user, rfq):
+        raise HTTPException(status_code=403, detail="Not authorized to access this RFQ.")
+
+    document_type = rfq.document_type
+    document_type_value = (
+        document_type.value
+        if isinstance(document_type, RfqDocumentType)
+        else str(document_type or "")
+    ).strip().upper()
+    if document_type_value != RfqDocumentType.POTENTIAL.value:
+        raise HTTPException(
+            status_code=409,
+            detail="The Potential assistant is locked for this request.",
+        )
+
+    edited_message = str(req.message or "").strip()
+    if not edited_message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    potential = rfq.potential
+    if potential is None:
+        raise HTTPException(status_code=404, detail="Chat message not found.")
+
+    history = _sanitize_chat_history(potential.chat_history or [])
+    try:
+        truncated_history = _truncate_potential_chat_history_for_edit(
+            history,
+            req.visible_message_index,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    potential.chat_history = truncated_history
+    await db.flush()
+
+    return await handle_potential_chat(
+        ChatRequest(rfq_id=req.rfq_id, message=edited_message),
+        db=db,
+        current_user=current_user,
+    )
 
 
 @router.post("", response_model=ChatResponse)
@@ -444,107 +728,81 @@ async def handle_potential_chat(
         await db.flush()
         rfq.potential = potential
 
-    history = list(potential.chat_history or [])
+    INVITATION = "If you're ready, we can proceed to the formal RFQ or RFI."
+    CONFIRMATION = "Perfect! Use the **Proceed as RFQ** or **Proceed as RFI** button to continue."
+    # Substring used for detection — robust against minor AI phrasing variations
+    INVITATION_MARKER = "proceed to the formal rfq or rfi"
+
+    history = _sanitize_chat_history(potential.chat_history or [])
     if not history:
         history.append({"role": "assistant", "content": POTENTIAL_INITIAL_GREETING})
-    history.append({"role": "user", "content": req.message})
 
     next_question, missing_fields = _find_next_question(potential)
-    dynamic_prompt = f"""
-You are the Potential Opportunity Intake Assistant. This is a pre-sales assessment before a formal RFQ exists.
+    all_fields_complete = len(missing_fields) == 0
 
-You must ONLY use these database fields:
-{json.dumps(sorted(POTENTIAL_ALLOWED_FIELDS.keys()), indent=2)}
+    last_assistant_content = next(
+        (
+            str(msg.get("content") or "").strip()
+            for msg in reversed(history)
+            if msg.get("role") == "assistant" and not msg.get("tool_calls")
+            and str(msg.get("content") or "").strip()
+        ),
+        "",
+    )
+    invitation_already_sent = INVITATION_MARKER in last_assistant_content.lower()
 
-Potential product intake:
-- First, ask the user how many part numbers/products are included in this request.
-- Once they answer, ask them to provide the Part Number, Revision Level, Quantity, and Target Price for each product.
-- Save those product rows with updatePotentialFields using the parent RFQ JSON keys `products` and `total_target_to`; do not store products on the Potential table.
+    history.append({"role": "user", "content": req.message})
 
-Math rule:
-- When the user provides Sales (k€) and Margin (%), you must calculate Margin (k€) autonomously and save it with updatePotentialFields.
+    async def _commit_and_refresh(reply_text: str, lock: bool) -> ChatResponse:
+        history.append({"role": "assistant", "content": reply_text})
+        potential.chat_history = history
+        await db.commit()
+        result = await db.execute(
+            select(Rfq)
+            .options(selectinload(Rfq.potential))
+            .where(Rfq.rfq_id == req.rfq_id)
+        )
+        refreshed = result.scalar_one_or_none()
+        if refreshed:
+            refreshed.rfq_data = normalize_rfq_data_products(refreshed.rfq_data)
+        return ChatResponse(response=reply_text, lock_chat=lock, rfq=refreshed)
 
-Guided interview questions. Use these exact questions as your guide:
-1. Who is the customer and where are they located?
-2. What is the application, and what industry is this product serving (Auto, Consumer, Industry...)?
-3. What kind of product do we plan to deliver (Assemblies, brushes, chokes, etc.)?
-4. Why do we engage in such a project? Give reasons. Whose idea is this (Ours or The customer's)?
-5. Who is supplying the function today? (List competition)
-6. Why do we think we can take this business? (Competitiveness, Know-how, Proximity, Flexibility)
-7. Do we have technical capabilities? (Yes it is easy, Moderately complicated, Complex)
-8. Is it related to our strategy? (Integrates several components, Good margin, Mandatory to move forward)
-9. What are the business perspectives? (Sales in k€, Margin in %, Start of production)
-10. What are the development efforts to integrate (High, Medium, Low)?
-11. What are the side effects of engaging (Gain more business, Acquire skills)?
-12. What are the risks TO DO? (e.g., Lose IP, Spend money for nothing, Engage in price war)
-13. What are the risks NOT TO DO? (e.g., Lose opportunity, Decrease current business)
+    # All fields complete + invitation already shown → user is accepting → lock
+    if all_fields_complete and invitation_already_sent:
+        return await _commit_and_refresh(CONFIRMATION, lock=True)
 
-Core rules:
-- Save every valid user-provided field immediately with updatePotentialFields before you continue.
-- Never ask for fields that are already populated in the current database state.
-- Ask one focused question at a time unless the user chooses to provide a paragraph.
-- If the user gives a full paragraph, extract every possible Potential field and save them in one updatePotentialFields call.
-- Use checkGroupeExistence when the customer is provided.
-- Use checkContactExistence when the contact email is provided.
-- Keep responses concise and in Markdown.
+    # All fields already complete but invitation not yet shown → send it directly
+    if all_fields_complete and not invitation_already_sent:
+        return await _commit_and_refresh(INVITATION, lock=False)
 
-Current next question:
-{next_question}
+    dynamic_prompt = _build_dynamic_prompt(
+        potential=potential,
+        rfq=rfq,
+        next_question=next_question,
+        missing_fields=missing_fields,
+    )
 
-Current missing fields for that question:
-{json.dumps(missing_fields)}
-
-Current Potential database state:
-{json.dumps(_serialize_potential_state(potential), indent=2)}
-
-Current parent RFQ product state:
-{json.dumps(normalize_rfq_data_products(rfq.rfq_data), indent=2)}
-""".strip()
-
-    messages_for_llm = [{"role": "system", "content": dynamic_prompt}, *history[-20:]]
+    sliced_history = _slice_history_for_llm(history, max_messages=20)
+    messages_for_llm = [{"role": "system", "content": dynamic_prompt}, *sliced_history]
 
     tool_calls_used: list[str] = []
     final_text = ""
 
     try:
-        completion = await client.chat.completions.create(
-            model="gpt-5.2",
-            messages=messages_for_llm,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.2,
+        final_text, tool_calls_used = await _generate_potential_response(
+            db=db,
+            rfq=rfq,
+            potential=potential,
+            history=history,
+            messages_for_llm=messages_for_llm,
         )
-        ai_message = completion.choices[0].message
-        normalized_tool_calls = _normalize_tool_calls(getattr(ai_message, "tool_calls", None))
-
-        if normalized_tool_calls:
-            assistant_tool_message = _build_tool_call_assistant_message(normalized_tool_calls)
-            history.append(assistant_tool_message)
-            messages_for_llm.append(assistant_tool_message)
-
-            tool_messages = await _execute_tool_calls(
-                db=db,
-                rfq=rfq,
-                potential=potential,
-                tool_calls=normalized_tool_calls,
-                tool_calls_used=tool_calls_used,
-            )
-            for tool_message in tool_messages:
-                history.append(tool_message)
-                messages_for_llm.append(tool_message)
-
-            follow_up_completion = await client.chat.completions.create(
-                model="gpt-5.2",
-                messages=messages_for_llm,
-                temperature=0.2,
-            )
-            final_text = _sanitize_assistant_text(
-                follow_up_completion.choices[0].message.content
-            )
-        else:
-            final_text = _sanitize_assistant_text(ai_message.content)
-
-        if not final_text:
+        # After the AI responds (possibly saving the last field), re-check completion.
+        # If all fields are now complete, override with the exact invitation string so
+        # the next turn can detect it reliably via INVITATION_MARKER.
+        _, post_missing = _find_next_question(potential)
+        if not post_missing:
+            final_text = INVITATION
+        elif not final_text:
             final_text = (
                 "I've saved the latest Potential details. "
                 "Please continue with the next missing information."

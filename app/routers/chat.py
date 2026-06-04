@@ -557,6 +557,10 @@ def _get_missing_fields_for_step(
 ) -> list[str]:
     missing_fields: list[str] = []
     for field_name in _get_step_fields(step_fields, include_optional=True):
+        if field_name == "costing_data":
+            # Never surface costing_data as a generic missing field.
+            # It is asked only via the retrieveProducts product-specific flow (rule #6).
+            continue
         if field_name == "products":
             product_missing_fields = get_incomplete_product_fields(
                 data,
@@ -804,6 +808,7 @@ def _is_field_filled(data: dict, field_name: str, *, include_optional: bool = Tr
     if isinstance(value, (int, float)):
         return True
     if isinstance(value, str):
+        # "_" means the user explicitly skipped — treat as filled
         return value.strip() != ""
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
@@ -823,7 +828,7 @@ def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[in
                 if not _is_field_filled(data, field)
             ]
             if chat_mode == "potential"
-            else _get_missing_required_fields_for_step(data, fields)
+            else _get_missing_fields_for_step(data, fields)
         )
         if missing_fields:
             return step_number, missing_fields
@@ -1981,7 +1986,7 @@ If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combin
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 FORMATTING RULE: When a missing field has allowed options, keep those options inline or nested under that field; never promote option values into separate top-level numbered items.
-CRITICAL OPTIONAL FIELD RULE: If the next missing field is marked as (OPTIONAL), you MUST explicitly tell the user it is not mandatory. Example: "What is the Revision level? This is optional, so if you don't have it, just type 'skip'." If the user indicates they want to skip it, you MUST call the updateFormFields tool and set that field's value to "N/A" or "Not provided" so it is removed from the missing fields list, and immediately move to the next question.
+CRITICAL OPTIONAL FIELD RULE: You MUST ask every field, including those marked (OPTIONAL). When asking an optional field, always append on a new line: "*(Optional — type **skip** to leave it blank.)*". If the user types "skip", "none", "N/A", or provides no useful answer, you MUST immediately call updateFormFields and save the value "_" for that field, then move to the next question. Never leave an optional field unanswered.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
 2. NO GUESSING/PROPOSITIONS: When asking the user for missing information, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples, parenthetical hints, or sample values for open-ended fields.
@@ -2444,6 +2449,21 @@ async def handle_chat(
 
     chat_mode = _normalize_chat_mode(rfq, req.chat_mode)
     extracted_data = _normalize_rfq_data_fields(rfq.rfq_data)
+
+    # Auto-fill costing_data = "_" only once the interview has moved past it
+    # (fields that come after costing_data in step 1 are already filled).
+    # This means the retrieveProducts flow had its chance and produced no questions.
+    _FIELDS_AFTER_COSTING_DATA = {
+        "rfq_files", "products", "delivery_zone", "delivery_plant", "country",
+        "po_date", "sop_year", "rfq_reception_date", "quotation_expected_date",
+        "contact_name", "contact_role", "contact_phone", "contact_email",
+    }
+    if (
+        chat_mode != "potential"
+        and not _is_field_filled(extracted_data, "costing_data")
+        and any(_is_field_filled(extracted_data, f) for f in _FIELDS_AFTER_COSTING_DATA)
+    ):
+        extracted_data["costing_data"] = "_"
 
     extracted_data["chat_mode"] = chat_mode
 
