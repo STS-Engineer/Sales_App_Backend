@@ -79,6 +79,54 @@ def test_sanitize_assistant_text_removes_json_blocks_and_preserves_prose():
     )
 
 
+def test_sanitize_assistant_text_removes_leading_tool_payload_and_keeps_summary():
+    content = (
+        '{"fieldstoupdate":{"products":[{"partnumber":"p25845","revisionlevel":"rev01","quantity":10000.0,'
+        '"targetprice":1000.0,"currency":"EUR","targetpriceisestimated":true,"targetto":10000000.0}],'
+        '"totaltargetto":10000000.0,"tototal":"10000.0","tototallocal":null,'
+        '"zonemanageremail":"taha.khiari@avocarbon.com","validatorrole":"CEO"}}\n\n'
+        "Total target TO: 10,000,000\n"
+        "Total turnover (kEUR): 10,000.0\n"
+        "Delivery zone: Europe\n"
+        "Validator: CEO (taha.khiari@avocarbon.com)\n"
+        "Do you want to submit this RFQ for validation?\n\n"
+        "Yes\n"
+        "No"
+    )
+
+    assert chat._sanitize_assistant_text(content) == (
+        "Total target TO: 10,000,000\n"
+        "Total turnover (kEUR): 10,000.0\n"
+        "Delivery zone: Europe\n"
+        "Validator: CEO (taha.khiari@avocarbon.com)\n"
+        "Do you want to submit this RFQ for validation?\n\n"
+        "Yes\n"
+        "No"
+    )
+
+
+def test_sanitize_assistant_text_rewrites_bare_field_label_into_question():
+    assert chat._sanitize_assistant_text("Contact phone") == (
+        "What is the Contact phone number?"
+    )
+
+
+def test_sanitize_assistant_text_rewrites_field_label_with_options_into_question():
+    content = (
+        "Delivery zone\n\n"
+        "Europe\n"
+        "Africa\n"
+        "India"
+    )
+
+    assert chat._sanitize_assistant_text(content) == (
+        "Which delivery zone applies to this RFQ?\n\n"
+        "Europe\n"
+        "Africa\n"
+        "India"
+    )
+
+
 def test_sanitize_chat_history_reuses_assistant_sanitizer_for_persisted_messages():
     history = [
         {

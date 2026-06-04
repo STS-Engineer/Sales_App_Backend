@@ -436,6 +436,46 @@ FIELD_LABELS = {
     "target_price_is_estimated": "Price source",
 }
 
+FIELD_QUESTION_OVERRIDES = {
+    "customer_name": "Who is the Customer?",
+    "application": "What is the Application?",
+    "product_name": "Which Product name should we use for this RFQ?",
+    "project_name": "What is the Project name?",
+    "rfq_files": "Have you uploaded the RFQ files (drawings/specs) here?",
+    "delivery_zone": "Which delivery zone applies to this RFQ?",
+    "delivery_plant": "What is the Plant?",
+    "country": "What is the Country?",
+    "po_date": "What is the PO date?",
+    "ppap_date": "What is the PPAP date?",
+    "sop_year": "What is the SOP year?",
+    "rfq_reception_date": "What is the RFQ reception date?",
+    "quotation_expected_date": "What is the Expected quotation date?",
+    "contact_email": "What is the Contact email?",
+    "contact_name": "What is the Contact name?",
+    "contact_role": "What is the Contact function?",
+    "contact_phone": "What is the Contact phone number?",
+    "expected_delivery_conditions": "What are the expected Delivery Conditions?",
+    "expected_payment_terms": "What are the expected Payment Terms?",
+    "type_of_packaging": "Which type of packaging applies?",
+    "business_trigger": "What is the Business Trigger?",
+    "customer_tooling_conditions": "What are the Customer Tooling Conditions?",
+    "entry_barriers": "What are the Entry Barriers?",
+    "responsibility_design": "Who is responsible for design?",
+    "responsibility_validation": "Who is responsible for validation?",
+    "product_ownership": "Who owns the product?",
+    "pays_for_development": "Who pays for development?",
+    "capacity_available": "Do we have the capacity to fulfill this request?",
+    "scope": "Is it in our scope?",
+    "strategic_note": "Do you have any additional comments or strategic considerations?",
+    "final_recommendation": "What is the final recommendation?",
+    "part_number": "What is the Part Number?",
+    "revision_level": "What is the Revision Level?",
+    "quantity": "What is the Quantity?",
+    "target_price": "What is the Target Price?",
+    "currency": "What is the Currency?",
+    "target_price_is_estimated": "What is the Price source?",
+}
+
 
 def _normalize_scope_value(value):
     if isinstance(value, bool):
@@ -500,6 +540,60 @@ def _strip_prompt_examples(label: str) -> str:
         flags=re.IGNORECASE,
     )
     return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def _normalize_prompt_label_text(label: str) -> str:
+    cleaned = _strip_prompt_examples(str(label or ""))
+    cleaned = re.sub(r"\s*\(OPTIONAL\)\s*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[*_`]", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip().casefold()
+
+
+def _build_generic_field_question(field_name: str, label: str) -> str:
+    cleaned_label = _strip_prompt_examples(label) or _humanize_field_name(field_name)
+    if not cleaned_label:
+        return ""
+    if field_name.endswith("_date"):
+        return f"What is the {cleaned_label}?"
+    if field_name == "sop_year":
+        return f"What is the {cleaned_label}?"
+    return f"What is the {cleaned_label}?"
+
+
+FIELD_LABEL_QUESTION_LOOKUP = {
+    _normalize_prompt_label_text(FIELD_LABELS[field_name]): (
+        FIELD_QUESTION_OVERRIDES.get(field_name)
+        or _build_generic_field_question(field_name, FIELD_LABELS[field_name])
+    )
+    for field_name in FIELD_LABELS
+    if field_name not in AI_GENERATED_STEP_FIELDS
+}
+
+
+def _rewrite_questionless_field_prompt(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    first_non_empty_index = next(
+        (index for index, line in enumerate(lines) if line.strip()),
+        None,
+    )
+    if first_non_empty_index is None:
+        return ""
+
+    first_line = lines[first_non_empty_index].strip()
+    if not first_line or first_line.endswith("?") or ":" in first_line:
+        return text
+
+    normalized_first_line = _normalize_prompt_label_text(first_line)
+    replacement = FIELD_LABEL_QUESTION_LOOKUP.get(normalized_first_line)
+    if not replacement:
+        return text
+
+    lines[first_non_empty_index] = replacement
+    return "\n".join(lines).strip()
 
 
 def _is_optional_field(field_name: str) -> bool:
@@ -869,6 +963,16 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
         prompt += (
             "\n- Next field to ask for: "
             f"{_format_field_for_prompt(next_field_to_ask)}"
+        )
+        preferred_question = FIELD_QUESTION_OVERRIDES.get(next_field_to_ask)
+        if preferred_question:
+            prompt += (
+                "\n- Preferred exact wording for the next question: "
+                f"{json.dumps(preferred_question, ensure_ascii=False)}"
+            )
+        prompt += (
+            "\n- When asking the next field, you MUST write a real question in natural "
+            "language. Never output only the bare field label."
         )
     if not missing_fields:
         prompt += (
@@ -1311,7 +1415,8 @@ def _sanitize_assistant_text(content: str) -> str:
     text = _strip_standalone_json_blocks(text).strip()
     if _is_internal_tool_payload_text(text):
         return ""
-    return _dedupe_adjacent_blocks(text)
+    text = _dedupe_adjacent_blocks(text)
+    return _rewrite_questionless_field_prompt(text)
 
 
 def _build_tool_call_assistant_message(tool_calls: list[dict]) -> dict:

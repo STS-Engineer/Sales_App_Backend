@@ -16,7 +16,7 @@ N2_ASIA_SOUTH_EMAIL = "eipe.thomas@avocarbon.com"
 # N-1 (VP Sales)
 N1_VP_EMAIL = "eric.suszylo@avocarbon.com"
 # N (CEO - above N-1 threshold)
-N0_CEO_EMAIL = "olivier.spicker@avocarbon.com"
+N0_CEO_EMAIL = "taha.khiari@avocarbon.com"
 
 
 def _normalize_zone_token(value: str | None) -> str:
