@@ -652,8 +652,9 @@ def _get_missing_fields_for_step(
     missing_fields: list[str] = []
     for field_name in _get_step_fields(step_fields, include_optional=True):
         if field_name == "costing_data":
-            # Never surface costing_data as a generic missing field.
-            # It is asked only via the retrieveProducts product-specific flow (rule #6).
+            # costing_data is never surfaced as a generic missing field.
+            # Whether to ask it depends on what retrieveProducts returns for the
+            # selected product — handled exclusively via rule #6 in the system prompt.
             continue
         if field_name == "products":
             product_missing_fields = get_incomplete_product_fields(
@@ -2092,11 +2093,12 @@ FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding 
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 FORMATTING RULE: When a missing field has allowed options, keep those options inline or nested under that field; never promote option values into separate top-level numbered items.
 CRITICAL OPTIONAL FIELD RULE: You MUST ask every field, including those marked (OPTIONAL). When asking an optional field, always append on a new line: "*(Optional — type **skip** to leave it blank.)*". If the user types "skip", "none", "N/A", or provides no useful answer, you MUST immediately call updateFormFields and save the value "_" for that field, then move to the next question. Never leave an optional field unanswered.
+COSTING DATA RULE: costing_data is NEVER in the missing fields list. After the user selects a product (product_name is saved), you MUST call retrieveProducts for that product. If the response contains costing parameters for that product, ask the user for those specific values and always append on a new line: "*(Optional — type **skip** to leave it blank.)*". If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
 2. NO GUESSING/PROPOSITIONS: When asking the user for missing information, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples, parenthetical hints, or sample values for open-ended fields.
 3. ENUM EXCEPTION: You may ONLY provide options if the field is strictly constrained to a predefined list already instructed by the system.
-STRICT CHECKLIST RULE: You MUST ONLY ask the user for the exact fields explicitly listed in the injected MISSING_FIELDS_PROMPT. You are strictly FORBIDDEN from inventing new questions, fields, or requirements (such as "delivery city", "full address", or "zip code"). If it is not in the missing fields array, do not ask for it.
+STRICT CHECKLIST RULE: You MUST ONLY ask the user for the exact fields explicitly listed in the injected MISSING_FIELDS_PROMPT. You are strictly FORBIDDEN from inventing new questions, fields, or requirements (such as "delivery city", "full address", or "zip code"). If it is not in the missing fields array, do not ask for it. EXCEPTION — costing_data: this field is NEVER in MISSING_FIELDS_PROMPT. It must be handled exclusively via rule #6 after retrieveProducts: ask only if the product's database record contains costing parameters; otherwise set it to "_" silently.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
 CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
 
