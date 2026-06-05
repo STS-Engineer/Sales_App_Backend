@@ -19,7 +19,7 @@ _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 _DEFAULT_FRONTEND_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://sales-management.azurewebsites.net",
+    "https://sales-app-backend.azurewebsites.net",
 )
 
 
