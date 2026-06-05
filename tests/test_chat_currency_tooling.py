@@ -147,6 +147,88 @@ def test_sanitize_chat_history_reuses_assistant_sanitizer_for_persisted_messages
     ]
 
 
+def test_is_field_filled_keeps_optional_skip_but_rejects_required_skip():
+    assert chat._is_field_filled({"ppap_date": "_"}, "ppap_date") is True
+    assert chat._is_field_filled({"po_date": "_"}, "po_date") is False
+    assert chat._is_field_filled({"scope": "skip"}, "scope") is False
+
+
+def test_get_current_step_ignores_optional_rfq_fields_when_required_fields_are_complete():
+    data = {
+        "customer_name": "TPEG",
+        "application": "Electronic",
+        "product_name": "Rod Choke",
+        "product_line_acronym": "ROC",
+        "project_name": "TPEG Winding",
+        "costing_data": "",
+        "rfq_files": ["TP018157Arev1_Draft.pdf"],
+        "products": [
+            {
+                "part_number": "TP018157A",
+                "revision_level": "",
+                "quantity": 1000,
+                "target_price": 7,
+                "currency": "EUR",
+                "target_price_is_estimated": True,
+            }
+        ],
+        "delivery_zone": "Europe",
+        "delivery_plant": "Tunisia",
+        "country": "France",
+        "po_date": "2027-12-12",
+        "ppap_date": "",
+        "sop_year": 2027,
+        "rfq_reception_date": "2027-05-05",
+        "quotation_expected_date": "2027-04-14",
+        "contact_name": "Khouloud Aouini",
+        "contact_role": "Method & Industrialization Engineer",
+        "contact_phone": "+216 98 148 178",
+        "contact_email": "khouloud.aouini@tpe.group",
+    }
+
+    current_step, missing_fields = chat._get_current_step_and_missing_fields(
+        "rfq",
+        data,
+    )
+
+    assert current_step == 2
+    assert "expected_delivery_conditions" in missing_fields
+    assert "ppap_date" not in missing_fields
+    assert "type_of_packaging" not in missing_fields
+
+
+def test_sanitize_rfq_update_fields_rejects_required_skips_and_keeps_optional_skips():
+    sanitized_fields, rejected_required_fields = (
+        chat._sanitize_rfq_update_fields_for_chat(
+            {
+                "po_date": "skip",
+                "ppap_date": "skip",
+                "products": [
+                    {
+                        "part_number": "skip",
+                        "revision_level": "skip",
+                        "quantity": 1000,
+                        "target_price": 1,
+                        "currency": "skip",
+                        "target_price_is_estimated": True,
+                    }
+                ],
+            }
+        )
+    )
+
+    assert "po_date" not in sanitized_fields
+    assert sanitized_fields["ppap_date"] == "_"
+    assert sanitized_fields["products"][0]["part_number"] is None
+    assert sanitized_fields["products"][0]["revision_level"] == ""
+    assert sanitized_fields["products"][0]["currency"] is None
+    assert set(rejected_required_fields) == {
+        "po_date",
+        "products[0].part_number",
+        "products[0].currency",
+    }
+
+
 @pytest.mark.asyncio
 async def test_execute_tool_calls_returns_fx_payload(monkeypatch):
     fx_db = object()
@@ -864,6 +946,8 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Would you like to add another part number to this request?" in chat.SYSTEM_PROMPT
     assert "NEVER ask the user how many part numbers/products there are upfront." in chat.SYSTEM_PROMPT
     assert "NEVER ask the user for the Product Line acronym." in chat.SYSTEM_PROMPT
+    assert "Optional Step 2 fields like Packaging must only be saved if the user voluntarily provides them." in chat.SYSTEM_PROMPT
+    assert "Delivery Conditions, Payment Terms, and Packaging (Step 2)" not in chat.SYSTEM_PROMPT
     assert "append_products=true" in chat.SYSTEM_PROMPT
     assert 'When the user agrees to add a second, third, or subsequent part number, you MUST call updateFormFields with the argument "append_products": true.' in chat.SYSTEM_PROMPT
     assert "Request-level pricing metadata if still missing" not in chat.SYSTEM_PROMPT

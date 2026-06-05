@@ -56,8 +56,29 @@ def create_refresh_token(
     return _create_token(email, role, "refresh", lifetime)
 
 
+def create_password_reset_token(
+    email: str,
+    password_hash: str,
+    expires_delta: timedelta | None = None,
+) -> str:
+    lifetime = expires_delta or timedelta(
+        minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
+    )
+    return _create_token(
+        email,
+        "",
+        "password_reset",
+        lifetime,
+        extra_claims={"pwd": build_password_reset_fingerprint(password_hash)},
+    )
+
+
 def decode_token(token: str) -> dict:
     return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+
+
+def build_password_reset_fingerprint(password_hash: str) -> str:
+    return hashlib.sha256(str(password_hash or "").encode("utf-8")).hexdigest()[:24]
 
 
 def _verify_legacy_bcrypt(password: str, password_hash: str) -> bool:
@@ -88,14 +109,18 @@ def _create_token(
     role: str,
     token_type: str,
     expires_delta: timedelta,
+    extra_claims: dict | None = None,
 ) -> str:
     expire = datetime.now(timezone.utc) + expires_delta
     payload = {
         "sub": email,
-        "role": role,
         "exp": expire,
         "token_type": token_type,
     }
+    if role:
+        payload["role"] = role
+    if extra_claims:
+        payload.update(extra_claims)
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 

@@ -388,6 +388,14 @@ RFQ_OPTIONAL_FIELDS = {
     if bool(step_field.get("is_optional"))
 }
 RFQ_OPTIONAL_PRODUCT_FIELDS = {"revision_level"}
+SKIP_LIKE_TEXT_VALUES = {
+    "_",
+    "skip",
+    "none",
+    "n/a",
+    "na",
+    "notapplicable",
+}
 FIELD_LABELS = {
     "customer_name": "Customer",
     "application": "Application",
@@ -542,6 +550,15 @@ def _strip_prompt_examples(label: str) -> str:
     return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
+def _is_skip_like_value(value) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return False
+    normalized = re.sub(r"\s+", "", str(value).strip()).casefold()
+    return normalized in SKIP_LIKE_TEXT_VALUES
+
+
 def _normalize_prompt_label_text(label: str) -> str:
     cleaned = _strip_prompt_examples(str(label or ""))
     cleaned = re.sub(r"\s*\(OPTIONAL\)\s*$", "", cleaned, flags=re.IGNORECASE)
@@ -686,6 +703,49 @@ def _get_missing_required_fields_for_step(
         if not _is_field_filled(data, field_name, include_optional=False):
             missing_fields.append(field_name)
     return missing_fields
+
+
+def _sanitize_rfq_update_fields_for_chat(
+    fields: dict[str, object],
+) -> tuple[dict[str, object], list[str]]:
+    sanitized_fields: dict[str, object] = {}
+    rejected_required_fields: list[str] = []
+
+    for field_name, value in fields.items():
+        if field_name == "products":
+            normalized_products = normalize_rfq_data_products(
+                {"products": value},
+                products_authoritative=True,
+            ).get("products", [])
+            sanitized_products: list[dict[str, object]] = []
+            for index, product in enumerate(normalized_products):
+                next_product = dict(product)
+                if _is_skip_like_value(next_product.get("part_number")):
+                    next_product["part_number"] = None
+                    rejected_required_fields.append(
+                        f"products[{index}].part_number"
+                    )
+                if _is_skip_like_value(next_product.get("currency")):
+                    next_product["currency"] = None
+                    rejected_required_fields.append(
+                        f"products[{index}].currency"
+                    )
+                if _is_skip_like_value(next_product.get("revision_level")):
+                    next_product["revision_level"] = ""
+                sanitized_products.append(next_product)
+            sanitized_fields[field_name] = sanitized_products
+            continue
+
+        if _is_skip_like_value(value):
+            if _is_optional_field(field_name):
+                sanitized_fields[field_name] = "_"
+            else:
+                rejected_required_fields.append(field_name)
+            continue
+
+        sanitized_fields[field_name] = value
+
+    return sanitized_fields, rejected_required_fields
 
 
 def _coerce_numeric_value(value) -> float:
@@ -903,8 +963,12 @@ def _is_field_filled(data: dict, field_name: str, *, include_optional: bool = Tr
     if isinstance(value, (int, float)):
         return True
     if isinstance(value, str):
-        # "_" means the user explicitly skipped — treat as filled
-        return value.strip() != ""
+        stripped_value = value.strip()
+        if not stripped_value:
+            return False
+        if _is_skip_like_value(stripped_value):
+            return _is_optional_field(field_name)
+        return True
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
     return value is not None
@@ -923,7 +987,7 @@ def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[in
                 if not _is_field_filled(data, field)
             ]
             if chat_mode == "potential"
-            else _get_missing_fields_for_step(data, fields)
+            else _get_missing_required_fields_for_step(data, fields)
         )
         if missing_fields:
             return step_number, missing_fields
@@ -1880,6 +1944,11 @@ async def _execute_tool_calls(
                     else str(val).strip().lower() in ("true", "1", "yes")
                 )
             filtered_fields = _filter_update_fields(chat_mode, fields)
+            rejected_required_fields: list[str] = []
+            if chat_mode != "potential":
+                filtered_fields, rejected_required_fields = (
+                    _sanitize_rfq_update_fields_for_chat(filtered_fields)
+                )
             if "delivery_zone" in filtered_fields:
                 canonical_delivery_zone = normalize_delivery_zone(
                     filtered_fields.get("delivery_zone")
@@ -1931,6 +2000,25 @@ async def _execute_tool_calls(
                 if isinstance(existing_products, list) and isinstance(normalized_new_products, list):
                     filtered_fields["products"] = existing_products + normalized_new_products
 
+            if not filtered_fields and rejected_required_fields:
+                tool_response_text = json.dumps(
+                    {
+                        "success": False,
+                        "error": "Required fields cannot be skipped.",
+                        "rejected_required_fields": rejected_required_fields,
+                        "status": "required_fields_still_missing",
+                    }
+                )
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": func_name,
+                        "content": tool_response_text,
+                    }
+                )
+                continue
+
             products_are_authoritative = "products" in filtered_fields
             for key, value in filtered_fields.items():
                 if key == "target_price_is_estimated":
@@ -1969,7 +2057,12 @@ async def _execute_tool_calls(
                     "ignored_fields": sorted(
                         set(fields.keys()) - set(filtered_fields.keys())
                     ),
-                    "status": "extracted_to_form",
+                    "rejected_required_fields": rejected_required_fields,
+                    "status": (
+                        "partial_update_required_fields_still_missing"
+                        if rejected_required_fields
+                        else "extracted_to_form"
+                    ),
                 }
             )
 
@@ -2092,8 +2185,8 @@ If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combin
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 FORMATTING RULE: When a missing field has allowed options, keep those options inline or nested under that field; never promote option values into separate top-level numbered items.
-CRITICAL OPTIONAL FIELD RULE: You MUST ask every field, including those marked (OPTIONAL). When asking an optional field, always append on a new line: "*(Optional — type **skip** to leave it blank.)*". If the user types "skip", "none", "N/A", or provides no useful answer, you MUST immediately call updateFormFields and save the value "_" for that field, then move to the next question. Never leave an optional field unanswered.
-COSTING DATA RULE: costing_data is NEVER in the missing fields list. After the user selects a product (product_name is saved), you MUST call retrieveProducts for that product. If the response contains costing parameters for that product, ask the user for those specific values and always append on a new line: "*(Optional — type **skip** to leave it blank.)*". If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data.
+CRITICAL OPTIONAL FIELD RULE: The ONLY optional RFQ fields are `costing_data`, `ppap_date`, `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, `entry_barriers`, and `products[*].revision_level`. You MUST NOT describe any other RFQ field as optional. In step-by-step mode, do NOT proactively ask optional RFQ fields. Save them only if the user voluntarily provides them. If the user types "skip", "none", "N/A", or provides no useful answer for a REQUIRED field, you MUST NOT save "_" and you MUST NOT move on; ask for that same required field again.
+COSTING DATA RULE: `costing_data` is a special optional field and is NEVER in the missing fields list. After the user selects a product (product_name is saved), you MUST call retrieveProducts for that product. If the response contains costing parameters for that product, ask the user for those specific values and always append on a new line: "*(Optional — type **skip** to leave it blank.)*". If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
 2. NO GUESSING/PROPOSITIONS: When asking the user for missing information, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples, parenthetical hints, or sample values for open-ended fields.
@@ -2153,7 +2246,7 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save `product_name` with `updateFormFields` and map it to the authorized `product_line_acronym` to lock them in.
 6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
 7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-8. Ask only for the remaining missing Step 1 fields among product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL.
+8. Ask only for the remaining REQUIRED Step 1 fields among product rows (`products`), Delivery Zone, Plant, Country, PO date, SOP year, RFQ reception date, and quotation expected date. DO NOT proactively ask `ppap_date` because it is optional. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL and should only be saved if the user provides it.
 MULTI-PRODUCT SUPPORT:
 - NEVER ask the user how many part numbers/products there are upfront.
 - After each part number is saved, ask: "Would you like to add another part number to this request?"
@@ -2178,13 +2271,10 @@ NOTE: costing_data is OPTIONAL. If the product has no specific costing parameter
 4. IF NOT FOUND: Ask the user only for the missing contact fields among Full Name, Role, and Phone Number, and save the full name directly in `contact_name`. NEVER ask separately for first name and last name.
 
 ### Step 2: Commercial Expectations
-Ask sequentially for:
+Ask sequentially only for the REQUIRED Step 2 fields:
 - Delivery Conditions
 - Payment Terms
-- Type of Packaging
-- Business Trigger
-- Tooling Conditions
-- Entry Barriers
+Do NOT proactively ask `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, or `entry_barriers` because they are optional. If the user voluntarily provides any of them, save them.
 CRITICAL TARGET PRICE RULE:
 1. When collecting product target prices, you MUST save each line price in the `products` array exactly as the user stated it. Save each product row with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` MUST remain the raw local amount the user provided. You may also collect these request-level price metadata fields:
    a. The target price amount for each product row in the user's local currency.
@@ -2205,14 +2295,15 @@ OR:
 3. If the currency is NOT EUR, you MAY call `get_eur_exchange_rate` only for derived backend previews or validator-routing checks. You MUST NOT rewrite `products[*].target_price` or `products[*].target_to` with converted EUR values.
 4. If the currency IS EUR, save the same raw product target prices directly in the `products` array.
 5. When relaying any backend-derived conversion, keep at most 5 digits after the decimal point and truncate extra digits instead of rounding.
-CRITICAL PACKAGING RULE: When `type_of_packaging` is missing, you MUST ask the user to choose exactly one of these 3 options:
+CRITICAL PACKAGING RULE: If the user voluntarily provides `type_of_packaging`, or if you need to confirm a packaging value that the user already mentioned, you MUST restrict it to exactly one of these 3 options:
 1. carboard divider
 2. one way tray
 3. returnable plastic tray
-As soon as the user chooses one option, you MUST immediately call `updateFormFields` with {"fields_to_update": {"type_of_packaging": "<chosen_option>"}} using exactly the chosen option text.
+As soon as the user chooses one option, you MUST immediately call `updateFormFields` with {"fields_to_update": {"type_of_packaging": "<chosen_option>"}} using exactly the chosen option text. Do NOT proactively ask for packaging in step-by-step mode when it is still blank.
 CRITICAL RULE: The moment the user provides these commercial expectations, you MUST immediately call `updateFormFields` using the exact JSON keys listed above. DO NOT move to the Strategic Alignment questions until you have successfully called the tool to save these fields.
 
 ### Step 3: Strategic Alignment
+All Step 3 fields are REQUIRED. You MUST NOT mark any Step 3 field as optional, and you MUST NOT accept `skip`, `none`, `N/A`, or `_` for them.
 Ask the user the following questions sequentially or all at once:
 - Who is responsible for design?
 - Who is responsible for validation?
@@ -2227,7 +2318,7 @@ Ask the user the following questions sequentially or all at once:
 CRITICAL RULE: As the user answers these, you MUST immediately call `updateFormFields` to save them using the exact keys listed in the mapping (e.g., {"fields_to_update": {"responsibility_design": "...", "capacity_available": "...", "scope": "...", "strategic_note": "...", "final_recommendation": "..."}}).
 
 CRITICAL STEP SEQUENCE ENFORCEMENT:
-You are STRICTLY FORBIDDEN from mentioning 'Validation', 'Submit', 'Step 4', 'Turnover', 'TO Total', or 'Validator' until the MISSING_FIELDS_PROMPT explicitly confirms that Steps 2 AND 3 are 100% complete. If MISSING_FIELDS_PROMPT contains '*** STEP 4 IS BLOCKED ***', you MUST NOT reference Step 4 topics AT ALL. If you just finished collecting part numbers, dates, or contacts from Step 1, you MUST immediately proceed to ask for Delivery Conditions, Payment Terms, and Packaging (Step 2). You are NEVER allowed to skip from Step 1 directly to Step 4.
+You are STRICTLY FORBIDDEN from mentioning 'Validation', 'Submit', 'Step 4', 'Turnover', 'TO Total', or 'Validator' until the MISSING_FIELDS_PROMPT explicitly confirms that Steps 2 AND 3 are 100% complete. If MISSING_FIELDS_PROMPT contains '*** STEP 4 IS BLOCKED ***', you MUST NOT reference Step 4 topics AT ALL. If you just finished collecting part numbers, dates, or contacts from Step 1, you MUST immediately proceed to ask for the required Step 2 fields: Delivery Conditions and Payment Terms. Optional Step 2 fields like Packaging must only be saved if the user voluntarily provides them. You are NEVER allowed to skip from Step 1 directly to Step 4.
 
 ### Step 4: Final Calculation & Routing
 CRITICAL STEP 4 RULES:

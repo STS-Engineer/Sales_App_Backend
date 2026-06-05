@@ -2,6 +2,7 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from urllib.parse import quote
 
 from app.config import settings
 from app.database import get_db
@@ -9,16 +10,34 @@ from app.middleware.auth import get_current_user
 from app.models.user import User, UserRole
 from app.schemas.auth import (
     AccessTokenResponse,
+    ForgotPasswordRequest,
     LoginRequest,
+    MessageResponse,
     RefreshTokenRequest,
     RegisterRequest,
+    ResetPasswordRequest,
     TokenResponse,
     UserOut,
 )
-from app.security import create_access_token, create_refresh_token, decode_token
+from app.security import (
+    build_password_reset_fingerprint,
+    create_access_token,
+    create_password_reset_token,
+    create_refresh_token,
+    decode_token,
+)
 from app.utils import emails
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+PASSWORD_RESET_REQUEST_MESSAGE = (
+    "If an account exists for that email, a password reset link has been sent."
+)
+PASSWORD_RESET_INVALID_MESSAGE = (
+    "This password reset link is invalid or has expired."
+)
+PASSWORD_RESET_SUCCESS_MESSAGE = (
+    "Your password has been reset. You can now sign in with your new password."
+)
 
 
 async def _get_owner_emails(db: AsyncSession) -> list[str]:
@@ -66,6 +85,49 @@ async def _create_pending_user(body: RegisterRequest, db: AsyncSession) -> dict[
     }
 
 
+async def _get_user_by_email(db: AsyncSession, email: str) -> User | None:
+    normalized_email = str(email or "").strip()
+    if not normalized_email:
+        return None
+    result = await db.execute(select(User).where(User.email == normalized_email))
+    return result.scalar_one_or_none()
+
+
+def _password_reset_http_exception() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=PASSWORD_RESET_INVALID_MESSAGE,
+    )
+
+
+async def _resolve_password_reset_user(
+    db: AsyncSession,
+    token: str,
+) -> User:
+    invalid_reset_exception = _password_reset_http_exception()
+    try:
+        payload = decode_token(token)
+    except jwt.PyJWTError as exc:
+        raise invalid_reset_exception from exc
+
+    if payload.get("token_type") != "password_reset":
+        raise invalid_reset_exception
+
+    email = str(payload.get("sub") or "").strip()
+    fingerprint = str(payload.get("pwd") or "").strip()
+    if not email or not fingerprint:
+        raise invalid_reset_exception
+
+    user = await _get_user_by_email(db, email)
+    if user is None:
+        raise invalid_reset_exception
+
+    if build_password_reset_fingerprint(user.password_hash) != fingerprint:
+        raise invalid_reset_exception
+
+    return user
+
+
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
 async def signup(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     return await _create_pending_user(body, db)
@@ -76,10 +138,59 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     return await _create_pending_user(body, db)
 
 
+@router.post("/forgot-password", response_model=MessageResponse)
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    user = await _get_user_by_email(db, body.email)
+    if user is not None:
+        token = create_password_reset_token(user.email, user.password_hash)
+        reset_link = (
+            f"{settings.frontend_url}/reset-password"
+            f"?token={quote(token, safe='')}"
+        )
+        emails.send_password_reset_email(
+            user.email,
+            user.full_name,
+            reset_link,
+            settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
+        )
+
+    return MessageResponse(message=PASSWORD_RESET_REQUEST_MESSAGE)
+
+
+@router.get("/reset-password/validate", response_model=MessageResponse)
+async def validate_reset_password_token(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    await _resolve_password_reset_user(db, token)
+    return MessageResponse(message="Password reset token is valid.")
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+async def reset_password(
+    body: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    user = await _resolve_password_reset_user(db, body.token)
+    new_password = str(body.password or "")
+    if user.check_password(new_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from the current password.",
+        )
+
+    user.set_password(new_password)
+    await db.commit()
+
+    return MessageResponse(message=PASSWORD_RESET_SUCCESS_MESSAGE)
+
+
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == body.email))
-    user = result.scalar_one_or_none()
+    user = await _get_user_by_email(db, body.email)
 
     if not user:
         raise HTTPException(

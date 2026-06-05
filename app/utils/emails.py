@@ -215,6 +215,47 @@ You can now log in here:
     )
 
 
+def send_password_reset_email(
+    user_email: str,
+    full_name: str | None,
+    reset_link: str,
+    expires_minutes: int,
+) -> bool:
+    display_name = full_name or user_email
+    subject = "Reset Your AVO Carbon RFQ Password"
+    text_body = f"""Hello {display_name},
+
+We received a request to reset your password for the AVO Carbon RFQ Portal.
+
+Use the link below to choose a new password:
+{reset_link}
+
+This link will expire in {expires_minutes} minutes.
+
+If you did not request a password reset, you can safely ignore this email.
+"""
+    html_body = _build_base_html(
+        "Password Reset Request",
+        f"""
+          <p>Hello {display_name},</p>
+          <p>We received a request to reset your password for the <strong>AVO Carbon RFQ Portal</strong>.</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{reset_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Reset Password
+            </a>
+          </div>
+          <p>This link will expire in <strong>{expires_minutes} minutes</strong>.</p>
+          <p>If you did not request a password reset, you can safely ignore this email.</p>
+        """,
+    )
+    return send_email(
+        user_email,
+        subject,
+        text_body,
+        html_body=html_body,
+    )
+
+
 def send_validation_email(
     zone_manager_email: str,
     systematic_rfq_id: str,
