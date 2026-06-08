@@ -1039,7 +1039,7 @@ def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[in
                 if not _is_field_filled(data, field)
             ]
             if chat_mode == "potential"
-            else _get_missing_required_fields_for_step(data, fields)
+            else _get_missing_fields_for_step(data, fields)
         )
         if missing_fields:
             return step_number, missing_fields
@@ -1069,20 +1069,22 @@ def _should_prioritize_rfq_files(
         (fields for step_number, fields in RFQ_STEPS if step_number == 1),
         [],
     )
-    ordered_required_step_1_fields = _get_step_fields(
+    ordered_step_1_fields = _get_step_fields(
         step_1_fields,
-        include_optional=False,
+        include_optional=True,
     )
     try:
-        rfq_files_index = ordered_required_step_1_fields.index("rfq_files")
+        rfq_files_index = ordered_step_1_fields.index("rfq_files")
     except ValueError:
         return False
 
-    required_fields_before_rfq_files = set(
-        ordered_required_step_1_fields[:rfq_files_index]
-    )
+    fields_before_rfq_files = {
+        field_name
+        for field_name in ordered_step_1_fields[:rfq_files_index]
+        if field_name != "costing_data"
+    }
     return not any(
-        missing_field in required_fields_before_rfq_files
+        missing_field in fields_before_rfq_files
         for missing_field in user_keys_missing
     )
 
@@ -2390,7 +2392,7 @@ CRITICAL NO-ROUNDING RULE: If a backend tool returns a converted EUR value, or i
 DIMENSION NORMALIZATION RULE: If the user provides physical dimensions or technical specifications in inches or any other non-mm unit, you MUST seamlessly convert them to millimeters (mm) before saving the data. Always store dimension data in mm.
 DELIVERY ZONE CLASSIFICATION RULE: When collecting the customer location or delivery destination, you MUST classify it into exactly one of these 7 approved `delivery_zone` strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". Never use any other spelling or region name. If the user gives a specific country, map it automatically to the correct approved zone (for example, France -> Europe, South Africa -> Africa, India -> India, United States -> North America, Brazil -> South America, China -> China / South Pacific, Japan -> Korea / Japan). If you cannot confidently map it, ask the user to clarify before saving. If you need the user to choose a delivery zone explicitly, you MUST present only these exact 7 options and no others.
 FORM STATE SYNC RULE: On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data. Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan".
-MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, Target Price, Currency, and Price Source for each product. Revision Level is OPTIONAL and the user may skip it. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
+MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, Target Price, Currency, and Price Source for each product. Revision Level is OPTIONAL. When you ask for a full product row in one grouped message, you MUST NOT require the user to type `skip` for Revision Level; they may simply omit it. If the user gives the other product row values but omits Revision Level, interpret it as blank, save the row, and continue. You MUST NOT ask a separate follow-up question only for the missing Revision Level. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
@@ -2446,7 +2448,7 @@ If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combin
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 FORMATTING RULE: When a missing field has allowed options, keep those options inline or nested under that field; never promote option values into separate top-level numbered items.
-CRITICAL OPTIONAL FIELD RULE: The ONLY optional RFQ fields are `costing_data`, `ppap_date`, `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, `entry_barriers`, and `products[*].revision_level`. You MUST NOT describe any other RFQ field as optional. In step-by-step mode, do NOT proactively ask optional RFQ fields. Save them only if the user voluntarily provides them. If the user types "skip", "none", "N/A", or provides no useful answer for a REQUIRED field, you MUST NOT save "_" and you MUST NOT move on; ask for that same required field again.
+CRITICAL OPTIONAL FIELD RULE: The ONLY optional RFQ fields are `costing_data`, `ppap_date`, `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, `entry_barriers`, and `products[*].revision_level`. You MUST NOT describe any other RFQ field as optional. In step-by-step mode, you MUST still ask optional RFQ fields when they appear next in the checklist order, EXCEPT for `products[*].revision_level`: if a grouped product row already has its required values and only Revision Level is missing, leave Revision Level blank and continue without a dedicated follow-up question. When you ask any other optional field, you MUST clearly say it is optional and that the user can type `skip` to leave it blank. If the user types "skip", "none", or "N/A" for an OPTIONAL field, save "_" (or an empty revision level for `products[*].revision_level`) and move on. If the user types "skip", "none", "N/A", or provides no useful answer for a REQUIRED field, you MUST NOT save "_" and you MUST NOT move on; ask for that same required field again.
 COSTING DATA RULE: `costing_data` is a special optional field and is NEVER in the missing fields list. After the user selects a product (product_name is saved), you MUST call retrieveProducts for that product. If the response contains costing parameters for that product, ask the user for those specific values and always append on a new line: "*(Optional — type **skip** to leave it blank.)*". If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
@@ -2508,7 +2510,7 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save `product_name` with `updateFormFields` and map it to the authorized `product_line_acronym` to lock them in.
 6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
 7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-8. Ask only for the remaining REQUIRED Step 1 fields among product rows (`products`), Delivery Zone, Plant, Country, PO date, SOP year, RFQ reception date, and quotation expected date. DO NOT proactively ask `ppap_date` because it is optional. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL and should only be saved if the user provides it.
+8. Ask for the remaining Step 1 fields in checklist order, including optional ones. This includes product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. You MUST explicitly mark `ppap_date` as optional and allow `skip`. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL. When asking for a full product row in one grouped prompt, do NOT tell the user to type `skip` for Revision Level; they may simply leave it out. If it is omitted while the required product row values are present, treat Revision Level as blank, save the row, and continue without a dedicated follow-up question.
 MULTI-PRODUCT SUPPORT:
 - NEVER ask the user how many part numbers/products there are upfront.
 - After each part number is saved, ask: "Would you like to add another part number to this request?"
@@ -2534,10 +2536,13 @@ NOTE: costing_data is OPTIONAL. If the product has no specific costing parameter
 5. IF NOT FOUND: Ask the user only for the missing contact fields among Full Name, Role, and Phone Number, and save the full name directly in `contact_name`. NEVER ask separately for first name and last name.
 
 ### Step 2: Commercial Expectations
-Ask sequentially only for the REQUIRED Step 2 fields:
+Ask sequentially for the Step 2 fields in this exact order:
 - Delivery Conditions
 - Payment Terms
-Do NOT proactively ask `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, or `entry_barriers` because they are optional. If the user voluntarily provides any of them, save them.
+- Type of Packaging (OPTIONAL — allow `skip`)
+- Business Trigger (OPTIONAL — allow `skip`)
+- Customer Tooling Conditions (OPTIONAL — allow `skip`)
+- Entry Barriers (OPTIONAL — allow `skip`)
 CRITICAL TARGET PRICE RULE:
 1. When collecting product target prices, you MUST save each line price in the `products` array exactly as the user stated it. Save each product row with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` MUST remain the raw local amount the user provided. You may also collect these request-level price metadata fields:
    a. The target price amount for each product row in the user's local currency.
@@ -2562,7 +2567,7 @@ CRITICAL PACKAGING RULE: If the user voluntarily provides `type_of_packaging`, o
 1. carboard divider
 2. one way tray
 3. returnable plastic tray
-As soon as the user chooses one option, you MUST immediately call `updateFormFields` with {"fields_to_update": {"type_of_packaging": "<chosen_option>"}} using exactly the chosen option text. Do NOT proactively ask for packaging in step-by-step mode when it is still blank.
+As soon as the user chooses one option, you MUST immediately call `updateFormFields` with {"fields_to_update": {"type_of_packaging": "<chosen_option>"}} using exactly the chosen option text.
 CRITICAL RULE: The moment the user provides these commercial expectations, you MUST immediately call `updateFormFields` using the exact JSON keys listed above. DO NOT move to the Strategic Alignment questions until you have successfully called the tool to save these fields.
 
 ### Step 3: Strategic Alignment

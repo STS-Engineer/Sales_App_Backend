@@ -99,7 +99,6 @@ def test_partial_product_rows_are_allowed_until_submission():
         "products[1].target_price_is_estimated",
     ]
     assert get_incomplete_product_fields(data, include_optional=True) == [
-        "products[1].revision_level",
         "products[1].quantity",
         "products[1].currency",
         "products[1].target_price_is_estimated",
@@ -123,9 +122,7 @@ def test_optional_revision_level_does_not_block_product_completion():
     )
 
     assert get_incomplete_product_fields(data) == []
-    assert get_incomplete_product_fields(data, include_optional=True) == [
-        "products[1].revision_level"
-    ]
+    assert get_incomplete_product_fields(data, include_optional=True) == []
 
 
 def test_legacy_target_price_currency_hydrates_product_currency():

@@ -147,7 +147,7 @@ def test_history_uses_paragraph_mode_detects_paragraph_prompt():
     assert _history_uses_paragraph_mode(history) is True
 
 
-def test_step_1_optional_fields_do_not_block_progression():
+def test_step_1_optional_fields_are_asked_in_order():
     rfq_state = _build_base_rfq_state()
     rfq_state.pop("costing_data", None)
     rfq_state.pop("ppap_date", None)
@@ -164,17 +164,18 @@ def test_step_1_optional_fields_do_not_block_progression():
 
     current_step, missing_fields = _get_current_step_and_missing_fields("rfq", rfq_state)
 
-    assert current_step == 3
-    assert missing_fields == ["strategic_note", "final_recommendation"]
+    assert current_step == 1
+    assert missing_fields == ["ppap_date"]
 
     prompt = _build_missing_fields_prompt("rfq", rfq_state)
 
     assert "Costing data (OPTIONAL)" not in prompt
-    assert "PPAP date (OPTIONAL)" not in prompt
+    assert "PPAP date (OPTIONAL)" in prompt
     assert "Product 1 Revision level (OPTIONAL)" not in prompt
+    assert "Next field to ask for: PPAP date (OPTIONAL)" in prompt
 
 
-def test_step_2_optional_fields_do_not_block_progression():
+def test_step_2_optional_fields_are_asked_in_order():
     rfq_state = _build_base_rfq_state()
     rfq_state.pop("type_of_packaging", None)
     rfq_state.pop("business_trigger", None)
@@ -183,16 +184,22 @@ def test_step_2_optional_fields_do_not_block_progression():
 
     current_step, missing_fields = _get_current_step_and_missing_fields("rfq", rfq_state)
 
-    assert current_step == 3
-    assert missing_fields == ["strategic_note", "final_recommendation"]
+    assert current_step == 2
+    assert missing_fields == [
+        "type_of_packaging",
+        "business_trigger",
+        "customer_tooling_conditions",
+        "entry_barriers",
+    ]
 
     prompt = _build_missing_fields_prompt("rfq", rfq_state)
 
-    assert "Type of Packaging (OPTIONAL)" not in prompt
-    assert "Business Trigger (OPTIONAL)" not in prompt
+    assert "Type of Packaging (OPTIONAL)" in prompt
+    assert "Business Trigger (OPTIONAL)" in prompt
+    assert "Next field to ask for: Type of Packaging (OPTIONAL)" in prompt
 
 
-def test_product_revision_level_does_not_block_progression():
+def test_product_revision_level_does_not_block_step_progression():
     rfq_state = _build_base_rfq_state()
     rfq_state["products"] = [
         {
@@ -208,7 +215,7 @@ def test_product_revision_level_does_not_block_progression():
     current_step, missing_fields = _get_current_step_and_missing_fields("rfq", rfq_state)
 
     assert current_step == 3
-    assert missing_fields == ["strategic_note", "final_recommendation"]
+    assert missing_fields[0] == "strategic_note"
 
     prompt = _build_missing_fields_prompt("rfq", rfq_state)
 

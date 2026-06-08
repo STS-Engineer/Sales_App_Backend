@@ -213,7 +213,7 @@ def test_is_field_filled_treats_internal_avocarbon_contact_as_missing():
     assert chat._is_field_filled(polluted_contact, "contact_phone") is False
 
 
-def test_get_current_step_ignores_optional_rfq_fields_when_required_fields_are_complete():
+def test_get_current_step_includes_optional_rfq_fields_in_order():
     data = {
         "customer_name": "TPEG",
         "application": "Electronic",
@@ -251,10 +251,40 @@ def test_get_current_step_ignores_optional_rfq_fields_when_required_fields_are_c
         data,
     )
 
-    assert current_step == 2
-    assert "expected_delivery_conditions" in missing_fields
-    assert "ppap_date" not in missing_fields
-    assert "type_of_packaging" not in missing_fields
+    assert current_step == 1
+    assert missing_fields == ["ppap_date"]
+
+
+def test_system_prompt_allows_grouped_product_rows_to_omit_revision_level():
+    assert (
+        "When asking for a full product row in one grouped prompt, do NOT tell "
+        "the user to type `skip` for Revision Level; they may simply leave it out."
+        in chat.SYSTEM_PROMPT
+    )
+    assert (
+        "If it is omitted while the required product row values are present, treat "
+        "Revision Level as blank, save the row, and continue without a dedicated "
+        "follow-up question."
+        in chat.SYSTEM_PROMPT
+    )
+
+
+def test_incomplete_product_fields_ignore_missing_optional_revision_level():
+    assert chat.get_incomplete_product_fields(
+        {
+            "products": [
+                {
+                    "part_number": "P58654",
+                    "revision_level": "",
+                    "quantity": 1000,
+                    "target_price": 100,
+                    "currency": "INR",
+                    "target_price_is_estimated": True,
+                }
+            ]
+        },
+        include_optional=True,
+    ) == []
 
 
 def test_sanitize_rfq_update_fields_rejects_required_skips_and_keeps_optional_skips():
@@ -1165,8 +1195,9 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "NEVER ask the user for the Product Line acronym." in chat.SYSTEM_PROMPT
     assert "Any email address from the `avocarbon.com` domain is an internal Avocarbon address, not a customer contact." in chat.SYSTEM_PROMPT
     assert "an `@avocarbon.com` email does NOT count as a valid customer contact email" in chat.SYSTEM_PROMPT
-    assert "Optional Step 2 fields like Packaging must only be saved if the user voluntarily provides them." in chat.SYSTEM_PROMPT
-    assert "Delivery Conditions, Payment Terms, and Packaging (Step 2)" not in chat.SYSTEM_PROMPT
+    assert "you MUST still ask optional RFQ fields when they appear next in the checklist order" in chat.SYSTEM_PROMPT
+    assert "When you ask any other optional field, you MUST clearly say it is optional and that the user can type `skip` to leave it blank." in chat.SYSTEM_PROMPT
+    assert "Type of Packaging (OPTIONAL — allow `skip`)" in chat.SYSTEM_PROMPT
     assert "append_products=true" in chat.SYSTEM_PROMPT
     assert 'When the user agrees to add a second, third, or subsequent part number, you MUST call updateFormFields with the argument "append_products": true.' in chat.SYSTEM_PROMPT
     assert "Request-level pricing metadata if still missing" not in chat.SYSTEM_PROMPT

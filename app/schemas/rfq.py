@@ -437,8 +437,9 @@ def get_incomplete_product_fields(
             continue
         if not _clean_text(product.get("part_number")):
             missing_fields.append(f"products[{index}].part_number")
-        if include_optional and not _clean_text(product.get("revision_level")):
-            missing_fields.append(f"products[{index}].revision_level")
+        # Revision level is optional for RFQ products. If the user omits it while
+        # providing an otherwise complete product row, we leave it blank and keep
+        # the workflow moving instead of forcing a dedicated follow-up question.
         quantity = _coerce_float_or_none(product.get("quantity"))
         if quantity is None or quantity <= 0:
             missing_fields.append(f"products[{index}].quantity")
