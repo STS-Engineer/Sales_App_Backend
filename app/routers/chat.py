@@ -492,6 +492,31 @@ FIELD_QUESTION_OVERRIDES = {
     "target_price_is_estimated": "What is the Price source?",
 }
 
+SYSTEM_MANAGED_CHAT_FIELDS = {"product_line_acronym"}
+TYPE_OF_PACKAGING_OPTIONS = [
+    "carboard divider",
+    "one way tray",
+    "returnable plastic tray",
+]
+PRICE_SOURCE_OPTIONS = [
+    "Estimated by Avocarbon",
+    "Given by Customer",
+]
+INTERNAL_STATUS_FILLER_SENTENCES = {
+    "update saved.",
+    "update saved",
+    "i've processed the latest information.",
+    "i've processed the latest information",
+    "please continue with the next missing fields.",
+    "please continue with the next missing fields",
+    "i've saved the latest potential details.",
+    "i've saved the latest potential details",
+    "please continue with the next missing information.",
+    "please continue with the next missing information",
+    "i've saved the latest potential details. please continue with the next missing information.",
+    "i've processed the latest information. please continue with the next missing fields.",
+}
+
 
 def _normalize_scope_value(value):
     if isinstance(value, bool):
@@ -556,6 +581,26 @@ def _strip_prompt_examples(label: str) -> str:
         flags=re.IGNORECASE,
     )
     return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def _normalize_internal_status_line(line: str) -> str:
+    normalized = re.sub(r"[*_`]", "", str(line or ""))
+    normalized = re.sub(r"^\s*[-*]\s*", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip().casefold()
+    return normalized
+
+
+def _strip_internal_status_filler(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return ""
+
+    filtered_lines = [
+        line
+        for line in text.splitlines()
+        if _normalize_internal_status_line(line) not in INTERNAL_STATUS_FILLER_SENTENCES
+    ]
+    return "\n".join(filtered_lines).strip()
 
 
 def _is_skip_like_value(value) -> bool:
@@ -1646,6 +1691,10 @@ def _sanitize_assistant_text(content: str) -> str:
     if not text:
         return ""
 
+    text = _strip_internal_status_filler(text).strip()
+    if not text:
+        return ""
+
     text = _strip_technical_error_lines(text).strip()
     if not text:
         return ""
@@ -1706,6 +1755,167 @@ def _build_submit_validation_success_text(
         f"Your {document_label} was submitted and is now {sub_status}. "
         "The validation workflow has started."
     )
+
+
+def _build_products_collection_fallback_text(
+    *,
+    rfq: Rfq,
+    product_index: int = 1,
+) -> str:
+    document_label = _document_type_label(rfq.document_type)
+    ordinal_label = "first" if product_index <= 1 else "next"
+    return (
+        f"Please provide the {ordinal_label} part number (product row) for this "
+        f"{document_label}:\n\n"
+        "Part Number\n"
+        "Quantity\n"
+        "Target Price\n"
+        "Currency (3-letter code)\n"
+        "Price source (Must be either Estimated or Official Customer Price)"
+    )
+
+
+def _build_field_question_with_options(
+    *,
+    rfq: Rfq,
+    field_name: str,
+    extracted_data: dict,
+) -> str:
+    normalized_field_name = str(field_name or "").strip()
+    question = FIELD_QUESTION_OVERRIDES.get(normalized_field_name)
+    if not question:
+        question = _build_generic_field_question(
+            normalized_field_name,
+            FIELD_LABELS.get(
+                normalized_field_name,
+                _humanize_field_name(normalized_field_name),
+            ),
+        )
+
+    if _is_optional_field(normalized_field_name):
+        question = f"{question}\n\n(Optional - type skip to leave it blank.)"
+
+    if normalized_field_name == "rfq_files":
+        return f"{question}\n\nYes\nNo"
+    if normalized_field_name == "delivery_zone":
+        return f"{question}\n\n" + "\n".join(APPROVED_DELIVERY_ZONES)
+    if normalized_field_name == "type_of_packaging":
+        return f"{question}\n\n" + "\n".join(TYPE_OF_PACKAGING_OPTIONS)
+    if normalized_field_name == "target_price_is_estimated":
+        return f"{question}\n\n" + "\n".join(PRICE_SOURCE_OPTIONS)
+
+    product_field_match = re.fullmatch(
+        r"products\[(\d+)\]\.([A-Za-z0-9_]+)",
+        normalized_field_name,
+    )
+    if product_field_match:
+        product_index = int(product_field_match.group(1))
+        base_field_name = product_field_match.group(2)
+        products = (
+            extracted_data.get("products")
+            if isinstance(extracted_data.get("products"), list)
+            else []
+        )
+        product = (
+            products[product_index - 1]
+            if 0 <= product_index - 1 < len(products)
+            and isinstance(products[product_index - 1], dict)
+            else {}
+        )
+        part_number = str(product.get("part_number") or "").strip()
+        currency = str(
+            product.get("currency")
+            or extracted_data.get("target_price_currency")
+            or ""
+        ).strip().upper()
+
+        if base_field_name == "target_price_is_estimated":
+            if part_number:
+                question = f"What is the Price source for part number {part_number}?"
+            else:
+                question = "What is the Price source for this part number?"
+            return f"{question}\n\n" + "\n".join(PRICE_SOURCE_OPTIONS)
+
+        if base_field_name == "target_price":
+            if part_number and currency:
+                return (
+                    "What is the Target price (numeric value) for part number "
+                    f"{part_number} ({currency})?"
+                )
+            if part_number:
+                return f"What is the Target price for part number {part_number}?"
+
+        if part_number:
+            label = FIELD_LABELS.get(
+                base_field_name,
+                _humanize_field_name(base_field_name),
+            )
+            return f"What is the {label} for part number {part_number}?"
+
+        return _build_products_collection_fallback_text(
+            rfq=rfq,
+            product_index=product_index,
+        )
+
+    return question
+
+
+def _build_user_facing_fallback_text(
+    *,
+    rfq: Rfq,
+    chat_mode: str,
+    extracted_data: dict,
+) -> str:
+    if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+        document_label = _document_type_label(rfq.document_type)
+        return f"Your {document_label} is waiting for validator approval."
+
+    current_step, missing_fields = _get_current_step_and_missing_fields(
+        chat_mode,
+        extracted_data,
+    )
+    user_missing_fields = [
+        field_name
+        for field_name in missing_fields
+        if field_name not in AI_GENERATED_STEP_FIELDS
+        and field_name not in SYSTEM_MANAGED_CHAT_FIELDS
+    ]
+
+    if user_missing_fields:
+        next_field = user_missing_fields[0]
+        product_field_match = re.fullmatch(
+            r"products\[(\d+)\]\.([A-Za-z0-9_]+)",
+            next_field,
+        )
+        if product_field_match:
+            product_index = int(product_field_match.group(1))
+            same_product_missing_fields = [
+                field_name
+                for field_name in user_missing_fields
+                if field_name.startswith(f"products[{product_index}].")
+            ]
+            if len(same_product_missing_fields) > 1:
+                return _build_products_collection_fallback_text(
+                    rfq=rfq,
+                    product_index=product_index,
+                )
+        if next_field == "products":
+            return _build_products_collection_fallback_text(rfq=rfq)
+        return _build_field_question_with_options(
+            rfq=rfq,
+            field_name=next_field,
+            extracted_data=extracted_data,
+        )
+
+    if not missing_fields and current_step >= 4:
+        document_label = _document_type_label(rfq.document_type)
+        return (
+            f"Do you want to submit this {document_label} for validation?\n\n"
+            "Yes\n"
+            "No"
+        )
+
+    return "Please send your last answer again."
 
 
 def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
@@ -3213,10 +3423,10 @@ Review this JSON to know exactly what has already been collected:
 
                 final_text = _sanitize_assistant_text(final_text)
                 if not final_text:
-                    final_text = (
-                        "**Update saved.**\n\n"
-                        "- I've processed the latest information.\n"
-                        "- Please continue with the next missing fields."
+                    final_text = _build_user_facing_fallback_text(
+                        rfq=rfq,
+                        chat_mode=chat_mode,
+                        extracted_data=extracted_data,
                     )
                 final_text = _append_assistant_text_if_new(history, final_text)
 
@@ -3224,10 +3434,10 @@ Review this JSON to know exactly what has already been collected:
             final_text = (ai_message.content or "").strip()
             final_text = _sanitize_assistant_text(final_text)
             if not final_text:
-                final_text = (
-                    "**Update saved.**\n\n"
-                    "- I've processed the latest information.\n"
-                    "- Please continue with the next missing fields."
+                final_text = _build_user_facing_fallback_text(
+                    rfq=rfq,
+                    chat_mode=chat_mode,
+                    extracted_data=extracted_data,
                 )
             final_text = _append_assistant_text_if_new(history, final_text)
 

@@ -165,6 +165,18 @@ def test_truncate_potential_chat_history_for_edit_keeps_messages_before_target_u
     assert truncated_history[-1]["content"] == "Next question"
 
 
+def test_potential_sanitize_assistant_text_removes_saved_filler_and_keeps_question():
+    content = (
+        "I've saved the latest Potential details. "
+        "Please continue with the next missing information.\n\n"
+        "Who is the customer and where are they located?"
+    )
+
+    assert chat_potential._sanitize_assistant_text(content) == (
+        "Who is the customer and where are they located?"
+    )
+
+
 @pytest.mark.asyncio
 async def test_generate_potential_response_supports_verify_then_save_in_same_turn(
     monkeypatch,

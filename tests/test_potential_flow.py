@@ -498,7 +498,7 @@ async def test_formal_chat_filters_raw_json_only_responses(
 
     assert chat_response.status_code == 200
     payload = chat_response.json()
-    assert payload["response"].startswith("**Update saved.**")
+    assert payload["response"] == "Who is the Customer?"
     assert "fields_to_update" not in payload["response"]
     assert captured_system_prompts
     assert (
@@ -514,7 +514,7 @@ async def test_formal_chat_filters_raw_json_only_responses(
         for message in (rfq.chat_history or [])
         if message.get("role") == "assistant" and message.get("content")
     ]
-    assert assistant_messages[-1]["content"].startswith("**Update saved.**")
+    assert assistant_messages[-1]["content"] == "Who is the Customer?"
     assert all(
         "fields_to_update" not in str(message.get("content"))
         for message in assistant_messages

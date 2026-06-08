@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import httpx
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -277,7 +278,35 @@ def _build_tool_call_assistant_message(tool_calls: list[dict]) -> dict:
 
 
 def _sanitize_assistant_text(content: str | None) -> str:
-    return str(content or "").strip()
+    text = str(content or "").strip()
+    if not text:
+        return ""
+
+    filler_sentences = {
+        "update saved.",
+        "update saved",
+        "i've processed the latest information.",
+        "i've processed the latest information",
+        "please continue with the next missing fields.",
+        "please continue with the next missing fields",
+        "i've saved the latest potential details.",
+        "i've saved the latest potential details",
+        "please continue with the next missing information.",
+        "please continue with the next missing information",
+        "i've saved the latest potential details. please continue with the next missing information.",
+        "i've processed the latest information. please continue with the next missing fields.",
+    }
+
+    filtered_lines = []
+    for line in text.splitlines():
+        normalized_line = re.sub(r"[*_`]", "", line)
+        normalized_line = re.sub(r"^\s*[-*]\s*", "", normalized_line)
+        normalized_line = re.sub(r"\s+", " ", normalized_line).strip().casefold()
+        if normalized_line in filler_sentences:
+            continue
+        filtered_lines.append(line)
+
+    return "\n".join(filtered_lines).strip()
 
 
 def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
@@ -454,6 +483,8 @@ Core rules:
 - Use checkContactExistence when the contact email is provided.
 - The guided interview order and the current next question take priority.
 - Keep responses concise and in Markdown.
+- Do NOT start by asking how many part numbers/products are included in the request.
+- Only collect product rows if the user voluntarily provides product details or explicitly asks to add products.
 - Do NOT ask about products, part numbers, quantities, or target prices at any point.
 - When all fields are captured, output ONLY this exact sentence and nothing else: "If you're ready, we can proceed to the formal RFQ or RFI."
 
@@ -803,10 +834,8 @@ async def handle_potential_chat(
         if not post_missing:
             final_text = INVITATION
         elif not final_text:
-            final_text = (
-                "I've saved the latest Potential details. "
-                "Please continue with the next missing information."
-            )
+            next_question, _ = _find_next_question(potential)
+            final_text = next_question
         _append_assistant_text_if_new(history, final_text)
     except (httpx.TimeoutException, APITimeoutError):
         final_text = (

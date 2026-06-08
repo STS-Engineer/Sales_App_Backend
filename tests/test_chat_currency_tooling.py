@@ -73,10 +73,7 @@ def test_sanitize_assistant_text_removes_json_blocks_and_preserves_prose():
         "Please continue with the next missing fields."
     )
 
-    assert chat._sanitize_assistant_text(content) == (
-        "I saved the latest details.\n\n"
-        "Please continue with the next missing fields."
-    )
+    assert chat._sanitize_assistant_text(content) == "I saved the latest details."
 
 
 def test_sanitize_assistant_text_removes_leading_tool_payload_and_keeps_summary():
@@ -138,6 +135,17 @@ def test_sanitize_assistant_text_removes_failed_to_parse_json_line():
         "New customer. It will be added to the database later after we get the contact details.\n"
         "What is the Application?"
     )
+
+
+def test_sanitize_assistant_text_removes_update_saved_filler_and_keeps_question():
+    content = (
+        "**Update saved.**\n\n"
+        "- I've processed the latest information.\n"
+        "- Please continue with the next missing fields.\n\n"
+        "What is the Application?"
+    )
+
+    assert chat._sanitize_assistant_text(content) == "What is the Application?"
 
 
 def test_extract_successful_submit_validation_payload_returns_success_payload():
