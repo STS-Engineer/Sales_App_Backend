@@ -1865,6 +1865,7 @@ def _build_user_facing_fallback_text(
     rfq: Rfq,
     chat_mode: str,
     extracted_data: dict,
+    user_message: str = "",
 ) -> str:
     if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
         document_label = _document_type_label(rfq.document_type)
@@ -1901,6 +1902,14 @@ def _build_user_facing_fallback_text(
                 )
         if next_field == "products":
             return _build_products_collection_fallback_text(rfq=rfq)
+        if next_field == "contact_email" and any(
+            f"@{domain}" in user_message.casefold()
+            for domain in INTERNAL_CUSTOMER_CONTACT_EMAIL_DOMAINS
+        ):
+            return (
+                "That's an internal Avocarbon address — it cannot be used as a customer contact.\n\n"
+                "What is the Contact email?"
+            )
         return _build_field_question_with_options(
             rfq=rfq,
             field_name=next_field,
@@ -2808,7 +2817,7 @@ CRITICAL STEP 4 RULES:
 6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `products`, `total_target_to`, `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
 7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the request for validation, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
 8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-9. CRITICAL SUBMISSION RULE: When the user confirms submission, you MUST ONLY invoke the submitValidation tool. Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool. Just trigger the function.
+9. CRITICAL SUBMISSION RULE: When you ask "Do you want to submit this RFQ for validation?" and the user replies "Yes", you MUST ONLY invoke the submitValidation tool. Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool. Just trigger the function.
 10. After `submitValidation` succeeds, acknowledge exactly once that the RFQ or RFI was submitted, confirm that it is now `PENDING_FOR_VALIDATION`, and clearly tell the user that the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT. Do NOT ask for confirmation again.
 """
 
@@ -3427,6 +3436,7 @@ Review this JSON to know exactly what has already been collected:
                         rfq=rfq,
                         chat_mode=chat_mode,
                         extracted_data=extracted_data,
+                        user_message=req.message,
                     )
                 final_text = _append_assistant_text_if_new(history, final_text)
 
@@ -3438,6 +3448,7 @@ Review this JSON to know exactly what has already been collected:
                     rfq=rfq,
                     chat_mode=chat_mode,
                     extracted_data=extracted_data,
+                    user_message=req.message,
                 )
             final_text = _append_assistant_text_if_new(history, final_text)
 

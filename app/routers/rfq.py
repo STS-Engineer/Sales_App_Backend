@@ -294,6 +294,8 @@ def _ensure_valid_phase_sub_status(phase: RfqPhase, sub_status: RfqSubStatus) ->
 
 def _set_phase_sub_status(rfq: Rfq, phase: RfqPhase, sub_status: RfqSubStatus) -> None:
     _ensure_valid_phase_sub_status(phase, sub_status)
+    if rfq.phase != phase or rfq.sub_status != sub_status:
+        rfq.last_notification_sent_at = None
     rfq.phase = phase
     rfq.sub_status = sub_status
 
@@ -1124,6 +1126,7 @@ async def _submit_rfq_for_validation_internal(
             validator_role=validator_role,
         )
         if email_sent:
+            rfq.last_notification_sent_at = datetime.datetime.utcnow()
             await record_notification_sent(
                 db,
                 rfq_id=rfq.rfq_id,
@@ -1311,6 +1314,7 @@ async def proceed_to_rfq(
     rfq.document_type = target_type
     rfq.phase = RfqPhase.RFQ
     rfq.sub_status = RfqSubStatus.NEW_RFQ
+    rfq.last_notification_sent_at = None
 
     label = target_type.value
     await log_action(db, rfq_id, f"Potential promoted to formal {label}", current_user.email)
@@ -2072,6 +2076,7 @@ async def validate_rfq(
                 _build_rfq_link(refreshed_rfq.rfq_id),
             )
             if email_sent:
+                refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
                 await record_notification_sent(
                     db,
                     rfq_id=refreshed_rfq.rfq_id,
@@ -2160,6 +2165,7 @@ async def costing_review(
                 rfq_link,
             )
             if handoff_email_sent:
+                refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
                 await record_notification_sent(
                     db,
                     rfq_id=refreshed_rfq.rfq_id,
