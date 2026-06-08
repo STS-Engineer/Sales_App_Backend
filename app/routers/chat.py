@@ -1757,6 +1757,52 @@ def _build_submit_validation_success_text(
     )
 
 
+def _tool_messages_indicate_internal_contact_blocked(
+    tool_messages: list[dict] | None,
+) -> bool:
+    for tool_message in tool_messages or []:
+        if not isinstance(tool_message, dict):
+            continue
+        payload = _try_load_json_payload(tool_message.get("content") or "")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("internal_contact") is True:
+            return True
+        if payload.get("status") == "internal_contact_blocked":
+            return True
+        blocked_fields = payload.get("blocked_internal_contact_fields") or []
+        if isinstance(blocked_fields, list) and any(
+            field_name in RFQ_CONTACT_FIELDS for field_name in blocked_fields
+        ):
+            return True
+    return False
+
+
+def _text_explains_internal_contact_rejection(content: str | None) -> bool:
+    normalized = str(content or "").casefold()
+    return (
+        "avocarbon" in normalized
+        and "contact" in normalized
+        and ("internal" in normalized or "cannot be used" in normalized)
+    )
+
+
+def _build_internal_contact_rejection_text(
+    *,
+    rfq: Rfq,
+    extracted_data: dict,
+) -> str:
+    return (
+        "That email is an internal Avocarbon address and cannot be used as a "
+        "customer contact.\n\n"
+        + _build_field_question_with_options(
+            rfq=rfq,
+            field_name="contact_email",
+            extracted_data=extracted_data,
+        )
+    )
+
+
 def _build_products_collection_fallback_text(
     *,
     rfq: Rfq,
@@ -1866,6 +1912,7 @@ def _build_user_facing_fallback_text(
     chat_mode: str,
     extracted_data: dict,
     user_message: str = "",
+    force_internal_contact_explanation: bool = False,
 ) -> str:
     if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
         document_label = _document_type_label(rfq.document_type)
@@ -1902,6 +1949,11 @@ def _build_user_facing_fallback_text(
                 )
         if next_field == "products":
             return _build_products_collection_fallback_text(rfq=rfq)
+        if next_field == "contact_email" and force_internal_contact_explanation:
+            return _build_internal_contact_rejection_text(
+                rfq=rfq,
+                extracted_data=extracted_data,
+            )
         if next_field == "contact_email" and any(
             f"@{domain}" in user_message.casefold()
             for domain in INTERNAL_CUSTOMER_CONTACT_EMAIL_DOMAINS
@@ -2817,7 +2869,7 @@ CRITICAL STEP 4 RULES:
 6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `products`, `total_target_to`, `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
 7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the request for validation, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
 8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-9. CRITICAL SUBMISSION RULE: When you ask "Do you want to submit this RFQ for validation?" and the user replies "Yes", you MUST ONLY invoke the submitValidation tool. Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool. Just trigger the function.
+9. CRITICAL SUBMISSION RULE: When the user confirms submission, you MUST ONLY invoke the submitValidation tool. When you ask "Do you want to submit this RFQ for validation?" and the user replies "Yes", you MUST ONLY invoke the submitValidation tool. Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool. Just trigger the function.
 10. After `submitValidation` succeeds, acknowledge exactly once that the RFQ or RFI was submitted, confirm that it is now `PENDING_FOR_VALIDATION`, and clearly tell the user that the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT. Do NOT ask for confirmation again.
 """
 
@@ -3328,6 +3380,7 @@ Review this JSON to know exactly what has already been collected:
         if normalized_tool_calls:
             history.append(assistant_tool_message)
             messages_for_llm.append(assistant_tool_message)
+            internal_contact_blocked_this_turn = False
 
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(INTERNAL_TOOL_TIMEOUT_SECONDS)
@@ -3340,10 +3393,14 @@ Review this JSON to know exactly what has already been collected:
                     rfq=rfq,
                     current_user=current_user,
                     extracted_data=extracted_data,
-                    chat_mode=chat_mode,
-                    tool_calls_used=tool_calls_used,
+                        chat_mode=chat_mode,
+                        tool_calls_used=tool_calls_used,
                 )
                 auto_redirect = auto_redirect or redirect_requested
+                internal_contact_blocked_this_turn = (
+                    internal_contact_blocked_this_turn
+                    or _tool_messages_indicate_internal_contact_blocked(tool_messages)
+                )
                 for tool_message in tool_messages:
                     history.append(tool_message)
                     messages_for_llm.append(tool_message)
@@ -3402,6 +3459,12 @@ Review this JSON to know exactly what has already been collected:
                             tool_calls_used=tool_calls_used,
                         )
                         auto_redirect = auto_redirect or redirect_requested
+                        internal_contact_blocked_this_turn = (
+                            internal_contact_blocked_this_turn
+                            or _tool_messages_indicate_internal_contact_blocked(
+                                follow_up_tool_messages
+                            )
+                        )
                         for tool_message in follow_up_tool_messages:
                             history.append(tool_message)
                             messages_for_llm.append(tool_message)
@@ -3431,12 +3494,24 @@ Review this JSON to know exactly what has already been collected:
                     final_text = (follow_up_message.content or "").strip()
 
                 final_text = _sanitize_assistant_text(final_text)
+                if (
+                    internal_contact_blocked_this_turn
+                    and not _text_explains_internal_contact_rejection(final_text)
+                ):
+                    final_text = _build_user_facing_fallback_text(
+                        rfq=rfq,
+                        chat_mode=chat_mode,
+                        extracted_data=extracted_data,
+                        user_message=req.message,
+                        force_internal_contact_explanation=True,
+                    )
                 if not final_text:
                     final_text = _build_user_facing_fallback_text(
                         rfq=rfq,
                         chat_mode=chat_mode,
                         extracted_data=extracted_data,
                         user_message=req.message,
+                        force_internal_contact_explanation=internal_contact_blocked_this_turn,
                     )
                 final_text = _append_assistant_text_if_new(history, final_text)
 

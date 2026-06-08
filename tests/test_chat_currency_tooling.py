@@ -148,6 +148,69 @@ def test_sanitize_assistant_text_removes_update_saved_filler_and_keeps_question(
     assert chat._sanitize_assistant_text(content) == "What is the Application?"
 
 
+def test_build_user_facing_fallback_text_explains_internal_avocarbon_contact_rejection():
+    rfq = SimpleNamespace(
+        sub_status="NEW_RFQ",
+        document_type=chat.RfqDocumentType.RFQ,
+    )
+
+    text = chat._build_user_facing_fallback_text(
+        rfq=rfq,
+        chat_mode="rfq",
+        extracted_data={
+            "customer_name": "Bosch",
+            "application": "Motor",
+            "product_name": "Brush Holder",
+            "project_name": "Proj-1",
+            "rfq_files": [{"name": "drawing.pdf"}],
+            "products": [
+                {
+                    "part_number": "PN-001",
+                    "quantity": 1000,
+                    "target_price": 1.5,
+                    "currency": "EUR",
+                    "target_price_is_estimated": True,
+                }
+            ],
+            "delivery_zone": "Europe",
+            "delivery_plant": "Plant A",
+            "country": "France",
+            "po_date": "2027-01-01",
+            "ppap_date": "_",
+            "sop_year": "2028",
+            "rfq_reception_date": "2026-12-01",
+            "quotation_expected_date": "2026-12-15",
+            "contact_name": "Jane Doe",
+            "contact_role": "Buyer",
+            "contact_phone": "+33 1 23 45 67 89",
+        },
+        force_internal_contact_explanation=True,
+    )
+
+    assert "internal Avocarbon address" in text
+    assert text.endswith("What is the Contact email?")
+
+
+def test_tool_messages_indicate_internal_contact_blocked():
+    assert (
+        chat._tool_messages_indicate_internal_contact_blocked(
+            [
+                {
+                    "name": "updateFormFields",
+                    "content": json.dumps(
+                        {
+                            "success": False,
+                            "status": "internal_contact_blocked",
+                            "blocked_internal_contact_fields": ["contact_email"],
+                        }
+                    ),
+                }
+            ]
+        )
+        is True
+    )
+
+
 def test_extract_successful_submit_validation_payload_returns_success_payload():
     payload = chat._extract_successful_submit_validation_payload(
         [
