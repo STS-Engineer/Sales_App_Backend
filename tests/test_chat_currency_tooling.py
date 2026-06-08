@@ -127,6 +127,52 @@ def test_sanitize_assistant_text_rewrites_field_label_with_options_into_question
     )
 
 
+def test_sanitize_assistant_text_removes_failed_to_parse_json_line():
+    content = (
+        "Failed to parse as JSON: unexpected character: line 1 column 1 (char 0)\n\n"
+        "New customer. It will be added to the database later after we get the contact details.\n"
+        "What is the Application?"
+    )
+
+    assert chat._sanitize_assistant_text(content) == (
+        "New customer. It will be added to the database later after we get the contact details.\n"
+        "What is the Application?"
+    )
+
+
+def test_extract_successful_submit_validation_payload_returns_success_payload():
+    payload = chat._extract_successful_submit_validation_payload(
+        [
+            {
+                "name": "submitValidation",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "sub_status": "PENDING_FOR_VALIDATION",
+                    }
+                ),
+            }
+        ]
+    )
+
+    assert payload == {
+        "success": True,
+        "sub_status": "PENDING_FOR_VALIDATION",
+    }
+
+
+def test_build_submit_validation_success_text_uses_document_type():
+    rfq = SimpleNamespace(document_type=chat.RfqDocumentType.RFI)
+
+    assert chat._build_submit_validation_success_text(
+        rfq,
+        {"sub_status": "PENDING_FOR_VALIDATION"},
+    ) == (
+        "Your RFI was submitted and is now PENDING_FOR_VALIDATION. "
+        "The validation workflow has started."
+    )
+
+
 def test_sanitize_chat_history_reuses_assistant_sanitizer_for_persisted_messages():
     history = [
         {
@@ -151,6 +197,20 @@ def test_is_field_filled_keeps_optional_skip_but_rejects_required_skip():
     assert chat._is_field_filled({"ppap_date": "_"}, "ppap_date") is True
     assert chat._is_field_filled({"po_date": "_"}, "po_date") is False
     assert chat._is_field_filled({"scope": "skip"}, "scope") is False
+
+
+def test_is_field_filled_treats_internal_avocarbon_contact_as_missing():
+    polluted_contact = {
+        "contact_email": "ons.ghariani@avocarbon.com",
+        "contact_name": "Ons Ghariani",
+        "contact_role": "Sales",
+        "contact_phone": "+216 00 000 000",
+    }
+
+    assert chat._is_field_filled(polluted_contact, "contact_email") is False
+    assert chat._is_field_filled(polluted_contact, "contact_name") is False
+    assert chat._is_field_filled(polluted_contact, "contact_role") is False
+    assert chat._is_field_filled(polluted_contact, "contact_phone") is False
 
 
 def test_get_current_step_ignores_optional_rfq_fields_when_required_fields_are_complete():
@@ -198,7 +258,11 @@ def test_get_current_step_ignores_optional_rfq_fields_when_required_fields_are_c
 
 
 def test_sanitize_rfq_update_fields_rejects_required_skips_and_keeps_optional_skips():
-    sanitized_fields, rejected_required_fields = (
+    (
+        sanitized_fields,
+        rejected_required_fields,
+        blocked_internal_contact_fields,
+    ) = (
         chat._sanitize_rfq_update_fields_for_chat(
             {
                 "po_date": "skip",
@@ -226,6 +290,34 @@ def test_sanitize_rfq_update_fields_rejects_required_skips_and_keeps_optional_sk
         "po_date",
         "products[0].part_number",
         "products[0].currency",
+    }
+    assert blocked_internal_contact_fields == []
+
+
+def test_sanitize_rfq_update_fields_blocks_internal_avocarbon_contact_fields():
+    (
+        sanitized_fields,
+        rejected_required_fields,
+        blocked_internal_contact_fields,
+    ) = (
+        chat._sanitize_rfq_update_fields_for_chat(
+            {
+                "customer_name": "Bosch",
+                "contact_email": "ons.ghariani@avocarbon.com",
+                "contact_name": "Ons Ghariani",
+                "contact_role": "Sales Engineer",
+                "contact_phone": "+216 11 222 333",
+            }
+        )
+    )
+
+    assert sanitized_fields == {"customer_name": "Bosch"}
+    assert rejected_required_fields == []
+    assert set(blocked_internal_contact_fields) == {
+        "contact_email",
+        "contact_name",
+        "contact_role",
+        "contact_phone",
     }
 
 
@@ -323,6 +415,19 @@ class _FakeDb:
         return None
 
 
+class _UnexpectedHttpClient:
+    async def get(self, *args, **kwargs):
+        raise AssertionError("HTTP client should not be called in this scenario.")
+
+
+class _StaticTextHttpClient:
+    def __init__(self, text):
+        self._text = text
+
+    async def get(self, *args, **kwargs):
+        return SimpleNamespace(text=self._text)
+
+
 def _build_matrix():
     return SimpleNamespace(
         product_line="Brushes",
@@ -356,6 +461,75 @@ def _build_product(**overrides):
     }
     data.update(overrides)
     return data
+
+
+@pytest.mark.asyncio
+async def test_check_contact_existence_blocks_internal_avocarbon_email_without_http_call():
+    extracted_data = {}
+
+    tool_messages, auto_redirect = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "contact-internal-1",
+                "name": "checkContactExistence",
+                "arguments": {
+                    "contact_email": "ons.ghariani@avocarbon.com",
+                },
+            }
+        ],
+        http_client=_UnexpectedHttpClient(),
+        db=None,
+        db3=None,
+        rfq=_build_rfq(),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert auto_redirect is False
+    assert payload["exists"] is False
+    assert payload["internal_contact"] is True
+    assert "customer contacts" in payload["message"]
+    assert "contact_email" not in extracted_data
+
+
+@pytest.mark.asyncio
+async def test_check_group_existence_normalizes_non_json_tool_response():
+    extracted_data = {}
+
+    tool_messages, auto_redirect = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "group-invalid-json-1",
+                "name": "checkGroupeExistence",
+                "arguments": {
+                    "groupeName": "Valeo India",
+                },
+            }
+        ],
+        http_client=_StaticTextHttpClient(
+            "Failed to parse as JSON: unexpected character: line 1 column 1 (char 0)"
+        ),
+        db=None,
+        db3=None,
+        rfq=_build_rfq(),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert auto_redirect is False
+    assert payload["exists"] is False
+    assert payload["matches"] == []
+    assert payload["tool_error"] == "invalid_json_response"
+    assert "Failed to parse as JSON" not in tool_messages[0]["content"]
+    assert extracted_data["customer_name"] == "Valeo India"
 
 
 @pytest.mark.asyncio
@@ -518,6 +692,49 @@ async def test_update_form_fields_preserves_product_row_price_source_as_boolean(
     assert extracted_data["products"][0]["target_price_is_estimated"] is True
     assert isinstance(extracted_data["products"][0]["target_price_is_estimated"], bool)
     assert "target_price_is_estimated" not in extracted_data
+
+
+@pytest.mark.asyncio
+async def test_update_form_fields_blocks_internal_avocarbon_contact_fields():
+    extracted_data = {}
+
+    tool_messages, auto_redirect = await chat._execute_tool_calls(
+        tool_calls=[
+            {
+                "id": "update-internal-contact-1",
+                "name": "updateFormFields",
+                "arguments": {
+                    "fields_to_update": {
+                        "contact_email": "ons.ghariani@avocarbon.com",
+                        "contact_name": "Ons Ghariani",
+                        "contact_role": "Sales Engineer",
+                        "contact_phone": "+216 11 222 333",
+                    }
+                },
+            }
+        ],
+        http_client=None,
+        db=_FakeDb(_build_matrix()),
+        db3=None,
+        rfq=_build_rfq(),
+        current_user=SimpleNamespace(email="user@example.com"),
+        extracted_data=extracted_data,
+        chat_mode="rfq",
+        tool_calls_used=[],
+    )
+
+    payload = json.loads(tool_messages[0]["content"])
+
+    assert auto_redirect is False
+    assert payload["success"] is False
+    assert payload["status"] == "internal_contact_blocked"
+    assert set(payload["blocked_internal_contact_fields"]) == {
+        "contact_email",
+        "contact_name",
+        "contact_role",
+        "contact_phone",
+    }
+    assert extracted_data == {}
 
 
 def test_normalize_tool_arguments_preserves_append_products_flag():
@@ -946,6 +1163,8 @@ def test_system_prompt_includes_dimension_fx_and_delivery_zone_instructions():
     assert "Would you like to add another part number to this request?" in chat.SYSTEM_PROMPT
     assert "NEVER ask the user how many part numbers/products there are upfront." in chat.SYSTEM_PROMPT
     assert "NEVER ask the user for the Product Line acronym." in chat.SYSTEM_PROMPT
+    assert "Any email address from the `avocarbon.com` domain is an internal Avocarbon address, not a customer contact." in chat.SYSTEM_PROMPT
+    assert "an `@avocarbon.com` email does NOT count as a valid customer contact email" in chat.SYSTEM_PROMPT
     assert "Optional Step 2 fields like Packaging must only be saved if the user voluntarily provides them." in chat.SYSTEM_PROMPT
     assert "Delivery Conditions, Payment Terms, and Packaging (Step 2)" not in chat.SYSTEM_PROMPT
     assert "append_products=true" in chat.SYSTEM_PROMPT

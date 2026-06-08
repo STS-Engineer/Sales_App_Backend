@@ -76,6 +76,7 @@ ENGLISH_INITIAL_GREETING_TEMPLATE = (
     "1. Guide me step by step\n"
     "2. I will provide a whole paragraph"
 )
+RFQ_PARAGRAPH_MODE_PROMPT = "Great! Please paste your entire RFQ paragraph below."
 SELF_REVISION_REQUEST_COMMENT = "Self-update initiated by assigned validator."
 SELF_REVISION_GREETING = (
     "Welcome back! Please tell me what fields you would like to update."
@@ -388,6 +389,13 @@ RFQ_OPTIONAL_FIELDS = {
     if bool(step_field.get("is_optional"))
 }
 RFQ_OPTIONAL_PRODUCT_FIELDS = {"revision_level"}
+RFQ_CONTACT_FIELDS = {
+    "contact_email",
+    "contact_name",
+    "contact_role",
+    "contact_phone",
+}
+INTERNAL_CUSTOMER_CONTACT_EMAIL_DOMAINS = {"avocarbon.com"}
 SKIP_LIKE_TEXT_VALUES = {
     "_",
     "skip",
@@ -559,6 +567,33 @@ def _is_skip_like_value(value) -> bool:
     return normalized in SKIP_LIKE_TEXT_VALUES
 
 
+def _normalize_email(value) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _extract_email_domain(value) -> str:
+    normalized_email = _normalize_email(value)
+    if "@" not in normalized_email:
+        return ""
+    return normalized_email.rsplit("@", 1)[-1]
+
+
+def _is_internal_customer_contact_email(value) -> bool:
+    domain = _extract_email_domain(value)
+    if not domain:
+        return False
+    return any(
+        domain == internal_domain or domain.endswith(f".{internal_domain}")
+        for internal_domain in INTERNAL_CUSTOMER_CONTACT_EMAIL_DOMAINS
+    )
+
+
+def _has_internal_customer_contact_email(data: dict | None) -> bool:
+    if not isinstance(data, dict):
+        return False
+    return _is_internal_customer_contact_email(data.get("contact_email"))
+
+
 def _normalize_prompt_label_text(label: str) -> str:
     cleaned = _strip_prompt_examples(str(label or ""))
     cleaned = re.sub(r"\s*\(OPTIONAL\)\s*$", "", cleaned, flags=re.IGNORECASE)
@@ -707,11 +742,22 @@ def _get_missing_required_fields_for_step(
 
 def _sanitize_rfq_update_fields_for_chat(
     fields: dict[str, object],
-) -> tuple[dict[str, object], list[str]]:
+) -> tuple[dict[str, object], list[str], list[str]]:
     sanitized_fields: dict[str, object] = {}
     rejected_required_fields: list[str] = []
+    blocked_internal_contact_fields: list[str] = []
+
+    if _is_internal_customer_contact_email(fields.get("contact_email")):
+        blocked_internal_contact_fields.extend(
+            field_name
+            for field_name in RFQ_CONTACT_FIELDS
+            if field_name in fields
+        )
 
     for field_name, value in fields.items():
+        if field_name in blocked_internal_contact_fields:
+            continue
+
         if field_name == "products":
             normalized_products = normalize_rfq_data_products(
                 {"products": value},
@@ -745,7 +791,11 @@ def _sanitize_rfq_update_fields_for_chat(
 
         sanitized_fields[field_name] = value
 
-    return sanitized_fields, rejected_required_fields
+    return (
+        sanitized_fields,
+        rejected_required_fields,
+        blocked_internal_contact_fields,
+    )
 
 
 def _coerce_numeric_value(value) -> float:
@@ -942,6 +992,8 @@ def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
 
 
 def _is_field_filled(data: dict, field_name: str, *, include_optional: bool = True) -> bool:
+    if field_name in RFQ_CONTACT_FIELDS and _has_internal_customer_contact_email(data):
+        return False
     if field_name == "products":
         return not get_incomplete_product_fields(
             data,
@@ -994,7 +1046,53 @@ def _get_current_step_and_missing_fields(chat_mode: str, data: dict) -> tuple[in
     return steps[-1][0], []
 
 
-def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
+def _history_uses_paragraph_mode(history: list[dict] | None) -> bool:
+    for message in history or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "assistant":
+            continue
+        if str(message.get("content") or "").strip() == RFQ_PARAGRAPH_MODE_PROMPT:
+            return True
+    return False
+
+
+def _should_prioritize_rfq_files(
+    chat_mode: str,
+    current_step: int,
+    user_keys_missing: list[str],
+) -> bool:
+    if chat_mode == "potential" or current_step != 1 or "rfq_files" not in user_keys_missing:
+        return False
+
+    step_1_fields = next(
+        (fields for step_number, fields in RFQ_STEPS if step_number == 1),
+        [],
+    )
+    ordered_required_step_1_fields = _get_step_fields(
+        step_1_fields,
+        include_optional=False,
+    )
+    try:
+        rfq_files_index = ordered_required_step_1_fields.index("rfq_files")
+    except ValueError:
+        return False
+
+    required_fields_before_rfq_files = set(
+        ordered_required_step_1_fields[:rfq_files_index]
+    )
+    return not any(
+        missing_field in required_fields_before_rfq_files
+        for missing_field in user_keys_missing
+    )
+
+
+def _build_missing_fields_prompt(
+    chat_mode: str,
+    data: dict,
+    *,
+    prioritize_rfq_files: bool = False,
+) -> str:
     if chat_mode == "potential":
         steps = POTENTIAL_STEPS
     else:
@@ -1015,6 +1113,18 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
     ]
     user_keys_missing = [key for key in missing_fields if key not in AI_GENERATED_STEP_FIELDS]
     ai_keys_missing = [key for key in missing_fields if key in AI_GENERATED_STEP_FIELDS]
+    prioritize_rfq_files_now = (
+        prioritize_rfq_files
+        and _should_prioritize_rfq_files(
+            chat_mode,
+            current_step,
+            user_keys_missing,
+        )
+    )
+    if prioritize_rfq_files_now:
+        user_keys_missing = ["rfq_files"] + [
+            key for key in user_keys_missing if key != "rfq_files"
+        ]
     next_field_to_ask = user_keys_missing[0] if user_keys_missing else (
         ai_keys_missing[0] if ai_keys_missing else ""
     )
@@ -1038,6 +1148,11 @@ def _build_missing_fields_prompt(chat_mode: str, data: dict) -> str:
         prompt += (
             "\n- When asking the next field, you MUST write a real question in natural "
             "language. Never output only the bare field label."
+        )
+    if prioritize_rfq_files_now:
+        prompt += (
+            "\n- PARAGRAPH MODE FILE BLOCKER: `rfq_files` is still missing. "
+            "You MUST ask for the RFQ files upload before any later remaining Step 1 field."
         )
     if not missing_fields:
         prompt += (
@@ -1136,6 +1251,62 @@ def _try_load_json_payload(content: str):
         if parsed_payload is not None:
             return parsed_payload
     return None
+
+
+def _normalize_external_tool_response_content(
+    tool_name: str,
+    response_text: str,
+) -> str:
+    parsed_payload = _try_load_json_payload(response_text)
+    if parsed_payload is not None:
+        return json.dumps(parsed_payload)
+
+    logger.warning(
+        "Tool %s returned non-JSON content. Falling back to a safe tool payload.",
+        tool_name,
+    )
+
+    fallback_payloads = {
+        "checkGroupeExistence": {
+            "exists": False,
+            "matches": [],
+            "tool_error": "invalid_json_response",
+        },
+        "retrieveProducts": {
+            "products": [],
+            "tool_error": "invalid_json_response",
+        },
+        "checkContactExistence": {
+            "exists": False,
+            "contact": None,
+            "tool_error": "invalid_json_response",
+        },
+    }
+    return json.dumps(
+        fallback_payloads.get(
+            tool_name,
+            {"success": False, "tool_error": "invalid_json_response"},
+        )
+    )
+
+
+def _is_technical_parse_error_line(line: str) -> bool:
+    return bool(
+        re.match(
+            r"(?i)^\s*failed to parse as json\s*:",
+            str(line or "").strip(),
+        )
+    )
+
+
+def _strip_technical_error_lines(content: str) -> str:
+    lines = str(content or "").splitlines()
+    filtered_lines = [
+        line
+        for line in lines
+        if not _is_technical_parse_error_line(line)
+    ]
+    return "\n".join(filtered_lines).strip()
 
 
 def _normalize_tool_arguments(func_name: str, args: dict | None) -> dict:
@@ -1473,6 +1644,10 @@ def _sanitize_assistant_text(content: str) -> str:
     if not text:
         return ""
 
+    text = _strip_technical_error_lines(text).strip()
+    if not text:
+        return ""
+
     text = _strip_fenced_json_blocks(text).strip()
     if _is_internal_tool_payload_text(text):
         return ""
@@ -1500,6 +1675,35 @@ def _build_tool_call_assistant_message(tool_calls: list[dict]) -> dict:
             for tool_call in tool_calls
         ],
     }
+
+
+def _extract_successful_submit_validation_payload(
+    tool_messages: list[dict] | None,
+) -> dict | None:
+    for tool_message in tool_messages or []:
+        if not isinstance(tool_message, dict):
+            continue
+        if tool_message.get("name") != "submitValidation":
+            continue
+        payload = _try_load_json_payload(tool_message.get("content") or "")
+        if isinstance(payload, dict) and payload.get("success") is True:
+            return payload
+    return None
+
+
+def _build_submit_validation_success_text(
+    rfq: Rfq,
+    payload: dict | None = None,
+) -> str:
+    document_label = _document_type_label(rfq.document_type)
+    sub_status = str(
+        (payload or {}).get("sub_status")
+        or RfqSubStatus.PENDING_FOR_VALIDATION.value
+    ).strip() or RfqSubStatus.PENDING_FOR_VALIDATION.value
+    return (
+        f"Your {document_label} was submitted and is now {sub_status}. "
+        "The validation workflow has started."
+    )
 
 
 def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
@@ -1616,7 +1820,10 @@ async def _execute_tool_calls(
                 f"{BASE_URL}/api/data/groupe/check",
                 params={"groupeName": groupe},
             )
-            tool_response_text = resp.text
+            tool_response_text = _normalize_external_tool_response_content(
+                func_name,
+                resp.text,
+            )
 
         elif func_name == "retrieveProducts":
             prod_name = args.get("productName", "")
@@ -1624,7 +1831,10 @@ async def _execute_tool_calls(
                 f"{BASE_URL}/api/products",
                 params={"productName": prod_name},
             )
-            tool_response_text = resp.text
+            tool_response_text = _normalize_external_tool_response_content(
+                func_name,
+                resp.text,
+            )
 
         elif func_name == "uploadRfqFiles":
             tool_response_text = json.dumps(
@@ -1639,13 +1849,34 @@ async def _execute_tool_calls(
 
         elif func_name == "checkContactExistence":
             email = args.get("contact_email")
-            if email:
+            if email and _is_internal_customer_contact_email(email):
+                tool_response_text = json.dumps(
+                    {
+                        "exists": False,
+                        "internal_contact": True,
+                        "message": (
+                            "Internal Avocarbon email addresses are not valid "
+                            "customer contacts."
+                        ),
+                    }
+                )
+            elif email:
                 extracted_data["contact_email"] = email
-            resp = await http_client.get(
-                f"{BASE_URL}/api/contact/check",
-                params={"email": email},
-            )
-            tool_response_text = resp.text
+                resp = await http_client.get(
+                    f"{BASE_URL}/api/contact/check",
+                    params={"email": email},
+                )
+                tool_response_text = _normalize_external_tool_response_content(
+                    func_name,
+                    resp.text,
+                )
+            else:
+                tool_response_text = json.dumps(
+                    {
+                        "exists": False,
+                        "error": "contact_email is required",
+                    }
+                )
 
         elif func_name == "get_eur_exchange_rate":
             currency_code = str(args.get("currency_code") or "").strip().upper()
@@ -1945,8 +2176,13 @@ async def _execute_tool_calls(
                 )
             filtered_fields = _filter_update_fields(chat_mode, fields)
             rejected_required_fields: list[str] = []
+            blocked_internal_contact_fields: list[str] = []
             if chat_mode != "potential":
-                filtered_fields, rejected_required_fields = (
+                (
+                    filtered_fields,
+                    rejected_required_fields,
+                    blocked_internal_contact_fields,
+                ) = (
                     _sanitize_rfq_update_fields_for_chat(filtered_fields)
                 )
             if "delivery_zone" in filtered_fields:
@@ -2019,6 +2255,28 @@ async def _execute_tool_calls(
                 )
                 continue
 
+            if not filtered_fields and blocked_internal_contact_fields:
+                tool_response_text = json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "Internal Avocarbon contact details cannot be saved "
+                            "as customer contact information."
+                        ),
+                        "blocked_internal_contact_fields": blocked_internal_contact_fields,
+                        "status": "internal_contact_blocked",
+                    }
+                )
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": func_name,
+                        "content": tool_response_text,
+                    }
+                )
+                continue
+
             products_are_authoritative = "products" in filtered_fields
             for key, value in filtered_fields.items():
                 if key == "target_price_is_estimated":
@@ -2058,8 +2316,11 @@ async def _execute_tool_calls(
                         set(fields.keys()) - set(filtered_fields.keys())
                     ),
                     "rejected_required_fields": rejected_required_fields,
+                    "blocked_internal_contact_fields": blocked_internal_contact_fields,
                     "status": (
-                        "partial_update_required_fields_still_missing"
+                        "internal_contact_blocked"
+                        if blocked_internal_contact_fields
+                        else "partial_update_required_fields_still_missing"
                         if rejected_required_fields
                         else "extracted_to_form"
                     ),
@@ -2194,6 +2455,7 @@ CRITICAL OUTPUT RULES:
 STRICT CHECKLIST RULE: You MUST ONLY ask the user for the exact fields explicitly listed in the injected MISSING_FIELDS_PROMPT. You are strictly FORBIDDEN from inventing new questions, fields, or requirements (such as "delivery city", "full address", or "zip code"). If it is not in the missing fields array, do not ask for it. EXCEPTION — costing_data: this field is NEVER in MISSING_FIELDS_PROMPT. It must be handled exclusively via rule #6 after retrieveProducts: ask only if the product's database record contains costing parameters; otherwise set it to "_" silently.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
 CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
+INTERNAL CONTACT RULE: Any email address from the `avocarbon.com` domain is an internal Avocarbon address, not a customer contact. You MUST NEVER save an `@avocarbon.com` email, or the associated person details, into `contact_email`, `contact_name`, `contact_role`, or `contact_phone`. If the user provides internal Avocarbon personal details, ignore them for customer contact purposes and keep asking for the external customer contact instead.
 
 DUAL-MODE RULE:
 - If the user wants step-by-step guidance, ask only the next focused question for the current step.
@@ -2265,10 +2527,11 @@ NOTE: costing_data is OPTIONAL. If the product has no specific costing parameter
 
 
 ### Step 1.2: Contact Info
-1. Ask for Contact Email ONLY IF `contact_email` is missing. If it is already filled, do not ask it again.
+1. Ask for Contact Email ONLY IF `contact_email` is missing. If it is already filled, do not ask it again. IMPORTANT: an `@avocarbon.com` email does NOT count as a valid customer contact email and must be treated as still missing.
 2. Call `checkContactExistence` only when you need to resolve missing contact details from the current state.
-3. IF FOUND: Ask the user to confirm the details ONLY IF some of `contact_name`, `contact_role`, or `contact_phone` are still missing. CRITICAL RULE: If the system gives separate first-name and last-name style fields, you MUST combine them into one full name string and save it ONLY in `contact_name`. If the user confirms the details, you MUST immediately call `updateFormFields` to save {"fields_to_update": {"contact_name": "<full_name>", "contact_phone": "...", "contact_role": "..."}} into the current RFQ form. Do not assume the system auto-saves them.
-4. IF NOT FOUND: Ask the user only for the missing contact fields among Full Name, Role, and Phone Number, and save the full name directly in `contact_name`. NEVER ask separately for first name and last name.
+3. If the user gives an `@avocarbon.com` email address or related internal Avocarbon person details, do NOT save them into customer contact fields. Explain briefly that you still need the external customer contact details, then continue asking for the customer contact.
+4. IF FOUND: Ask the user to confirm the details ONLY IF some of `contact_name`, `contact_role`, or `contact_phone` are still missing. CRITICAL RULE: If the system gives separate first-name and last-name style fields, you MUST combine them into one full name string and save it ONLY in `contact_name`. If the user confirms the details, you MUST immediately call `updateFormFields` to save {"fields_to_update": {"contact_name": "<full_name>", "contact_phone": "...", "contact_role": "..."}} into the current RFQ form. Do not assume the system auto-saves them.
+5. IF NOT FOUND: Ask the user only for the missing contact fields among Full Name, Role, and Phone Number, and save the full name directly in `contact_name`. NEVER ask separately for first name and last name.
 
 ### Step 2: Commercial Expectations
 Ask sequentially only for the REQUIRED Step 2 fields:
@@ -2702,6 +2965,7 @@ async def handle_chat(
         base_system_prompt = SYSTEM_PROMPT
     revision_mode_prompt = _build_revision_mode_prompt_context(rfq)
     available_tools = _get_available_tools(rfq, chat_mode)
+    paragraph_mode_active = _history_uses_paragraph_mode(history)
 
     def _build_dynamic_system_prompt() -> str:
         current_rfq_state = dict(extracted_data)
@@ -2736,7 +3000,9 @@ async def handle_chat(
             )
         else:
             missing_fields_prompt = _build_missing_fields_prompt(
-                chat_mode, current_rfq_state
+                chat_mode,
+                current_rfq_state,
+                prioritize_rfq_files=paragraph_mode_active,
             )
 
         mode_specific_instructions = """CRITICAL INSTRUCTION:
@@ -2762,6 +3028,18 @@ async def handle_chat(
 20. If the RFQ sub_status is REVISION_REQUESTED, treat it as an editable RFQ revision workflow. Do NOT claim the user must return to NEW_RFQ before updates can be saved.
 21. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
 22. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen."""
+
+        if (
+            paragraph_mode_active
+            and chat_mode != "potential"
+            and not _is_field_filled(current_rfq_state, "rfq_files")
+        ):
+            mode_specific_instructions += (
+                "\n23. PARAGRAPH MODE FILE PRIORITY: Because the user chose paragraph mode, "
+                "you MUST keep the exact Step 1 order. If `rfq_files` is still missing once "
+                "all earlier required Step 1 fields are complete, your very next question "
+                "MUST be the RFQ files upload question before any later remaining Step 1 field."
+            )
 
         return f"""{base_system_prompt}
 
@@ -2852,71 +3130,90 @@ Review this JSON to know exactly what has already been collected:
                 "content": _build_dynamic_system_prompt(),
             }
 
-            follow_up_completion = await client.chat.completions.create(
-                model="gpt-5.2",
-                messages=messages_for_llm,
-                tools=available_tools,
-                tool_choice="auto",
-                temperature=0.2,
+            successful_submit_payload = _extract_successful_submit_validation_payload(
+                tool_messages
             )
-            follow_up_message = follow_up_completion.choices[0].message
-            follow_up_tool_calls = _normalize_tool_calls(follow_up_message.tool_calls)
-
-            if not follow_up_tool_calls:
-                follow_up_tool_calls = _extract_tool_calls_from_text(
-                    follow_up_message.content or "",
-                    {tool["function"]["name"] for tool in available_tools},
+            if successful_submit_payload is not None:
+                final_text = _build_submit_validation_success_text(
+                    rfq,
+                    successful_submit_payload,
                 )
-
-            if follow_up_tool_calls:
-                synthetic_assistant_message = _build_tool_call_assistant_message(
-                    follow_up_tool_calls
-                )
-                history.append(synthetic_assistant_message)
-                messages_for_llm.append(synthetic_assistant_message)
-
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(INTERNAL_TOOL_TIMEOUT_SECONDS)
-                ) as http_client:
-                    follow_up_tool_messages, redirect_requested = await _execute_tool_calls(
-                        tool_calls=follow_up_tool_calls,
-                        http_client=http_client,
-                        db=db,
-                        db3=db3,
-                        rfq=rfq,
-                        current_user=current_user,
-                        extracted_data=extracted_data,
-                        chat_mode=chat_mode,
-                        tool_calls_used=tool_calls_used,
-                    )
-                    auto_redirect = auto_redirect or redirect_requested
-                    for tool_message in follow_up_tool_messages:
-                        history.append(tool_message)
-                        messages_for_llm.append(tool_message)
-
-                rfq.rfq_data = extracted_data
-                messages_for_llm[0] = {
-                    "role": "system",
-                    "content": _build_dynamic_system_prompt(),
-                }
-
-                final_completion = await client.chat.completions.create(
+                final_text = _append_assistant_text_if_new(history, final_text)
+            else:
+                follow_up_completion = await client.chat.completions.create(
                     model="gpt-5.2",
                     messages=messages_for_llm,
+                    tools=available_tools,
+                    tool_choice="auto",
                     temperature=0.2,
                 )
-                final_text = (final_completion.choices[0].message.content or "").strip()
-            else:
-                final_text = (follow_up_message.content or "").strip()
+                follow_up_message = follow_up_completion.choices[0].message
+                follow_up_tool_calls = _normalize_tool_calls(follow_up_message.tool_calls)
 
-            final_text = _sanitize_assistant_text(final_text)
-            if not final_text:
-                final_text = (
-                    "**Update saved.**\n\n"
-                    "- I've processed the latest information.\n"
-                    "- Please continue with the next missing fields."
-                )
-            final_text = _append_assistant_text_if_new(history, final_text)
+                if not follow_up_tool_calls:
+                    follow_up_tool_calls = _extract_tool_calls_from_text(
+                        follow_up_message.content or "",
+                        {tool["function"]["name"] for tool in available_tools},
+                    )
+
+                if follow_up_tool_calls:
+                    synthetic_assistant_message = _build_tool_call_assistant_message(
+                        follow_up_tool_calls
+                    )
+                    history.append(synthetic_assistant_message)
+                    messages_for_llm.append(synthetic_assistant_message)
+
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(INTERNAL_TOOL_TIMEOUT_SECONDS)
+                    ) as http_client:
+                        follow_up_tool_messages, redirect_requested = await _execute_tool_calls(
+                            tool_calls=follow_up_tool_calls,
+                            http_client=http_client,
+                            db=db,
+                            db3=db3,
+                            rfq=rfq,
+                            current_user=current_user,
+                            extracted_data=extracted_data,
+                            chat_mode=chat_mode,
+                            tool_calls_used=tool_calls_used,
+                        )
+                        auto_redirect = auto_redirect or redirect_requested
+                        for tool_message in follow_up_tool_messages:
+                            history.append(tool_message)
+                            messages_for_llm.append(tool_message)
+
+                    rfq.rfq_data = extracted_data
+                    messages_for_llm[0] = {
+                        "role": "system",
+                        "content": _build_dynamic_system_prompt(),
+                    }
+
+                    successful_submit_payload = _extract_successful_submit_validation_payload(
+                        follow_up_tool_messages
+                    )
+                    if successful_submit_payload is not None:
+                        final_text = _build_submit_validation_success_text(
+                            rfq,
+                            successful_submit_payload,
+                        )
+                    else:
+                        final_completion = await client.chat.completions.create(
+                            model="gpt-5.2",
+                            messages=messages_for_llm,
+                            temperature=0.2,
+                        )
+                        final_text = (final_completion.choices[0].message.content or "").strip()
+                else:
+                    final_text = (follow_up_message.content or "").strip()
+
+                final_text = _sanitize_assistant_text(final_text)
+                if not final_text:
+                    final_text = (
+                        "**Update saved.**\n\n"
+                        "- I've processed the latest information.\n"
+                        "- Please continue with the next missing fields."
+                    )
+                final_text = _append_assistant_text_if_new(history, final_text)
 
         else:
             final_text = (ai_message.content or "").strip()

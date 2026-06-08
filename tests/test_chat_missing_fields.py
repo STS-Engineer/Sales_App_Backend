@@ -10,7 +10,12 @@ os.environ.setdefault(
 )
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
-from app.routers.chat import _build_missing_fields_prompt, _get_current_step_and_missing_fields
+from app.routers.chat import (
+    RFQ_PARAGRAPH_MODE_PROMPT,
+    _build_missing_fields_prompt,
+    _get_current_step_and_missing_fields,
+    _history_uses_paragraph_mode,
+)
 
 
 def _build_base_rfq_state():
@@ -89,6 +94,57 @@ def test_required_step_gating_stops_at_first_incomplete_step():
 
     assert "Next field to ask for: RFQ Files" in prompt
     assert "Type of Packaging (OPTIONAL)" not in prompt
+
+
+def test_paragraph_mode_keeps_earlier_step_1_fields_before_rfq_files():
+    rfq_state = _build_base_rfq_state()
+    rfq_state.pop("rfq_files", None)
+    rfq_state.pop("product_name", None)
+    rfq_state.pop("product_line_acronym", None)
+
+    current_step, missing_fields = _get_current_step_and_missing_fields("rfq", rfq_state)
+
+    assert current_step == 1
+    assert missing_fields == ["product_name", "product_line_acronym", "rfq_files"]
+
+    prompt = _build_missing_fields_prompt(
+        "rfq",
+        rfq_state,
+        prioritize_rfq_files=True,
+    )
+
+    assert "Next field to ask for: Product name" in prompt
+    assert "PARAGRAPH MODE FILE BLOCKER" not in prompt
+
+
+def test_paragraph_mode_prioritizes_rfq_files_before_later_step_1_fields():
+    rfq_state = _build_base_rfq_state()
+    rfq_state.pop("rfq_files", None)
+    rfq_state.pop("contact_phone", None)
+    rfq_state.pop("contact_email", None)
+
+    current_step, missing_fields = _get_current_step_and_missing_fields("rfq", rfq_state)
+
+    assert current_step == 1
+    assert missing_fields == ["rfq_files", "contact_phone", "contact_email"]
+
+    prompt = _build_missing_fields_prompt(
+        "rfq",
+        rfq_state,
+        prioritize_rfq_files=True,
+    )
+
+    assert "Next field to ask for: RFQ Files" in prompt
+    assert "PARAGRAPH MODE FILE BLOCKER" in prompt
+
+
+def test_history_uses_paragraph_mode_detects_paragraph_prompt():
+    history = [
+        {"role": "assistant", "content": RFQ_PARAGRAPH_MODE_PROMPT},
+        {"role": "user", "content": "My RFQ paragraph"},
+    ]
+
+    assert _history_uses_paragraph_mode(history) is True
 
 
 def test_step_1_optional_fields_do_not_block_progression():
