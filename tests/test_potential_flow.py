@@ -522,11 +522,15 @@ async def test_formal_chat_filters_raw_json_only_responses(
 
 
 @pytest.mark.asyncio
-async def test_formal_chat_yes_reply_submits_without_second_confirmation(
+async def test_formal_chat_yes_reply_submits_after_confirmation_question(
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch,
 ):
+    """
+    When the submit confirmation question is the last assistant message and the
+    user replies "Yes", the RFQ is submitted without calling the LLM.
+    """
     headers = await _create_headers(db_session)
     create_response = await client.post(
         "/api/rfq",
@@ -587,28 +591,17 @@ async def test_formal_chat_yes_reply_submits_without_second_confirmation(
         "zone_manager_email": "validator@example.com",
         "validator_role": "Zone Manager",
     }
+    # The submit confirmation question must already be the last assistant message.
+    rfq.chat_history = [
+        {
+            "role": "assistant",
+            "content": "Do you want to submit this RFQ for validation?\n\nYes\nNo",
+        }
+    ]
     await db_session.commit()
 
-    captured_system_prompts: list[str] = []
-    queued = iter(
-        [
-            _build_completion(
-                tool_calls=[
-                    _build_tool_call("submitValidation", {}, "submit-call-1")
-                ]
-            ),
-            _build_completion(
-                content=(
-                    "Your RFQ was submitted and is now PENDING_FOR_VALIDATION. "
-                    "The validation workflow has started."
-                )
-            ),
-        ]
-    )
-
-    async def _fake_create(*args, **kwargs):
-        captured_system_prompts.append(kwargs["messages"][0]["content"])
-        return next(queued)
+    async def _unexpected_llm_call(*args, **kwargs):
+        raise AssertionError("LLM should not be called when submit_yes is handled by code")
 
     async def _fake_submit_internal(*, rfq, db, current_user, send_email):
         rfq.sub_status = RfqSubStatus.PENDING_FOR_VALIDATION
@@ -619,7 +612,7 @@ async def test_formal_chat_yes_reply_submits_without_second_confirmation(
             "email_sent": send_email,
         }
 
-    monkeypatch.setattr(formal_chat.client.chat.completions, "create", _fake_create)
+    monkeypatch.setattr(formal_chat.client.chat.completions, "create", _unexpected_llm_call)
     monkeypatch.setattr(
         formal_chat,
         "_submit_rfq_for_validation_internal",
@@ -635,20 +628,123 @@ async def test_formal_chat_yes_reply_submits_without_second_confirmation(
     assert chat_response.status_code == 200
     payload = chat_response.json()
     assert payload["response"] == (
-        "Your RFQ was submitted and is now PENDING_FOR_VALIDATION. "
+        "Your RFQ was submitted and is now PENDING FOR VALIDATION. "
         "The validation workflow has started."
     )
     assert payload["tool_calls_used"] == ["submitValidation"]
-    assert "Do you want to submit" not in payload["response"]
-    assert captured_system_prompts
-    assert (
-        'CRITICAL SUBMISSION RULE: When you ask "Do you want to submit this RFQ '
-        'for validation?" and the user replies "Yes"'
-        in captured_system_prompts[0]
-    )
 
     await db_session.refresh(rfq)
     assert rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION
+
+
+@pytest.mark.asyncio
+async def test_formal_chat_no_to_modify_question_shows_submit_confirmation(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    """
+    When the LLM asks 'Would you like to update?' (or any variant) and the user
+    replies 'No', the LLM must NOT submit directly. The submit confirmation
+    question must be shown first.
+    """
+    headers = await _create_headers(db_session)
+    create_response = await client.post(
+        "/api/rfq",
+        json={"chat_mode": "rfq"},
+        headers=headers,
+    )
+    rfq_id = create_response.json()["rfq_id"]
+
+    rfq = await db_session.get(Rfq, rfq_id)
+    rfq.product_line_acronym = "BRU"
+    rfq.zone_manager_email = "validator@example.com"
+    rfq.rfq_data = {
+        "customer_name": "Nidec",
+        "application": "Traction motor",
+        "product_name": "Brush Holder",
+        "product_line_acronym": "BRU",
+        "project_name": "Project Alpha",
+        "rfq_files": [{"name": "drawing.pdf"}],
+        "products": [
+            {
+                "part_number": "PN-001",
+                "revision_level": "A",
+                "quantity": 500000,
+                "target_price": 1.25,
+                "currency": "EUR",
+                "target_price_is_estimated": True,
+            }
+        ],
+        "delivery_zone": "Europe",
+        "delivery_plant": "Plant A",
+        "country": "France",
+        "po_date": "2026-04-20",
+        "ppap_date": "2026-05-20",
+        "sop_year": "2027",
+        "rfq_reception_date": "2026-04-10",
+        "quotation_expected_date": "2026-04-30",
+        "contact_email": "buyer@example.com",
+        "contact_name": "Jane Doe",
+        "contact_role": "Buyer",
+        "contact_phone": "+33 1 23 45 67 89",
+        "expected_delivery_conditions": "DAP",
+        "expected_payment_terms": "60 days",
+        "type_of_packaging": "returnable plastic tray",
+        "business_trigger": "Cost reduction",
+        "customer_tooling_conditions": "Customer owned",
+        "entry_barriers": "Qualification lead time",
+        "responsibility_design": "Design team",
+        "responsibility_validation": "Validation team",
+        "product_ownership": "Avocarbon",
+        "pays_for_development": "Customer",
+        "capacity_available": "Yes",
+        "scope": "In scope",
+        "strategic_note": "Aligned with strategy",
+        "final_recommendation": "Proceed",
+        "total_target_to": "625.0",
+        "to_total": "625.0",
+        "to_total_local": "625.0",
+        "zone_manager_email": "validator@example.com",
+        "validator_role": "Zone Manager",
+    }
+    # Last message is a modify-before-submission question (LLM custom wording).
+    rfq.chat_history = [
+        {
+            "role": "assistant",
+            "content": "Anything else you want to update before submission?\n\nYes\nNo",
+        }
+    ]
+    await db_session.commit()
+
+    async def _fake_create(*args, **kwargs):
+        # LLM tries to submit directly when user says "No"
+        return _build_completion(
+            tool_calls=[_build_tool_call("submitValidation", {}, "submit-call-1")]
+        )
+
+    async def _unexpected_submit(*args, **kwargs):
+        raise AssertionError("submitValidation should NOT run before confirmation question is shown")
+
+    monkeypatch.setattr(formal_chat.client.chat.completions, "create", _fake_create)
+    monkeypatch.setattr(formal_chat, "_submit_rfq_for_validation_internal", _unexpected_submit)
+
+    chat_response = await client.post(
+        "/api/chat",
+        json={"rfq_id": rfq_id, "message": "No", "chat_mode": "rfq"},
+        headers=headers,
+    )
+
+    assert chat_response.status_code == 200
+    payload = chat_response.json()
+    # Must show the submit confirmation question, not submit directly
+    assert "Do you want to submit this RFQ for validation?" in payload["response"]
+    assert "Yes" in payload["response"]
+    assert "No" in payload["response"]
+    assert "PENDING_FOR_VALIDATION" not in payload["response"]
+
+    await db_session.refresh(rfq)
+    assert rfq.sub_status != RfqSubStatus.PENDING_FOR_VALIDATION
 
 
 @pytest.mark.asyncio

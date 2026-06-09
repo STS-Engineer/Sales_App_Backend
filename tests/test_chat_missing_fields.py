@@ -14,6 +14,7 @@ from app.routers.chat import (
     RFQ_PARAGRAPH_MODE_PROMPT,
     _build_missing_fields_prompt,
     _get_current_step_and_missing_fields,
+    _get_required_missing_fields_before_submission,
     _history_uses_paragraph_mode,
 )
 
@@ -220,6 +221,16 @@ def test_product_revision_level_does_not_block_step_progression():
     prompt = _build_missing_fields_prompt("rfq", rfq_state)
 
     assert "Product 1 Revision level (OPTIONAL)" not in prompt
+
+
+def test_required_missing_fields_before_submission_collects_all_incomplete_required_steps():
+    rfq_state = _build_base_rfq_state()
+    rfq_state.pop("strategic_note", None)
+    rfq_state.pop("final_recommendation", None)
+
+    assert _get_required_missing_fields_before_submission(rfq_state) == {
+        3: ["strategic_note", "final_recommendation"]
+    }
 
 
 def test_missing_fields_prompt_uses_plain_labels_without_examples():

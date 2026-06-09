@@ -404,6 +404,7 @@ SKIP_LIKE_TEXT_VALUES = {
     "na",
     "notapplicable",
 }
+URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>()]+")
 FIELD_LABELS = {
     "customer_name": "Customer",
     "application": "Application",
@@ -493,6 +494,11 @@ FIELD_QUESTION_OVERRIDES = {
 }
 
 SYSTEM_MANAGED_CHAT_FIELDS = {"product_line_acronym"}
+PRE_SUBMISSION_MODIFY_PROMPT = (
+    "Would you like to update or modify any field before submission?\n\n"
+    "Yes\n"
+    "No"
+)
 TYPE_OF_PACKAGING_OPTIONS = [
     "carboard divider",
     "one way tray",
@@ -502,6 +508,55 @@ PRICE_SOURCE_OPTIONS = [
     "Estimated by Avocarbon",
     "Given by Customer",
 ]
+# Regex that matches internal tool function names — these must never appear in visible text.
+_INTERNAL_TOOL_NAME_RE = re.compile(
+    r"\b("
+    r"updateFormFields|submitValidation|retrieveZoneManager|retrieveProducts"
+    r"|checkGroupeExistence|checkContactExistence|get_eur_exchange_rate|uploadRfqFiles"
+    r")\b"
+)
+
+# Matches any variant of the submit-for-validation question the LLM may generate.
+_SUBMIT_QUESTION_RE = re.compile(
+    r"\b(?:do you want|would you like)\s+to\s+submit\s+this\s+\w+\s+for\s+validation\b",
+    re.IGNORECASE,
+)
+
+# Matches any variant of the pre-submission modify/update prompt the LLM may generate.
+_MODIFY_QUESTION_RE = re.compile(
+    r"\b(?:"
+    r"would you like to (?:update|modify)"
+    r"|anything else you (?:want|would like) to (?:update|modify|change)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Regex for common scratchpad-reasoning phrases the LLM sometimes leaks.
+_SCRATCHPAD_PHRASE_RE = re.compile(
+    r"(?:backend-derived|Step\s*\d+\s+says|We(?:'ll| will)\s+call\s+\w+"
+    r"|need\s+updateFormFields|should\s+sync|already\s+present\s+but\s+still)",
+    re.IGNORECASE,
+)
+
+
+def _is_scratchpad_reasoning_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _INTERNAL_TOOL_NAME_RE.search(stripped):
+        return True
+    if _SCRATCHPAD_PHRASE_RE.search(stripped):
+        return True
+    return False
+
+
+def _strip_scratchpad_reasoning(content: str) -> str:
+    """Remove lines that contain leaked LLM internal reasoning or tool names."""
+    lines = str(content or "").splitlines()
+    filtered = [line for line in lines if not _is_scratchpad_reasoning_line(line)]
+    return "\n".join(filtered).strip()
+
+
 INTERNAL_STATUS_FILLER_SENTENCES = {
     "update saved.",
     "update saved",
@@ -783,6 +838,19 @@ def _get_missing_required_fields_for_step(
         if not _is_field_filled(data, field_name, include_optional=False):
             missing_fields.append(field_name)
     return missing_fields
+
+
+def _get_required_missing_fields_before_submission(
+    data: dict,
+) -> dict[int, list[str]]:
+    missing_by_step: dict[int, list[str]] = {}
+    for step_number, step_fields in RFQ_STEPS:
+        if step_number >= 4:
+            break
+        step_missing_fields = _get_missing_required_fields_for_step(data, step_fields)
+        if step_missing_fields:
+            missing_by_step[step_number] = step_missing_fields
+    return missing_by_step
 
 
 def _sanitize_rfq_update_fields_for_chat(
@@ -1695,6 +1763,10 @@ def _sanitize_assistant_text(content: str) -> str:
     if not text:
         return ""
 
+    text = _strip_scratchpad_reasoning(text).strip()
+    if not text:
+        return ""
+
     text = _strip_technical_error_lines(text).strip()
     if not text:
         return ""
@@ -1754,6 +1826,165 @@ def _build_submit_validation_success_text(
     return (
         f"Your {document_label} was submitted and is now {sub_status}. "
         "The validation workflow has started."
+    )
+
+
+def _build_submit_validation_question(rfq: Rfq) -> str:
+    document_label = _document_type_label(rfq.document_type)
+    return (
+        f"Do you want to submit this {document_label} for validation?\n\n"
+        "Yes\n"
+        "No"
+    )
+
+
+def _build_modify_before_submission_question() -> str:
+    return PRE_SUBMISSION_MODIFY_PROMPT
+
+
+def _build_modify_fields_follow_up_text() -> str:
+    return "Please tell me which field you would like to update or modify."
+
+
+def _normalize_prompt_block_text(text: str | None) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+
+
+def _normalize_yes_no_reply(message: str | None) -> str | None:
+    normalized = _normalize_prompt_block_text(message)
+    if normalized in {"yes", "y", "1"}:
+        return "yes"
+    if normalized in {"no", "n", "2"}:
+        return "no"
+    return None
+
+
+def _get_last_visible_assistant_text(history: list[dict] | None) -> str:
+    for entry in reversed(history or []):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("role") != "assistant":
+            continue
+        if entry.get("tool_calls"):
+            continue
+        content = str(entry.get("content") or "").strip()
+        if content:
+            return content
+    return ""
+
+
+def _match_pre_submission_prompt_action(
+    *,
+    last_assistant_text: str,
+    user_message: str,
+    rfq: Rfq,
+) -> str | None:
+    reply = _normalize_yes_no_reply(user_message)
+    if reply is None:
+        return None
+
+    normalized_last_assistant_text = _normalize_prompt_block_text(last_assistant_text)
+    normalized_modify_prompt = _normalize_prompt_block_text(
+        _build_modify_before_submission_question()
+    )
+    normalized_submit_prompt = _normalize_prompt_block_text(
+        _build_submit_validation_question(rfq)
+    )
+
+    if (
+        normalized_modify_prompt in normalized_last_assistant_text
+        or _MODIFY_QUESTION_RE.search(last_assistant_text)
+    ):
+        return f"modify_{reply}"
+    if (
+        normalized_submit_prompt in normalized_last_assistant_text
+        or _SUBMIT_QUESTION_RE.search(last_assistant_text)
+    ):
+        return f"submit_{reply}"
+    return None
+
+
+def _is_waiting_for_pre_submission_modify_details(last_assistant_text: str | None) -> bool:
+    return (
+        _normalize_prompt_block_text(last_assistant_text)
+        == _normalize_prompt_block_text(_build_modify_fields_follow_up_text())
+    )
+
+
+def _is_pre_submission_modify_turn(
+    *,
+    last_assistant_text: str,
+    user_message: str,
+    rfq: Rfq,
+) -> bool:
+    if _is_waiting_for_pre_submission_modify_details(last_assistant_text):
+        return True
+
+    if _normalize_yes_no_reply(user_message) is not None:
+        return False
+
+    normalized_last_assistant_text = _normalize_prompt_block_text(last_assistant_text)
+    normalized_modify_prompt = _normalize_prompt_block_text(
+        _build_modify_before_submission_question()
+    )
+    normalized_submit_prompt = _normalize_prompt_block_text(
+        _build_submit_validation_question(rfq)
+    )
+
+    return (
+        normalized_modify_prompt in normalized_last_assistant_text
+        or _MODIFY_QUESTION_RE.search(last_assistant_text)
+        or normalized_submit_prompt in normalized_last_assistant_text
+        or _SUBMIT_QUESTION_RE.search(last_assistant_text)
+    )
+
+
+def _tool_messages_include_clean_update_form_success(
+    tool_messages: list[dict] | None,
+) -> bool:
+    for tool_message in tool_messages or []:
+        if not isinstance(tool_message, dict):
+            continue
+        if tool_message.get("name") != "updateFormFields":
+            continue
+        payload = _try_load_json_payload(tool_message.get("content") or "")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("success") is not True:
+            continue
+        if payload.get("status") != "extracted_to_form":
+            continue
+        updated_fields = payload.get("fields_updated") or []
+        if isinstance(updated_fields, list) and updated_fields:
+            return True
+    return False
+
+
+def _rewrite_submit_prompt_to_modify_prompt_if_needed(
+    *,
+    text: str,
+    rfq: Rfq,
+    chat_mode: str,
+    extracted_data: dict,
+) -> str:
+    if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+        return text
+
+    current_step, missing_fields = _get_current_step_and_missing_fields(
+        chat_mode,
+        extracted_data,
+    )
+    if missing_fields or current_step < 4:
+        return text
+
+    submit_prompt = _build_submit_validation_question(rfq)
+    if submit_prompt not in text:
+        return text
+
+    return text.replace(
+        submit_prompt,
+        _build_modify_before_submission_question(),
+        1,
     )
 
 
@@ -1949,6 +2180,8 @@ def _build_user_facing_fallback_text(
                 )
         if next_field == "products":
             return _build_products_collection_fallback_text(rfq=rfq)
+        if next_field == "rfq_files" and _message_contains_url(user_message):
+            return _build_rfq_files_url_rejection_text(rfq=rfq, extracted_data=extracted_data)
         if next_field == "contact_email" and force_internal_contact_explanation:
             return _build_internal_contact_rejection_text(
                 rfq=rfq,
@@ -1969,12 +2202,7 @@ def _build_user_facing_fallback_text(
         )
 
     if not missing_fields and current_step >= 4:
-        document_label = _document_type_label(rfq.document_type)
-        return (
-            f"Do you want to submit this {document_label} for validation?\n\n"
-            "Yes\n"
-            "No"
-        )
+        return _build_modify_before_submission_question()
 
     return "Please send your last answer again."
 
@@ -1992,6 +2220,52 @@ def _append_assistant_text_if_new(history: list[dict], content: str) -> str:
             return text
     history.append({"role": "assistant", "content": text})
     return text
+
+
+def _message_contains_url(message: str | None) -> bool:
+    return bool(URL_PATTERN.search(str(message or "")))
+
+
+def _build_rfq_files_url_rejection_text(*, rfq: Rfq, extracted_data: dict) -> str:
+    follow_up_question = _build_field_question_with_options(
+        rfq=rfq,
+        field_name="rfq_files",
+        extracted_data=extracted_data,
+    )
+    return (
+        "I can't accept a URL or link as an RFQ file.\n\n"
+        "Please upload the drawing/spec file directly using the Attach files button, "
+        "then confirm here once the file is uploaded.\n\n"
+        f"{follow_up_question}"
+    )
+
+
+def _should_reject_rfq_file_url_message(
+    *,
+    chat_mode: str,
+    extracted_data: dict,
+    user_message: str,
+) -> bool:
+    if chat_mode == "potential" or not _message_contains_url(user_message):
+        return False
+
+    current_step, missing_fields = _get_current_step_and_missing_fields(
+        chat_mode,
+        extracted_data,
+    )
+    if current_step != 1 or not missing_fields:
+        return False
+
+    user_missing_fields = [
+        field_name
+        for field_name in missing_fields
+        if field_name not in AI_GENERATED_STEP_FIELDS
+        and field_name not in SYSTEM_MANAGED_CHAT_FIELDS
+    ]
+    if not user_missing_fields or user_missing_fields[0] != "rfq_files":
+        return False
+
+    return not _is_field_filled(extracted_data, "rfq_files")
 
 
 def _sanitize_chat_history(history: list[dict] | None) -> list[dict]:
@@ -2303,6 +2577,13 @@ async def _execute_tool_calls(
                         extracted_data["delivery_zone"] = canonical_delivery_zone
                     if zone_manager_email:
                         extracted_data["zone_manager_email"] = zone_manager_email
+                        # Mirror to model attribute so the form field is populated
+                        # immediately when the frontend calls getRfq after this turn.
+                        rfq.zone_manager_email = zone_manager_email
+
+                    # Signal the frontend that form fields changed this turn.
+                    if "updateFormFields" not in tool_calls_used:
+                        tool_calls_used.append("updateFormFields")
 
                     tool_response_text = json.dumps(
                         {
@@ -2354,6 +2635,36 @@ async def _execute_tool_calls(
                 continue
             try:
                 saved_data = _normalize_rfq_data_fields(rfq.rfq_data)
+                missing_required_fields_by_step = _get_required_missing_fields_before_submission(
+                    saved_data
+                )
+                if missing_required_fields_by_step:
+                    flattened_missing_required_fields = [
+                        field_name
+                        for step_fields in missing_required_fields_by_step.values()
+                        for field_name in step_fields
+                    ]
+                    tool_response_text = json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                "All required fields from Steps 1 to 3 must be completed "
+                                "before submitValidation can run."
+                            ),
+                            "missing_fields": flattened_missing_required_fields,
+                            "missing_fields_by_step": missing_required_fields_by_step,
+                        }
+                    )
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": func_name,
+                            "content": tool_response_text,
+                        }
+                    )
+                    continue
+
                 validator_email = str(saved_data.get("zone_manager_email") or rfq.zone_manager_email or "").strip()
                 to_total_value = str(saved_data.get("to_total") or "").strip()
                 total_target_to_value = str(saved_data.get("total_target_to") or "").strip()
@@ -2781,6 +3092,7 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
 5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save `product_name` with `updateFormFields` and map it to the authorized `product_line_acronym` to lock them in.
 6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
 7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
+7.b. A URL or link does NOT count as an uploaded RFQ file. If the user pastes a URL when `rfq_files` is the next missing field, do NOT accept it, do NOT call `uploadRfqFiles`, and tell them to upload the file directly with the `Attach files` button.
 8. Ask for the remaining Step 1 fields in checklist order, including optional ones. This includes product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. You MUST explicitly mark `ppap_date` as optional and allow `skip`. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL. When asking for a full product row in one grouped prompt, do NOT tell the user to type `skip` for Revision Level; they may simply leave it out. If it is omitted while the required product row values are present, treat Revision Level as blank, save the row, and continue without a dedicated follow-up question.
 MULTI-PRODUCT SUPPORT:
 - NEVER ask the user how many part numbers/products there are upfront.
@@ -2867,10 +3179,13 @@ CRITICAL STEP 4 RULES:
 4. CRITICAL MATH RULE: You MUST NEVER calculate the TO Total yourself. Call `retrieveZoneManager` without passing `to_total`. The backend will automatically calculate every product row `target_to`, sum the local `total_target_to`, calculate the strict kEUR turnover for routing, perform the matrix routing, and return the calculated `to_total` to you.
 5. You MUST use the `retrieveZoneManager` tool with `product_line_acronym` and the canonical `delivery_zone` to query the validation matrix and retrieve the backend-calculated `products`, `total_target_to`, `to_total`, `to_total_local`, Validator Email, and Validator Role.
 6. You MUST call `updateFormFields` to save these backend-derived values to the database, including the returned `products`, `total_target_to`, `to_total`, `to_total_local`, `zone_manager_email`, and `validator_role`.
-7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, and ONLY ONCE at the very end of your message, state the assigned Validator and ask whether the user wants to submit the request for validation, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT.
-8. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
-9. CRITICAL SUBMISSION RULE: When the user confirms submission, you MUST ONLY invoke the submitValidation tool. When you ask "Do you want to submit this RFQ for validation?" and the user replies "Yes", you MUST ONLY invoke the submitValidation tool. Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool. Just trigger the function.
-10. After `submitValidation` succeeds, acknowledge exactly once that the RFQ or RFI was submitted, confirm that it is now `PENDING_FOR_VALIDATION`, and clearly tell the user that the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT. Do NOT ask for confirmation again.
+7. When you finish saving Step 4 data, you must format your response in this exact order: First, provide the bulleted summary of the saved data. Second, state the assigned Validator. Third, ask exactly: "Would you like to update or modify any field before submission?" followed by the options `Yes` and `No`. Do NOT ask for submission yet in that same message.
+8. If the user answers `Yes` to the modify/update question, ask which field they want to change and continue the editing workflow.
+9. If the user answers `No` to the modify/update question and all required workflow fields are complete, ask exactly once whether they want to submit the RFQ or RFI for validation.
+10. CRITICAL ORDER OF OPERATIONS: You MUST call `updateFormFields` to save the final Step 4 data to the database first. You are STRICTLY FORBIDDEN from calling `submitValidation` until AFTER `updateFormFields` has returned a success message for Step 4.
+11. CRITICAL SUBMISSION RULE: You are STRICTLY FORBIDDEN from calling `submitValidation` while ANY required field from Steps 1, 2, or 3 is still missing. You must keep asking for the next required missing field until all required workflow fields are complete.
+12. CRITICAL SUBMISSION RULE: When the user confirms submission, you MUST ONLY invoke the submitValidation tool. When you ask "Do you want to submit this RFQ for validation?" and the user replies "Yes", you MUST ONLY invoke the submitValidation tool. Do NOT output any standard text, do NOT explain your reasoning, and do NOT narrate that you are calling the tool. Just trigger the function.
+13. After `submitValidation` succeeds, acknowledge exactly once that the RFQ or RFI was submitted, confirm that it is now `PENDING_FOR_VALIDATION`, and clearly tell the user that the validation workflow has started, using RFQ or RFI according to DOCUMENT_TYPE_CONTEXT. Do NOT ask for confirmation again.
 """
 
 POTENTIAL_SYSTEM_PROMPT = STATE_RECONCILIATION_DIRECTIVE + "\n" + ENGLISH_ONLY_RULE + """
@@ -3224,6 +3539,155 @@ async def handle_chat(
     # We append the user's message to the DB array
     history.append({"role": "user", "content": req.message})
 
+    last_assistant_text = _get_last_visible_assistant_text(history[:-1])
+    pre_submission_modify_turn = _is_pre_submission_modify_turn(
+        last_assistant_text=last_assistant_text,
+        user_message=req.message,
+        rfq=rfq,
+    )
+    pending_pre_submission_action = _match_pre_submission_prompt_action(
+        last_assistant_text=last_assistant_text,
+        user_message=req.message,
+        rfq=rfq,
+    )
+
+    if pending_pre_submission_action and chat_mode != "potential":
+        if pending_pre_submission_action == "modify_yes":
+            final_text = _append_assistant_text_if_new(
+                history,
+                _build_modify_fields_follow_up_text(),
+            )
+            rfq.chat_history = history
+            rfq.rfq_data = extracted_data
+            await db.commit()
+            await db.refresh(rfq)
+            return ChatResponse(response=final_text)
+
+        if pending_pre_submission_action == "modify_no":
+            final_text = _append_assistant_text_if_new(
+                history,
+                _build_submit_validation_question(rfq),
+            )
+            rfq.chat_history = history
+            rfq.rfq_data = extracted_data
+            await db.commit()
+            await db.refresh(rfq)
+            return ChatResponse(response=final_text)
+
+        if pending_pre_submission_action == "submit_no":
+            final_text = _append_assistant_text_if_new(
+                history,
+                _build_modify_fields_follow_up_text(),
+            )
+            rfq.chat_history = history
+            rfq.rfq_data = extracted_data
+            await db.commit()
+            await db.refresh(rfq)
+            return ChatResponse(response=final_text)
+
+        if pending_pre_submission_action == "submit_yes":
+            # Copy model-attribute fallbacks into extracted_data so submitValidation
+            # can find them via rfq.rfq_data (set below).
+            if not extracted_data.get("product_line_acronym") and rfq.product_line_acronym:
+                extracted_data["product_line_acronym"] = rfq.product_line_acronym
+            if not extracted_data.get("zone_manager_email") and rfq.zone_manager_email:
+                extracted_data["zone_manager_email"] = rfq.zone_manager_email
+
+            # If step 4 derived fields are still incomplete, call retrieveZoneManager
+            # synthetically to compute them. The handler modifies extracted_data in-place
+            # and does NOT need an http_client.
+            if not (extracted_data.get("to_total") and extracted_data.get("zone_manager_email")):
+                _pla = str(extracted_data.get("product_line_acronym") or "").strip()
+                _dz = str(extracted_data.get("delivery_zone") or "").strip()
+                if _pla:
+                    await _execute_tool_calls(
+                        tool_calls=[{
+                            "id": "pre-submit-zone-refresh",
+                            "name": "retrieveZoneManager",
+                            "arguments": {"product_line_acronym": _pla, "delivery_zone": _dz},
+                        }],
+                        http_client=None,
+                        db=db,
+                        db3=db3,
+                        rfq=rfq,
+                        current_user=current_user,
+                        extracted_data=extracted_data,
+                        chat_mode=chat_mode,
+                        tool_calls_used=tool_calls_used,
+                    )
+
+            # Ensure submitValidation reads up-to-date data from rfq.rfq_data.
+            rfq.rfq_data = extracted_data
+
+            synthetic_tool_call = {
+                "id": "manual-submit-validation",
+                "name": "submitValidation",
+                "arguments": {},
+            }
+            assistant_tool_message = _build_tool_call_assistant_message(
+                [synthetic_tool_call]
+            )
+            history.append(assistant_tool_message)
+            tool_calls_used = []
+            tool_messages, auto_redirect = await _execute_tool_calls(
+                tool_calls=[synthetic_tool_call],
+                http_client=None,
+                db=db,
+                db3=db3,
+                rfq=rfq,
+                current_user=current_user,
+                extracted_data=extracted_data,
+                chat_mode=chat_mode,
+                tool_calls_used=tool_calls_used,
+            )
+            for tool_message in tool_messages:
+                history.append(tool_message)
+
+            successful_submit_payload = _extract_successful_submit_validation_payload(
+                tool_messages
+            )
+            if successful_submit_payload is not None:
+                final_text = _build_submit_validation_success_text(
+                    rfq,
+                    successful_submit_payload,
+                )
+            else:
+                final_text = _build_user_facing_fallback_text(
+                    rfq=rfq,
+                    chat_mode=chat_mode,
+                    extracted_data=extracted_data,
+                    user_message=req.message,
+                )
+            final_text = _append_assistant_text_if_new(history, final_text)
+
+            rfq.chat_history = history
+            rfq.rfq_data = extracted_data
+            await db.commit()
+            await db.refresh(rfq)
+            return ChatResponse(
+                response=final_text,
+                tool_calls_used=tool_calls_used,
+                auto_redirect=auto_redirect or None,
+            )
+
+    if _should_reject_rfq_file_url_message(
+        chat_mode=chat_mode,
+        extracted_data=extracted_data,
+        user_message=req.message,
+    ):
+        final_text = _append_assistant_text_if_new(
+            history,
+            _build_rfq_files_url_rejection_text(
+                rfq=rfq,
+                extracted_data=extracted_data,
+            ),
+        )
+        rfq.chat_history = history
+        rfq.rfq_data = extracted_data
+        await db.commit()
+        await db.refresh(rfq)
+        return ChatResponse(response=final_text)
+
     # Keep a wider short-term history window so the assistant can reconcile
     # recent user answers against the current RFQ state before responding.
     start_idx = max(0, len(history) - 20)
@@ -3317,6 +3781,15 @@ async def handle_chat(
                 "MUST be the RFQ files upload question before any later remaining Step 1 field."
             )
 
+        if pre_submission_modify_turn and chat_mode != "potential":
+            mode_specific_instructions += (
+                "\n24. PRE-SUBMISSION MODIFICATION MODE: The user is updating one or more "
+                "already-existing fields before submission. You MUST ONLY extract and save "
+                "the field(s) explicitly mentioned in the user's latest message. Do NOT "
+                "resume the normal step-by-step checklist. Do NOT ask for downstream fields "
+                "that come after the updated field. After saving the requested update(s), stop."
+            )
+
         return f"""{base_system_prompt}
 
 === MISSING_FIELDS_PROMPT ===
@@ -3378,6 +3851,45 @@ Review this JSON to know exactly what has already been collected:
         
         # 2. Check if OpenAI decided to call a tool
         if normalized_tool_calls:
+            # Guard: if the LLM wants to submit but the submit confirmation question has not
+            # been shown yet, intercept submitValidation but still execute any other tool
+            # calls first (e.g., updateFormFields) so form data is not lost.
+            if any(tc["name"] == "submitValidation" for tc in normalized_tool_calls):
+                _submit_q = _build_submit_validation_question(rfq)
+                if (
+                    _normalize_prompt_block_text(_submit_q)
+                    not in _normalize_prompt_block_text(last_assistant_text)
+                    and not _SUBMIT_QUESTION_RE.search(last_assistant_text)
+                ):
+                    non_submit_calls = [
+                        tc for tc in normalized_tool_calls if tc["name"] != "submitValidation"
+                    ]
+                    if non_submit_calls:
+                        _guard_asst_msg = _build_tool_call_assistant_message(non_submit_calls)
+                        history.append(_guard_asst_msg)
+                        async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(INTERNAL_TOOL_TIMEOUT_SECONDS)
+                        ) as http_client:
+                            _guard_tool_msgs, _ = await _execute_tool_calls(
+                                tool_calls=non_submit_calls,
+                                http_client=http_client,
+                                db=db,
+                                db3=db3,
+                                rfq=rfq,
+                                current_user=current_user,
+                                extracted_data=extracted_data,
+                                chat_mode=chat_mode,
+                                tool_calls_used=tool_calls_used,
+                            )
+                            for _guard_tool_msg in _guard_tool_msgs:
+                                history.append(_guard_tool_msg)
+                    final_text = _append_assistant_text_if_new(history, _submit_q)
+                    rfq.chat_history = history
+                    rfq.rfq_data = extracted_data
+                    await db.commit()
+                    await db.refresh(rfq)
+                    return ChatResponse(response=final_text)
+
             history.append(assistant_tool_message)
             messages_for_llm.append(assistant_tool_message)
             internal_contact_blocked_this_turn = False
@@ -3494,6 +4006,12 @@ Review this JSON to know exactly what has already been collected:
                     final_text = (follow_up_message.content or "").strip()
 
                 final_text = _sanitize_assistant_text(final_text)
+                final_text = _rewrite_submit_prompt_to_modify_prompt_if_needed(
+                    text=final_text,
+                    rfq=rfq,
+                    chat_mode=chat_mode,
+                    extracted_data=extracted_data,
+                )
                 if (
                     internal_contact_blocked_this_turn
                     and not _text_explains_internal_contact_rejection(final_text)
@@ -3513,11 +4031,25 @@ Review this JSON to know exactly what has already been collected:
                         user_message=req.message,
                         force_internal_contact_explanation=internal_contact_blocked_this_turn,
                     )
+                if (
+                    pre_submission_modify_turn
+                    and _tool_messages_include_clean_update_form_success(tool_messages)
+                ):
+                    final_text = (
+                        "The requested field has been updated.\n\n"
+                        + _build_modify_before_submission_question()
+                    )
                 final_text = _append_assistant_text_if_new(history, final_text)
 
         else:
             final_text = (ai_message.content or "").strip()
             final_text = _sanitize_assistant_text(final_text)
+            final_text = _rewrite_submit_prompt_to_modify_prompt_if_needed(
+                text=final_text,
+                rfq=rfq,
+                chat_mode=chat_mode,
+                extracted_data=extracted_data,
+            )
             if not final_text:
                 final_text = _build_user_facing_fallback_text(
                     rfq=rfq,
@@ -3525,6 +4057,8 @@ Review this JSON to know exactly what has already been collected:
                     extracted_data=extracted_data,
                     user_message=req.message,
                 )
+            if pre_submission_modify_turn:
+                final_text = _build_modify_fields_follow_up_text()
             final_text = _append_assistant_text_if_new(history, final_text)
 
     except (httpx.TimeoutException, APITimeoutError):
