@@ -767,6 +767,40 @@ def _build_rfq_link(rfq_id: str) -> str:
     frontend_url = str(settings.frontend_url or "").rstrip("/")
     return f"{frontend_url}/rfqs/new?id={rfq_id}" if frontend_url else rfq_id
 
+
+_SELF_REVISION_COMMENT = "self-update initiated by assigned validator."
+
+
+def _build_revision_chat_greeting(revision_notes: str) -> str:
+    notes = str(revision_notes or "").strip()
+    if not notes or notes.casefold() == _SELF_REVISION_COMMENT:
+        return "Please tell me your updates."
+    return (
+        f"The validator requested the following updates: {notes}. "
+        "What would you like to change?"
+    )
+
+
+def _ensure_revision_greeting_in_history(rfq: Rfq) -> bool:
+    """Append the revision greeting to chat_history if not already present.
+    Returns True if the history was modified."""
+    if not (
+        rfq.phase == RfqPhase.RFQ
+        and rfq.sub_status == RfqSubStatus.REVISION_REQUESTED
+    ):
+        return False
+    greeting = _build_revision_chat_greeting(rfq.revision_notes)
+    history = list(rfq.chat_history or [])
+    already_present = any(
+        m.get("role") == "assistant" and m.get("content") == greeting
+        for m in history
+    )
+    if already_present:
+        return False
+    history.append({"role": "assistant", "content": greeting})
+    rfq.chat_history = history
+    return True
+
 async def _upload_costing_action_file(
     *,
     rfq_id: str,
@@ -1549,6 +1583,9 @@ async def get_rfq(
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
     await _assert_can_view_rfq(db, current_user, rfq)
+    if rfq.chat_history and _ensure_revision_greeting_in_history(rfq):
+        await db.commit()
+        await db.refresh(rfq)
     return rfq
 
 
@@ -1839,6 +1876,7 @@ async def request_revision(
 
     rfq.revision_notes = comment
     _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.REVISION_REQUESTED)
+    _ensure_revision_greeting_in_history(rfq)
 
     await log_action(
         db,
