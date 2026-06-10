@@ -2078,9 +2078,9 @@ def _build_products_collection_fallback_text(
     document_label = _document_type_label(rfq.document_type)
     ordinal_label = "first" if product_index <= 1 else "next"
     return (
-        f"Please provide the {ordinal_label} part number (product row) for this "
-        f"{document_label}:\n\n"
+        f"Please provide the {ordinal_label} part number details (one line item):\n\n"
         "Part Number\n"
+        "Revision Level (optional — you may omit it)\n"
         "Quantity\n"
         "Target Price\n"
         "Currency (3-letter code)\n"
