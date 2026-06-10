@@ -355,6 +355,9 @@ def _can_edit_rfq_phase(current_user: User, rfq: Rfq) -> bool:
         return True
     if _is_costing_specialist_role(current_user):
         return False
+    # In REVISION_REQUESTED, only the creator may make changes — the validator must wait.
+    if rfq.sub_status == RfqSubStatus.REVISION_REQUESTED:
+        return _is_rfq_creator(current_user, rfq)
     return _is_rfq_creator(current_user, rfq) or _is_assigned_validator(current_user, rfq)
 
 

@@ -1064,6 +1064,16 @@ def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
             "- Follow the normal RFQ workflow rules.\n"
         )
 
+    _revision_products_rule = (
+        "PRODUCTS UPDATE RULE: When the user updates any field inside a product row "
+        "(e.g. target_price, quantity), call updateFormFields with only the changed "
+        "fields for that row — the backend will merge them into the existing row "
+        "automatically. After saving the product change, you MUST immediately call "
+        "retrieveZoneManager (without passing to_total) so the backend recalculates "
+        "the new TO and re-evaluates the validator assignment. Then save the returned "
+        "zone_manager_email and validator_role via updateFormFields."
+    )
+
     if _is_self_revision_note(revision_notes):
         return f"""REVISION MODE CONTEXT:
 - The RFQ sub_status is REVISION_REQUESTED.
@@ -1074,6 +1084,7 @@ def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
 - Self-update rule: greet the user with exactly "{SELF_REVISION_GREETING}"
 - Do NOT mention the validator in this self-update flow.
 - When the RFQ is in REVISION_REQUESTED, you are ONLY responsible for updating requested fields.
+- {_revision_products_rule}
 - DO NOT call submitValidation or any other tool that changes RFQ status.
 - When the user says the updates are complete, instruct them to click the physical "Submit Updates" button at the top of their screen to send the RFQ back to the validator.
 """
@@ -1088,6 +1099,7 @@ def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
 - External revision rule: summarize the validator feedback and greet the user with exactly "{_build_revision_greeting(revision_notes)}"
 - You must guide the user based on the validator feedback above, even when the referenced fields are already populated in the database state.
 - When the RFQ is in REVISION_REQUESTED, you are ONLY responsible for updating requested fields.
+- {_revision_products_rule}
 - DO NOT call submitValidation or any other tool that changes RFQ status.
 - When the user says the updates are complete, instruct them to click the physical "Submit Updates" button at the top of their screen to send the RFQ back to the validator.
 """
@@ -1099,6 +1111,7 @@ def _build_revision_mode_prompt_context(rfq: Rfq) -> str:
 - DO NOT say that updates are limited to NEW_RFQ. REVISION_REQUESTED is also a valid editable RFQ state.
 - Greet the user with exactly "{SELF_REVISION_GREETING}"
 - When the RFQ is in REVISION_REQUESTED, you are ONLY responsible for updating requested fields.
+- {_revision_products_rule}
 - DO NOT call submitValidation or any other tool that changes RFQ status.
 - When the user says the updates are complete, instruct them to click the physical "Submit Updates" button at the top of their screen to send the RFQ back to the validator.
 """
@@ -1256,6 +1269,10 @@ def _build_missing_fields_prompt(
         )
         preferred_question = FIELD_QUESTION_OVERRIDES.get(next_field_to_ask)
         if preferred_question:
+            if _is_optional_field(next_field_to_ask):
+                preferred_question = (
+                    f"{preferred_question}\n\n*(Optional — type **skip** to leave it blank.)*"
+                )
             prompt += (
                 "\n- Preferred exact wording for the next question: "
                 f"{json.dumps(preferred_question, ensure_ascii=False)}"
@@ -1844,6 +1861,25 @@ def _build_modify_before_submission_question() -> str:
 
 def _build_modify_fields_follow_up_text() -> str:
     return "Please tell me which field you would like to update or modify."
+
+
+def _build_submit_later_text() -> str:
+    return "No problem! You can submit the RFQ for validation whenever you're ready."
+
+
+_NEUTRAL_ACK_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?|alright|sure|got\s+it|noted|understood|thanks?|thank\s+you|perfect|great|fine|cool|sounds?\s+good)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_submit_later_ack(last_assistant_text: str, user_message: str) -> bool:
+    """True when the user is just acknowledging the 'submit later' reply."""
+    return (
+        _normalize_prompt_block_text(last_assistant_text)
+        == _normalize_prompt_block_text(_build_submit_later_text())
+        and bool(_NEUTRAL_ACK_RE.match(user_message))
+    )
 
 
 def _normalize_prompt_block_text(text: str | None) -> str:
@@ -2820,6 +2856,69 @@ async def _execute_tool_calls(
                 if isinstance(existing_products, list) and isinstance(normalized_new_products, list):
                     filtered_fields["products"] = existing_products + normalized_new_products
 
+            # ── smart-merge: patch existing product rows rather than replacing them ──
+            # When the LLM sends a partial products update (e.g., only target_price),
+            # merge the changed fields into the existing rows matched by part_number so
+            # that all other product fields (quantity, revision_level, costing_data, …)
+            # are preserved.
+            if not should_append and "products" in filtered_fields:
+                persisted_rfq_data = _normalize_rfq_data_fields(
+                    getattr(rfq, "rfq_data", None)
+                )
+                _existing = (
+                    persisted_rfq_data.get("products")
+                    if isinstance(persisted_rfq_data.get("products"), list) and persisted_rfq_data.get("products")
+                    else (
+                        extracted_data.get("products")
+                        if isinstance(extracted_data.get("products"), list) and extracted_data.get("products")
+                        else None
+                    )
+                )
+                if _existing:
+                    _incoming_raw = filtered_fields["products"]
+                    if isinstance(_incoming_raw, str):
+                        try:
+                            _incoming_raw = json.loads(_incoming_raw)
+                        except Exception:
+                            _incoming_raw = []
+                    if not isinstance(_incoming_raw, list):
+                        _incoming_raw = []
+                    _incoming_normalized = [
+                        p for p in (
+                            normalize_rfq_data_products({"products": [row]}, products_authoritative=True).get("products", [])
+                            for row in _incoming_raw
+                        )
+                        if p
+                    ]
+                    _incoming_normalized = [p for sublist in _incoming_normalized for p in sublist]
+                    # Index existing rows by part_number (lower-cased for case-insensitive match)
+                    _result = [dict(p) for p in _existing]
+                    _existing_index = {
+                        str(p.get("part_number") or "").strip().lower(): i
+                        for i, p in enumerate(_result)
+                        if str(p.get("part_number") or "").strip()
+                    }
+                    _unmatched = []
+                    for _inc in _incoming_normalized:
+                        _pn_key = str(_inc.get("part_number") or "").strip().lower()
+                        if _pn_key and _pn_key in _existing_index:
+                            _idx = _existing_index[_pn_key]
+                            _merged = dict(_result[_idx])
+                            # Update only the fields the LLM explicitly provided (non-None)
+                            for _k, _v in _inc.items():
+                                if _v is not None:
+                                    _merged[_k] = _v
+                            # Recalculate target_to from merged quantity and price
+                            _qty = _merged.get("quantity")
+                            _price = _merged.get("target_price")
+                            if isinstance(_qty, (int, float)) and isinstance(_price, (int, float)):
+                                _merged["target_to"] = _qty * _price
+                            _result[_idx] = _merged
+                        else:
+                            _unmatched.append(_inc)
+                    _result.extend(_unmatched)
+                    filtered_fields["products"] = _result
+
             if not filtered_fields and rejected_required_fields:
                 tool_response_text = json.dumps(
                     {
@@ -3577,7 +3676,7 @@ async def handle_chat(
         if pending_pre_submission_action == "submit_no":
             final_text = _append_assistant_text_if_new(
                 history,
-                _build_modify_fields_follow_up_text(),
+                _build_submit_later_text(),
             )
             rfq.chat_history = history
             rfq.rfq_data = extracted_data
@@ -3682,6 +3781,16 @@ async def handle_chat(
                 extracted_data=extracted_data,
             ),
         )
+        rfq.chat_history = history
+        rfq.rfq_data = extracted_data
+        await db.commit()
+        await db.refresh(rfq)
+        return ChatResponse(response=final_text)
+
+    # Short-circuit: user acknowledged "you can submit later" with a neutral phrase.
+    # Skip the LLM entirely — it would otherwise re-ask for field updates.
+    if chat_mode != "potential" and _is_submit_later_ack(last_assistant_text, req.message):
+        final_text = _append_assistant_text_if_new(history, "Understood!")
         rfq.chat_history = history
         rfq.rfq_data = extracted_data
         await db.commit()
@@ -4059,6 +4168,15 @@ Review this JSON to know exactly what has already been collected:
                 )
             if pre_submission_modify_turn:
                 final_text = _build_modify_fields_follow_up_text()
+            # Guard: never re-ask for modifications right after "submit later" reply
+            if (
+                chat_mode != "potential"
+                and _normalize_prompt_block_text(last_assistant_text)
+                    == _normalize_prompt_block_text(_build_submit_later_text())
+                and _normalize_prompt_block_text(final_text)
+                    == _normalize_prompt_block_text(_build_modify_fields_follow_up_text())
+            ):
+                final_text = "Understood!"
             final_text = _append_assistant_text_if_new(history, final_text)
 
     except (httpx.TimeoutException, APITimeoutError):
