@@ -81,11 +81,11 @@ def test_sanitize_assistant_text_removes_leading_tool_payload_and_keeps_summary(
         '{"fieldstoupdate":{"products":[{"partnumber":"p25845","revisionlevel":"rev01","quantity":10000.0,'
         '"targetprice":1000.0,"currency":"EUR","targetpriceisestimated":true,"targetto":10000000.0}],'
         '"totaltargetto":10000000.0,"tototal":"10000.0","tototallocal":null,'
-        '"zonemanageremail":"taha.khiari@avocarbon.com","validatorrole":"CEO"}}\n\n'
+        '"zonemanageremail":"olivier.spicker@avocarbon.com","validatorrole":"CEO"}}\n\n'
         "Total target TO: 10,000,000\n"
         "Total turnover (kEUR): 10,000.0\n"
         "Delivery zone: Europe\n"
-        "Validator: CEO (taha.khiari@avocarbon.com)\n"
+        "Validator: CEO (olivier.spicker@avocarbon.com)\n"
         "Do you want to submit this RFQ for validation?\n\n"
         "Yes\n"
         "No"
@@ -95,7 +95,7 @@ def test_sanitize_assistant_text_removes_leading_tool_payload_and_keeps_summary(
         "Total target TO: 10,000,000\n"
         "Total turnover (kEUR): 10,000.0\n"
         "Delivery zone: Europe\n"
-        "Validator: CEO (taha.khiari@avocarbon.com)\n"
+        "Validator: CEO (olivier.spicker@avocarbon.com)\n"
         "Do you want to submit this RFQ for validation?\n\n"
         "Yes\n"
         "No"
