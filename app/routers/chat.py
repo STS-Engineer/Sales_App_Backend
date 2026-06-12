@@ -3,6 +3,7 @@ import logging
 import datetime
 import re
 import unicodedata
+from typing import Any
 import httpx
 from openai import APITimeoutError, AsyncOpenAI
 from fastapi import APIRouter, Depends, HTTPException
@@ -168,6 +169,7 @@ POTENTIAL_ALLOWED_FIELDS = {
     "contact_phone",
 }
 RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
+    "automotive_type",
     "product_name",
     "product_line_acronym",
     "project_name",
@@ -211,6 +213,7 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
 }
 UPDATE_FORM_FIELD_ALIASES = {
     "customerName": "customer_name",
+    "automotiveType": "automotive_type",
     "productName": "product_name",
     "products": "products",
     "productItems": "products",
@@ -325,6 +328,7 @@ RFQ_STEPS: list[tuple[int, list[dict[str, object]]]] = [
     (
         1,
         [
+            _step_field("automotive_type"),
             _step_field("customer_name"),
             _step_field("application"),
             _step_field("product_name"),
@@ -406,6 +410,7 @@ SKIP_LIKE_TEXT_VALUES = {
 }
 URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>()]+")
 FIELD_LABELS = {
+    "automotive_type": "Automotive / Non automotive",
     "customer_name": "Customer",
     "application": "Application",
     "product_name": "Product name",
@@ -454,6 +459,7 @@ FIELD_LABELS = {
 }
 
 FIELD_QUESTION_OVERRIDES = {
+    "automotive_type": "Is this request related to the Automotive or Non Automotive market?",
     "customer_name": "Who is the Customer?",
     "application": "What is the Application?",
     "product_name": "Which Product name should we use for this RFQ?",
@@ -503,6 +509,10 @@ TYPE_OF_PACKAGING_OPTIONS = [
     "carboard divider",
     "one way tray",
     "returnable plastic tray",
+]
+AUTOMOTIVE_TYPE_OPTIONS = [
+    "1. Automotive",
+    "2. Non automotive",
 ]
 PRICE_SOURCE_OPTIONS = [
     "Estimated by Avocarbon",
@@ -585,11 +595,35 @@ def _normalize_scope_value(value):
     return value
 
 
+def _normalize_automotive_type(value: Any) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+
+    normalized = re.sub(r"[_\-\s]+", " ", cleaned).strip().lower()
+    if normalized == "1":
+        return "Automotive"
+    if normalized == "2":
+        return "Non automotive"
+    if "non" in normalized and "auto" in normalized:
+        return "Non automotive"
+    if "auto" in normalized:
+        return "Automotive"
+    return cleaned
+
+
 def _normalize_rfq_data_fields(data: dict | None) -> dict:
     normalized = dict(data or {})
     legacy_scope = normalized.pop("is_feasible", None)
     if "scope" not in normalized and legacy_scope is not None:
         normalized["scope"] = _normalize_scope_value(legacy_scope)
+    normalized_automotive_type = _normalize_automotive_type(
+        normalized.get("automotive_type") or normalized.get("automotiveType")
+    )
+    if normalized_automotive_type is not None:
+        normalized["automotive_type"] = normalized_automotive_type
     return normalize_rfq_data_products(normalized)
 
 
@@ -2110,6 +2144,8 @@ def _build_field_question_with_options(
 
     if normalized_field_name == "rfq_files":
         return f"{question}\n\nYes\nNo"
+    if normalized_field_name == "automotive_type":
+        return f"{question}\n\n" + "\n".join(AUTOMOTIVE_TYPE_OPTIONS)
     if normalized_field_name == "delivery_zone":
         return f"{question}\n\n" + "\n".join(APPROVED_DELIVERY_ZONES)
     if normalized_field_name == "type_of_packaging":
@@ -2350,6 +2386,56 @@ def _sanitize_chat_history(history: list[dict] | None) -> list[dict]:
         sanitized_history.append(next_message)
 
     return sanitized_history
+
+
+def _make_json_safe(value: Any):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {
+            str(key): _make_json_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_make_json_safe(item) for item in value]
+    return str(value)
+
+
+def _build_chat_persistence_error_text() -> str:
+    return (
+        "**System error.**\n\n"
+        "- The assistant could not save this chat turn.\n"
+        "- Please try again.\n"
+    )
+
+
+async def _persist_chat_state(
+    *,
+    db: AsyncSession,
+    rfq: Rfq,
+    extracted_data: dict,
+    history: list[dict],
+    chat_mode: str,
+) -> bool:
+    try:
+        safe_history = _make_json_safe(history)
+        safe_data = _make_json_safe(dict(extracted_data or {}))
+
+        if chat_mode == "potential":
+            safe_data["potential_chat_history"] = safe_history
+            rfq.rfq_data = safe_data
+        else:
+            rfq.chat_history = safe_history
+            rfq.rfq_data = _normalize_rfq_data_fields(safe_data)
+
+        await db.commit()
+        return True
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to persist chat state for RFQ %s.", rfq.rfq_id)
+        return False
 
 
 def _map_visible_chat_entries(history: list[dict]) -> list[dict]:
@@ -2788,6 +2874,12 @@ async def _execute_tool_calls(
         elif func_name == "updateFormFields":
             raw_fields = args.get("fields_to_update", {})
             fields = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+            if "automotive_type" in fields:
+                normalized_automotive_type = _normalize_automotive_type(
+                    fields["automotive_type"]
+                )
+                if normalized_automotive_type:
+                    fields["automotive_type"] = normalized_automotive_type
             if "target_price_is_estimated" in fields:
                 val = fields["target_price_is_estimated"]
                 fields["target_price_is_estimated"] = (
@@ -3077,6 +3169,7 @@ MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/product
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
+- automotive_type
 - customer_name
 - application
 - product_name
@@ -3161,11 +3254,12 @@ CRITICAL TOOL RULE: You must NEVER output raw JSON, tool call arguments, or data
 CRITICAL WORKFLOW RULES:
 1. Before asking anything, inspect BOTH the CURRENT RFQ DATABASE STATE and the injected MISSING_FIELDS_PROMPT.
 2. NEVER ask again for any field that is already populated in the CURRENT RFQ DATABASE STATE. This is especially critical after a Potential opportunity is promoted to formal RFQ because shared fields may already be prefilled.
-3. If `customer_name` is already filled, DO NOT ask 'Who is the Customer?' again. If it is missing, ask it and INSTANTLY call checkGroupeExistence. If the tool returns that the customer does NOT exist, DO NOT ask them to verify or try again. Simply reply: 'New customer. It will be added to the database later after we get the contact details,' and IMMEDIATELY proceed to the next unresolved field.
-4. If `application` is already filled, DO NOT ask 'What is the Application?' again. If it is missing, ask it and save it with updateFormFields. DO NOT use the application text to search for products.
-5. If `product_name` is still missing, you MUST call retrieveProducts with an EMPTY STRING for productName ("") once the application is already saved or already present in the state. You MUST retrieve the entire list of products from the database, regardless of the application. Once the system returns the full list, present it to the user as a numbered list and ask them to choose one.
-6. When the user chooses a product from the list, you MUST call updateFormFields with BOTH `product_name` AND `product_line_acronym` in the SAME single call: {"fields_to_update": {"product_name": "<chosen_product>", "product_line_acronym": "<ACRONYM>"}}. NEVER save product_name without product_line_acronym or vice versa — they must always be written together in one call. After that single call completes, immediately call retrieveProducts again with that exact product name to fetch its costing parameters.
-7. If any contact fields (`contact_email`, `contact_name`, `contact_role`, `contact_phone`) are already filled because they were copied from Potential, DO NOT ask for them again. Only ask for the specific contact fields that are still missing.
+3. If `automotive_type` is already filled, DO NOT ask for it again. If it is missing, ask exactly `Is this request related to the Automotive or Non Automotive market?` and present exactly these numbered options on separate lines: `1. Automotive` and `2. Non automotive`. As soon as the user answers, you MUST immediately call `updateFormFields` with `automotive_type` using the exact canonical value `Automotive` or `Non automotive`.
+4. If `customer_name` is already filled, DO NOT ask 'Who is the Customer?' again. If it is missing, ask it and INSTANTLY call checkGroupeExistence. If the tool returns that the customer does NOT exist, DO NOT ask them to verify or try again. Simply reply: 'New customer. It will be added to the database later after we get the contact details,' and IMMEDIATELY proceed to the next unresolved field.
+5. If `application` is already filled, DO NOT ask 'What is the Application?' again. If it is missing, ask it and save it with updateFormFields. DO NOT use the application text to search for products.
+6. If `product_name` is still missing, you MUST call retrieveProducts with an EMPTY STRING for productName ("") once the application is already saved or already present in the state. You MUST retrieve the entire list of products from the database, regardless of the application. Once the system returns the full list, present it to the user as a numbered list and ask them to choose one.
+7. When the user chooses a product from the list, you MUST call updateFormFields with BOTH `product_name` AND `product_line_acronym` in the SAME single call: {"fields_to_update": {"product_name": "<chosen_product>", "product_line_acronym": "<ACRONYM>"}}. NEVER save product_name without product_line_acronym or vice versa — they must always be written together in one call. After that single call completes, immediately call retrieveProducts again with that exact product name to fetch its costing parameters.
+8. If any contact fields (`contact_email`, `contact_name`, `contact_role`, `contact_phone`) are already filled because they were copied from Potential, DO NOT ask for them again. Only ask for the specific contact fields that are still missing.
 
 AUTHORIZED PRODUCT LINES:
 The system maps products to one of these strict acronyms:
@@ -3184,15 +3278,19 @@ You must strictly follow this exact sequential checklist to collect data. Do not
 STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in Step 2, and then all fields in Step 3 BEFORE you are allowed to calculate Turnover, assign a validator, or ask the user to submit in Step 4. Do not jump to Step 4 if Step 3 fields are empty.
 
 ### Step 1: Client & Delivery
-1. Ask 'Who is the Customer?' ONLY IF `customer_name` is currently missing. Once they answer, extract it and INSTANTLY call `checkGroupeExistence`.
-2. Ask 'What is the Application?' ONLY IF `application` is currently missing.
-3. CRITICAL RULE: Once the user answers the application question, you MUST immediately call `updateFormFields` with {"fields_to_update": {"application": "<user_answer>"}}. You are FORBIDDEN from calling `retrieveProducts` until the application is either already present in the state or has just been successfully saved.
-4. ONLY AFTER the application is saved or already present, call `retrieveProducts` with an empty string ("") to fetch the catalog IF `product_name` is still missing.
-5. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save BOTH `product_name` AND `product_line_acronym` together in ONE single `updateFormFields` call (see rule 6 below). NEVER split them into two separate calls.
-6. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
-7. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-7.b. A URL or link does NOT count as an uploaded RFQ file. If the user pastes a URL when `rfq_files` is the next missing field, do NOT accept it, do NOT call `uploadRfqFiles`, and tell them to upload the file directly with the `Attach files` button.
-8. Ask for the remaining Step 1 fields in checklist order, including optional ones. This includes product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. You MUST explicitly mark `ppap_date` as optional and allow `skip`. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL. When asking for a full product row in one grouped prompt, do NOT tell the user to type `skip` for Revision Level; they may simply leave it out. If it is omitted while the required product row values are present, treat Revision Level as blank, save the row, and continue without a dedicated follow-up question.
+1. Ask `Is this request related to the Automotive or Non Automotive market?` ONLY IF `automotive_type` is currently missing. You MUST show the answer choices exactly as:
+   `1. Automotive`
+   `2. Non automotive`
+   If the user replies with `1` or `2`, you MUST map it to the exact saved value `Automotive` or `Non automotive` before calling `updateFormFields`.
+2. Ask 'Who is the Customer?' ONLY IF `customer_name` is currently missing. Once they answer, extract it and INSTANTLY call `checkGroupeExistence`.
+3. Ask 'What is the Application?' ONLY IF `application` is currently missing.
+4. CRITICAL RULE: Once the user answers the application question, you MUST immediately call `updateFormFields` with {"fields_to_update": {"application": "<user_answer>"}}. You are FORBIDDEN from calling `retrieveProducts` until the application is either already present in the state or has just been successfully saved.
+5. ONLY AFTER the application is saved or already present, call `retrieveProducts` with an empty string ("") to fetch the catalog IF `product_name` is still missing.
+6. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save BOTH `product_name` AND `product_line_acronym` together in ONE single `updateFormFields` call. NEVER split them into two separate calls.
+7. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
+8. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
+8.b. A URL or link does NOT count as an uploaded RFQ file. If the user pastes a URL when `rfq_files` is the next missing field, do NOT accept it, do NOT call `uploadRfqFiles`, and tell them to upload the file directly with the `Attach files` button.
+9. Ask for the remaining Step 1 fields in checklist order, including optional ones. This includes product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. You MUST explicitly mark `ppap_date` as optional and allow `skip`. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL. When asking for a full product row in one grouped prompt, do NOT tell the user to type `skip` for Revision Level; they may simply leave it out. If it is omitted while the required product row values are present, treat Revision Level as blank, save the row, and continue without a dedicated follow-up question.
 MULTI-PRODUCT SUPPORT:
 - NEVER ask the user how many part numbers/products there are upfront.
 - After each part number is saved, ask: "Would you like to add another part number to this request?"
@@ -3656,10 +3754,14 @@ async def handle_chat(
                 history,
                 _build_modify_fields_follow_up_text(),
             )
-            rfq.chat_history = history
-            rfq.rfq_data = extracted_data
-            await db.commit()
-            await db.refresh(rfq)
+            if not await _persist_chat_state(
+                db=db,
+                rfq=rfq,
+                extracted_data=extracted_data,
+                history=history,
+                chat_mode=chat_mode,
+            ):
+                return ChatResponse(response=_build_chat_persistence_error_text())
             return ChatResponse(response=final_text)
 
         if pending_pre_submission_action == "modify_no":
@@ -3667,10 +3769,14 @@ async def handle_chat(
                 history,
                 _build_submit_validation_question(rfq),
             )
-            rfq.chat_history = history
-            rfq.rfq_data = extracted_data
-            await db.commit()
-            await db.refresh(rfq)
+            if not await _persist_chat_state(
+                db=db,
+                rfq=rfq,
+                extracted_data=extracted_data,
+                history=history,
+                chat_mode=chat_mode,
+            ):
+                return ChatResponse(response=_build_chat_persistence_error_text())
             return ChatResponse(response=final_text)
 
         if pending_pre_submission_action == "submit_no":
@@ -3678,10 +3784,14 @@ async def handle_chat(
                 history,
                 _build_submit_later_text(),
             )
-            rfq.chat_history = history
-            rfq.rfq_data = extracted_data
-            await db.commit()
-            await db.refresh(rfq)
+            if not await _persist_chat_state(
+                db=db,
+                rfq=rfq,
+                extracted_data=extracted_data,
+                history=history,
+                chat_mode=chat_mode,
+            ):
+                return ChatResponse(response=_build_chat_persistence_error_text())
             return ChatResponse(response=final_text)
 
         if pending_pre_submission_action == "submit_yes":
@@ -3759,10 +3869,14 @@ async def handle_chat(
                 )
             final_text = _append_assistant_text_if_new(history, final_text)
 
-            rfq.chat_history = history
-            rfq.rfq_data = extracted_data
-            await db.commit()
-            await db.refresh(rfq)
+            if not await _persist_chat_state(
+                db=db,
+                rfq=rfq,
+                extracted_data=extracted_data,
+                history=history,
+                chat_mode=chat_mode,
+            ):
+                return ChatResponse(response=_build_chat_persistence_error_text())
             return ChatResponse(
                 response=final_text,
                 tool_calls_used=tool_calls_used,
@@ -3781,20 +3895,28 @@ async def handle_chat(
                 extracted_data=extracted_data,
             ),
         )
-        rfq.chat_history = history
-        rfq.rfq_data = extracted_data
-        await db.commit()
-        await db.refresh(rfq)
+        if not await _persist_chat_state(
+            db=db,
+            rfq=rfq,
+            extracted_data=extracted_data,
+            history=history,
+            chat_mode=chat_mode,
+        ):
+            return ChatResponse(response=_build_chat_persistence_error_text())
         return ChatResponse(response=final_text)
 
     # Short-circuit: user acknowledged "you can submit later" with a neutral phrase.
     # Skip the LLM entirely — it would otherwise re-ask for field updates.
     if chat_mode != "potential" and _is_submit_later_ack(last_assistant_text, req.message):
         final_text = _append_assistant_text_if_new(history, "Understood!")
-        rfq.chat_history = history
-        rfq.rfq_data = extracted_data
-        await db.commit()
-        await db.refresh(rfq)
+        if not await _persist_chat_state(
+            db=db,
+            rfq=rfq,
+            extracted_data=extracted_data,
+            history=history,
+            chat_mode=chat_mode,
+        ):
+            return ChatResponse(response=_build_chat_persistence_error_text())
         return ChatResponse(response=final_text)
 
     # Keep a wider short-term history window so the assistant can reconcile
@@ -3917,19 +4039,40 @@ Review this JSON to know exactly what has already been collected:
 {mode_specific_instructions}
 """
 
-    # Create a dynamic system message containing the database state
-    DYNAMIC_SYSTEM_PROMPT = _build_dynamic_system_prompt()
-
-    # Prep messages for OpenAI
-    messages_for_llm = [
-        {"role": "system", "content": DYNAMIC_SYSTEM_PROMPT},
-        *sliced_history
-    ]
-
     # Initialize tool calls tracking for the UI badge
     tool_calls_used = []
     final_text = ""
     auto_redirect = False
+
+    try:
+        dynamic_system_prompt = _build_dynamic_system_prompt()
+    except Exception as exc:
+        logger.exception(
+            "Failed to build dynamic chat prompt for RFQ %s.",
+            rfq.rfq_id,
+        )
+        final_text = (
+            "**System error.**\n\n"
+            "- The assistant could not prepare this chat turn.\n"
+            f"- Details: `{str(exc).strip() or exc.__class__.__name__}`\n"
+            "- Please try again.\n"
+        )
+        final_text = _append_assistant_text_if_new(history, final_text)
+        if not await _persist_chat_state(
+            db=db,
+            rfq=rfq,
+            extracted_data=extracted_data,
+            history=history,
+            chat_mode=chat_mode,
+        ):
+            return ChatResponse(response=_build_chat_persistence_error_text())
+        return ChatResponse(response=final_text)
+
+    # Prep messages for OpenAI
+    messages_for_llm = [
+        {"role": "system", "content": dynamic_system_prompt},
+        *sliced_history
+    ]
     
     # 1. Call OpenAI (1st pass)
     try:
@@ -3993,10 +4136,14 @@ Review this JSON to know exactly what has already been collected:
                             for _guard_tool_msg in _guard_tool_msgs:
                                 history.append(_guard_tool_msg)
                     final_text = _append_assistant_text_if_new(history, _submit_q)
-                    rfq.chat_history = history
-                    rfq.rfq_data = extracted_data
-                    await db.commit()
-                    await db.refresh(rfq)
+                    if not await _persist_chat_state(
+                        db=db,
+                        rfq=rfq,
+                        extracted_data=extracted_data,
+                        history=history,
+                        chat_mode=chat_mode,
+                    ):
+                        return ChatResponse(response=_build_chat_persistence_error_text())
                     return ChatResponse(response=final_text)
 
             history.append(assistant_tool_message)
@@ -4196,16 +4343,18 @@ Review this JSON to know exactly what has already been collected:
         )
         final_text = _append_assistant_text_if_new(history, final_text)
 
-    # Update state and commit
-    if chat_mode == "potential":
-        extracted_data["potential_chat_history"] = history
-        rfq.rfq_data = extracted_data
-    else:
-        rfq.chat_history = history
-        rfq.rfq_data = extracted_data
-
-    await db.commit()
-    await db.refresh(rfq)
+    if not await _persist_chat_state(
+        db=db,
+        rfq=rfq,
+        extracted_data=extracted_data,
+        history=history,
+        chat_mode=chat_mode,
+    ):
+        return ChatResponse(
+            response=_build_chat_persistence_error_text(),
+            tool_calls_used=tool_calls_used if tool_calls_used else None,
+            auto_redirect=auto_redirect or None,
+        )
 
     return ChatResponse(
         response=final_text,

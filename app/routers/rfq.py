@@ -456,11 +456,27 @@ def _rfq_query():
     )
 
 
+async def _refresh_rfq_response_state(db: AsyncSession, rfq: Rfq) -> None:
+    # updated_at is populated by the database on UPDATE, so after a commit it can
+    # remain in a server-postfetch state that is unsafe for FastAPI serialization
+    # outside the async session context. Refresh the response-critical timestamps
+    # explicitly before returning any RFQ payload.
+    await db.refresh(
+        rfq,
+        attribute_names=["updated_at", "last_notification_sent_at"],
+    )
+
+
 async def _get_rfq_or_404(db: AsyncSession, rfq_id: str) -> Rfq:
-    result = await db.execute(_rfq_query().where(Rfq.rfq_id == rfq_id))
+    result = await db.execute(
+        _rfq_query()
+        .where(Rfq.rfq_id == rfq_id)
+        .execution_options(populate_existing=True)
+    )
     rfq = result.scalar_one_or_none()
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found.")
+    await _refresh_rfq_response_state(db, rfq)
     rfq.rfq_data = normalize_rfq_data_products(rfq.rfq_data)
     return rfq
 
@@ -2125,6 +2141,7 @@ async def validate_rfq(
                     email_type=EMAIL_COSTING_ENTRY,
                 )
 
+    await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -2216,6 +2233,7 @@ async def costing_review(
         if str(refreshed_rfq.product_line_acronym or "").upper() == "ASS":
             await sync_rfq_to_assembly(refreshed_rfq)
 
+    await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -2333,6 +2351,7 @@ async def submit_costing_file_action(
                 email_type=EMAIL_FEASIBILITY_RESULT,
             )
 
+    await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -2422,6 +2441,7 @@ async def upload_pricing_bom_file(
             recipients=recipient_email,
             email_type=EMAIL_BOM_READY,
         )
+    await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -2523,6 +2543,7 @@ async def upload_pricing_final_price_file(
             recipients=recipient_email,
             email_type=EMAIL_PRICING_READY,
         )
+    await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -2651,6 +2672,7 @@ async def costing_validation(
                 email_type=EMAIL_COSTING_REJECTED,
             )
 
+    await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
 

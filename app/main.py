@@ -1,10 +1,13 @@
+import logging
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+logger = logging.getLogger(__name__)
 
 from app.config import settings
 from app.routers import (
@@ -64,6 +67,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception for %s %s", request.method, request.url.path)
+    # This handler runs inside ServerErrorMiddleware, which is outside CORSMiddleware.
+    # The response is sent on the original (unwrapped) ASGI send, so we must add
+    # CORS headers manually — otherwise the browser blocks it as a CORS error.
+    origin = request.headers.get("origin", "")
+    cors_headers: dict[str, str] = {}
+    if origin:
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers=cors_headers,
+    )
 
 app.include_router(auth.router)
 app.include_router(users.router)

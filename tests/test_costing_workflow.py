@@ -250,6 +250,64 @@ async def test_validation_approval_initializes_costing_file_state_and_sends_entr
 
 
 @pytest.mark.asyncio
+async def test_validation_approval_refreshes_response_after_notification_commit(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="validation-refresh-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Validation Refresh Creator",
+    )
+    validator = await _create_user(
+        db_session,
+        prefix="validation-refresh-validator",
+        role=UserRole.ZONE_MANAGER,
+        full_name="Validation Refresh Validator",
+    )
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        zone_manager=validator,
+        phase=RfqPhase.RFQ,
+        sub_status=RfqSubStatus.PENDING_FOR_VALIDATION,
+    )
+
+    monkeypatch.setattr(
+        rfq_router.emails,
+        "send_costing_entry_email",
+        lambda *_args, **_kwargs: True,
+    )
+
+    async def _fake_record_notification_sent(*args, **kwargs):
+        db: AsyncSession = args[0]
+        await db.commit()
+        for instance in list(db.sync_session.identity_map.values()):
+            if isinstance(instance, Rfq):
+                db.sync_session.expire(instance, ["updated_at"])
+        return 1
+
+    monkeypatch.setattr(
+        rfq_router,
+        "record_notification_sent",
+        _fake_record_notification_sent,
+    )
+
+    response = await client.post(
+        f"/api/rfq/{rfq.rfq_id}/validate",
+        json={"approved": True},
+        headers=_headers_for(validator),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["phase"] == "COSTING"
+    assert payload["updated_at"]
+
+
+@pytest.mark.asyncio
 async def test_costing_review_approval_sends_reception_and_handoff_emails(
     client: AsyncClient,
     db_session: AsyncSession,
