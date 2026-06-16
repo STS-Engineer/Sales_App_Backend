@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     DATABASE_URL2: str | None = None
     DATABASE_URL3: str
+    DATABASE_URL4: str | None = None
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
@@ -123,6 +124,10 @@ class Settings(BaseSettings):
     @property
     def async_db_url2(self) -> URL | None:
         return self._build_async_db_url(self.DATABASE_URL2)
+
+    @property
+    def async_db_url4(self) -> URL | None:
+        return self._build_async_db_url(self.DATABASE_URL4)
 
     @property
     def async_db_url3(self) -> URL:

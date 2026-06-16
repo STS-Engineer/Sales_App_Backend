@@ -21,6 +21,7 @@ from app.routers import (
     products,
     rfq,
     routing_config,
+    team_view,
     users,
 )
 
@@ -96,6 +97,7 @@ app.include_router(routing_config.router)
 app.include_router(chat.router)
 app.include_router(chat_offer.router)
 app.include_router(chat_potential.router)
+app.include_router(team_view.router)
 app.include_router(internal.router)
 
 

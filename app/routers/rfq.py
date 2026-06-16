@@ -1,19 +1,22 @@
 import datetime
+import logging
 import os
 import uuid
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database_assembly import sync_rfq_to_assembly
-from app.database import get_db, get_db3
+from app.database import get_db, get_db3, get_db4_optional
 from app.middleware.auth import get_current_user, require_role
 from app.models.audit_log import AuditLog
 from app.models.contact import Contact
@@ -97,6 +100,36 @@ from app.utils.currency import get_eur_exchange_rate
 router = APIRouter(prefix="/api/rfq", tags=["rfq"])
 
 TERMINAL_SUBSTATUSES = {RfqSubStatus.LOST, RfqSubStatus.CANCELED}
+
+_ZONE_MANAGER_TEAM_SQL = text("""
+WITH RECURSIVE team_tree AS (
+    SELECT email
+    FROM v_sales_organisation
+    WHERE lower(email) = lower(:current_user_email)
+    UNION ALL
+    SELECT child.email
+    FROM v_sales_organisation child
+    INNER JOIN team_tree parent
+        ON lower(child.reports_to_email) = lower(parent.email)
+)
+SELECT lower(email) AS email
+FROM team_tree
+WHERE lower(email) <> lower(:current_user_email)
+""")
+
+
+async def _get_zone_manager_team_emails(
+    db_kpi: AsyncSession, user_email: str
+) -> frozenset[str]:
+    try:
+        result = await db_kpi.execute(
+            _ZONE_MANAGER_TEAM_SQL,
+            {"current_user_email": user_email},
+        )
+        return frozenset(row.email for row in result.mappings().all() if row.email)
+    except Exception:
+        logger.exception("Failed to query team emails for %s", user_email)
+        return frozenset()
 RFI_BLOCKED_FORWARD_PHASES = {RfqPhase.OFFER, RfqPhase.PO, RfqPhase.PROTOTYPE}
 RFQ_FILES_CONTAINER = "rfq-files"
 COSTING_DISCUSSION_PHASES = {RfqSubStatus.FEASIBILITY, RfqSubStatus.PRICING}
@@ -318,7 +351,12 @@ def _assert_terminal_status_allowed(rfq: Rfq, target_sub_status: RfqSubStatus) -
         )
 
 
-async def _can_view_rfq(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
+async def _can_view_rfq(
+    db: AsyncSession,
+    current_user: User,
+    rfq: Rfq,
+    db_kpi: AsyncSession | None = None,
+) -> bool:
     if current_user.role == UserRole.OWNER:
         return True
     if current_user.role == UserRole.COSTING_TEAM:
@@ -327,14 +365,24 @@ async def _can_view_rfq(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
         return rfq.phase == RfqPhase.COSTING and await _is_assigned_rnd(db, current_user, rfq)
     if current_user.role == UserRole.PLM:
         return await _is_assigned_plm(db, current_user, rfq)
-    return (
+    if (
         rfq.created_by_email == current_user.email
         or rfq.zone_manager_email == current_user.email
-    )
+    ):
+        return True
+    if current_user.role == UserRole.ZONE_MANAGER and db_kpi is not None:
+        team_emails = await _get_zone_manager_team_emails(db_kpi, current_user.email)
+        return (rfq.created_by_email or "").lower() in team_emails
+    return False
 
 
-async def _assert_can_view_rfq(db: AsyncSession, current_user: User, rfq: Rfq) -> None:
-    if not await _can_view_rfq(db, current_user, rfq):
+async def _assert_can_view_rfq(
+    db: AsyncSession,
+    current_user: User,
+    rfq: Rfq,
+    db_kpi: AsyncSession | None = None,
+) -> None:
+    if not await _can_view_rfq(db, current_user, rfq, db_kpi=db_kpi):
         raise HTTPException(status_code=403, detail="Not authorized to access this RFQ.")
 
 
@@ -1598,10 +1646,11 @@ async def list_rfqs(
 async def get_rfq(
     rfq_id: str,
     db: AsyncSession = Depends(get_db),
+    db_kpi: AsyncSession | None = Depends(get_db4_optional),
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    await _assert_can_view_rfq(db, current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq, db_kpi=db_kpi)
     if rfq.chat_history and _ensure_revision_greeting_in_history(rfq):
         await db.commit()
         await db.refresh(rfq)
@@ -1613,10 +1662,11 @@ async def get_rfq_discussion(
     rfq_id: str,
     phase: RfqSubStatus,
     db: AsyncSession = Depends(get_db),
+    db_kpi: AsyncSession | None = Depends(get_db4_optional),
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    await _assert_can_view_rfq(db, current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq, db_kpi=db_kpi)
 
     result = await db.execute(
         select(DiscussionMessage, User)
@@ -1660,10 +1710,11 @@ async def create_rfq_discussion_message(
 async def get_costing_messages(
     rfq_id: str,
     db: AsyncSession = Depends(get_db),
+    db_kpi: AsyncSession | None = Depends(get_db4_optional),
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    await _assert_can_view_rfq(db, current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq, db_kpi=db_kpi)
 
     result = await db.execute(
         select(DiscussionMessage, User)
@@ -2026,10 +2077,11 @@ async def submit_autopsy(
 async def get_audit_logs(
     rfq_id: str,
     db: AsyncSession = Depends(get_db),
+    db_kpi: AsyncSession | None = Depends(get_db4_optional),
     current_user: User = Depends(get_current_user),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    await _assert_can_view_rfq(db, current_user, rfq)
+    await _assert_can_view_rfq(db, current_user, rfq, db_kpi=db_kpi)
 
     query = select(AuditLog).where(AuditLog.rfq_id == rfq_id).order_by(AuditLog.timestamp.desc())
     logs = await db.execute(query)
