@@ -55,12 +55,13 @@ async def apply_user_role_update(
     await db.commit()
     await db.refresh(user)
 
-    if not was_approved and user.is_approved:
-        emails.send_approval_email(
-            user.email,
-            format_role_label(role),
-            settings.frontend_url,
-        )
+    # Disabled by request: do not send account approval email after OWNER validation.
+    # if not was_approved and user.is_approved:
+    #     emails.send_approval_email(
+    #         user.email,
+    #         format_role_label(role),
+    #         settings.frontend_url,
+    #     )
 
     return user
 
