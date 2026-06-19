@@ -17,6 +17,8 @@ from app.routers import (
     chat_offer,
     chat_potential,
     internal,
+    kpi_data,
+    kpi_settings,
     owner,
     products,
     rfq,
@@ -99,6 +101,8 @@ app.include_router(chat_offer.router)
 app.include_router(chat_potential.router)
 app.include_router(team_view.router)
 app.include_router(internal.router)
+app.include_router(kpi_settings.router)
+app.include_router(kpi_data.router)
 
 
 @app.get("/health", tags=["system"])

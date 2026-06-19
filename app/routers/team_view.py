@@ -1,6 +1,6 @@
 ﻿import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -54,8 +54,17 @@ ORDER BY person
 """)
 
 
+_SELF_SQL = text("""
+SELECT person, email
+FROM v_sales_organisation
+WHERE lower(email) = lower(:email)
+LIMIT 1
+""")
+
+
 @router.get("/members")
 async def get_team_members(
+    include_self: bool = Query(default=False),
     current_user: User = Depends(require_role(UserRole.ZONE_MANAGER)),
     db_kpi: AsyncSession = Depends(get_db4),
 ):
@@ -65,7 +74,18 @@ async def get_team_members(
             {"current_user_email": current_user.email},
         )
         rows = result.mappings().all()
-        return [{"person": row.person, "email": row.email} for row in rows]
+        members = [{"person": row.person, "email": row.email} for row in rows]
+
+        if include_self:
+            self_result = await db_kpi.execute(_SELF_SQL, {"email": current_user.email})
+            self_row = self_result.mappings().first()
+            self_entry = {
+                "person": self_row.person if self_row else (current_user.full_name or current_user.email),
+                "email": current_user.email,
+            }
+            members = [self_entry] + members
+
+        return members
     except Exception:
         logger.exception(
             "Failed to query team members for user %s", current_user.email

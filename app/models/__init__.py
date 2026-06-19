@@ -15,6 +15,9 @@ from app.models.notification_log import NotificationLog
 from app.models.discussion import DiscussionMessage
 from app.models.offer_preparation import OfferPreparation
 from app.models.potential import Potential
+from app.models.kpi_annual_target import KpiAnnualTarget
+from app.models.kpi_opportunity import KpiOpportunity
+from app.models.kpi_new_business import KpiNewBusiness
 
 __all__ = [
     "User",
@@ -34,4 +37,7 @@ __all__ = [
     "NotificationLog",
     "DiscussionMessage",
     "OfferPreparation",
+    "KpiAnnualTarget",
+    "KpiOpportunity",
+    "KpiNewBusiness",
 ]
