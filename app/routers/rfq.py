@@ -951,14 +951,21 @@ async def _generate_systematic_rfq_id(
     acronym: str,
     revision: str,
 ) -> str:
+    now = datetime.datetime.now()
+    yy = now.strftime("%y")
+    current_year = now.year
     count_query = await db.execute(
         select(func.count())
         .select_from(Rfq)
-        .where(Rfq.product_line_acronym == acronym, Rfq.zone_manager_email.is_not(None))
+        .where(
+            func.extract("year", Rfq.created_at) == current_year,
+            Rfq.zone_manager_email.is_not(None),
+            Rfq.document_type != RfqDocumentType.POTENTIAL,
+        )
     )
     current_count = count_query.scalar_one() or 0
-    yy = datetime.datetime.now().strftime("%y")
-    return f"{yy}{current_count + 1:03d}-{acronym}-{revision}"
+    sequence = 500 + current_count
+    return f"{yy}{sequence}-{acronym}-{revision}"
 
 
 async def _resolve_validation_matrix_product(

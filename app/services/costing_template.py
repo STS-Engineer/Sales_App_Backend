@@ -1322,7 +1322,10 @@ def _get_field_display_value(
         return multi_reference_display
     if label == "Target price":
         return _format_target_price_display(data)
-    return _pick_first_value(data, keys)
+    value = _pick_first_value(data, keys)
+    if value and value != "-" and "email" not in label.lower():
+        value = value[0].upper() + value[1:]
+    return value
 
 
 def _format_target_price_display(data: dict[str, Any]) -> str:
