@@ -185,6 +185,68 @@ async def _ensure_default_routing(
 
 
 @pytest.mark.asyncio
+async def test_assigned_costing_and_rnd_can_open_costing_rfq_detail(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    creator = await _create_user(
+        db_session,
+        prefix="detail-creator",
+        role=UserRole.COMMERCIAL,
+        full_name="Detail Creator",
+    )
+    validator = await _create_user(
+        db_session,
+        prefix="detail-validator",
+        role=UserRole.ZONE_MANAGER,
+        full_name="Detail Validator",
+    )
+    costing_user = await _create_user(
+        db_session,
+        prefix="detail-costing",
+        role=UserRole.COSTING_TEAM,
+        full_name="Assigned Costing",
+    )
+    rnd_user = await _create_user(
+        db_session,
+        prefix="detail-rnd",
+        role=UserRole.RND,
+        full_name="Assigned RND",
+    )
+
+    await _assign_matrix_contacts(
+        db_session,
+        product_line_acronym="ASS",
+        costing_email=costing_user.email,
+        rnd_email=rnd_user.email,
+        plm_email=DEFAULT_ROUTING_EMAIL,
+    )
+    rfq = await _create_rfq(
+        db_session,
+        creator=creator,
+        zone_manager=validator,
+        phase=RfqPhase.COSTING,
+        sub_status=RfqSubStatus.FEASIBILITY,
+        product_line_acronym="ASS",
+        product_name="Assembly",
+    )
+
+    costing_response = await client.get(
+        f"/api/rfq/{rfq.rfq_id}",
+        headers=_headers_for(costing_user),
+    )
+    rnd_response = await client.get(
+        f"/api/rfq/{rfq.rfq_id}",
+        headers=_headers_for(rnd_user),
+    )
+
+    assert costing_response.status_code == 200
+    assert costing_response.json()["rfq_id"] == rfq.rfq_id
+    assert rnd_response.status_code == 200
+    assert rnd_response.json()["rfq_id"] == rfq.rfq_id
+
+
+@pytest.mark.asyncio
 async def test_validation_approval_initializes_costing_file_state_and_sends_entry_email(
     client: AsyncClient,
     db_session: AsyncSession,

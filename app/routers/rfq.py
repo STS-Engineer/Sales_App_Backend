@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.config import settings
 from app.database_assembly import sync_rfq_to_assembly
@@ -525,7 +526,12 @@ async def _get_rfq_or_404(db: AsyncSession, rfq_id: str) -> Rfq:
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found.")
     await _refresh_rfq_response_state(db, rfq)
-    rfq.rfq_data = normalize_rfq_data_products(rfq.rfq_data)
+    # Normalize the payload for API consumers without marking the ORM object as
+    # dirty. Assigned-costing/R&D permission checks trigger extra SELECTs; if the
+    # instance looks dirty, SQLAlchemy autoflushes on those reads and expires the
+    # server-managed updated_at field, which later blows up FastAPI response
+    # serialization with MissingGreenlet.
+    set_committed_value(rfq, "rfq_data", normalize_rfq_data_products(rfq.rfq_data))
     return rfq
 
 
@@ -1645,7 +1651,7 @@ async def list_rfqs(
     result = await db.execute(query)
     rfqs = result.scalars().all()
     for rfq in rfqs:
-        rfq.rfq_data = normalize_rfq_data_products(rfq.rfq_data)
+        set_committed_value(rfq, "rfq_data", normalize_rfq_data_products(rfq.rfq_data))
     return rfqs
 
 
