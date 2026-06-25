@@ -515,45 +515,45 @@ FIELD_LABELS = {
 }
 
 FIELD_QUESTION_OVERRIDES = {
-    "automotive_type": "Is this request related to the Automotive or Non Automotive market?",
-    "customer_name": "Who is the Customer?",
-    "application": "What is the Application?",
-    "product_name": "Which Product name should we use for this RFQ?",
-    "project_name": "What is the Project name?",
-    "rfq_files": "Have you uploaded the RFQ files (drawings/specs) here?",
-    "volumes": "Please provide the yearly volumes and logistics details for each part number.",
-    "delivery_zone": "Which delivery zone applies to this RFQ?",
-    "delivery_plant": "What is the Plant?",
-    "country": "What is the Country?",
-    "po_date": "What is the PO date?",
-    "ppap_date": "What is the PPAP date?",
-    "sop_year": "What is the SOP year?",
-    "rfq_reception_date": "What is the RFQ reception date?",
-    "quotation_expected_date": "What is the Expected quotation date?",
-    "contact_email": "What is the Contact email?",
-    "contact_name": "What is the Contact name?",
-    "contact_role": "What is the Contact function?",
-    "contact_phone": "What is the Contact phone number?",
-    "expected_delivery_conditions": "What are the expected Delivery Conditions?",
-    "expected_payment_terms": "What are the expected Payment Terms?",
-    "type_of_packaging": "Which type of packaging applies?\n\n1. carboard divider\n2. one way tray\n3. returnable plastic tray",
-    "business_trigger": "What is the Business Trigger?",
-    "customer_tooling_conditions": "What are the Customer Tooling Conditions?",
-    "entry_barriers": "What are the Entry Barriers?",
-    "responsibility_design": "Who is responsible for design?",
-    "responsibility_validation": "Who is responsible for validation?",
-    "product_ownership": "Who owns the product?",
-    "pays_for_development": "Who pays for development?",
-    "capacity_available": "Do we have the capacity to fulfill this request?",
-    "scope": "Is it in our scope?",
-    "strategic_note": "Do you have any additional comments or strategic considerations?",
-    "final_recommendation": "What is the final recommendation?",
-    "part_number": "What is the Part Number?",
-    "revision_level": "What is the Revision Level? *(Optional — you can omit it.)*",
-    "quantity": "What is the Quantity?",
-    "target_price": "What is the Target Price?",
-    "currency": "What is the Currency?",
-    "target_price_is_estimated": "What is the Price source?",
+    "automotive_type": "**Is this request related to the Automotive or Non Automotive market?**",
+    "customer_name": "**Who is the Customer?**",
+    "application": "**What is the Application?**",
+    "product_name": "**Which Product name should we use for this RFQ?**",
+    "project_name": "**What is the Project name?**",
+    "rfq_files": "**Have you uploaded the RFQ files (drawings/specs) here?**",
+    "volumes": "**Please provide the yearly volumes and logistics details for each part number.**",
+    "delivery_zone": "**Which delivery zone applies to this RFQ?**",
+    "delivery_plant": "**What is the Plant?**",
+    "country": "**What is the Country?**",
+    "po_date": "**What is the PO date?**",
+    "ppap_date": "**What is the PPAP date?**",
+    "sop_year": "**What is the SOP year?**",
+    "rfq_reception_date": "**What is the RFQ reception date?**",
+    "quotation_expected_date": "**What is the Expected quotation date?**",
+    "contact_email": "**What is the Contact email?**",
+    "contact_name": "**What is the Contact name?**",
+    "contact_role": "**What is the Contact function?**",
+    "contact_phone": "**What is the Contact phone number?**",
+    "expected_delivery_conditions": "**What are the expected Delivery Conditions?**",
+    "expected_payment_terms": "**What are the expected Payment Terms?**",
+    "type_of_packaging": "**Which type of packaging applies?**\n\n1. carboard divider\n2. one way tray\n3. returnable plastic tray",
+    "business_trigger": "**What is the Business Trigger?**",
+    "customer_tooling_conditions": "**What are the Customer Tooling Conditions?**",
+    "entry_barriers": "**What are the Entry Barriers?**",
+    "responsibility_design": "**Who is responsible for design?**",
+    "responsibility_validation": "**Who is responsible for validation?**",
+    "product_ownership": "**Who owns the product?**",
+    "pays_for_development": "**Who pays for development?**",
+    "capacity_available": "**Do we have the capacity to fulfill this request?**",
+    "scope": "**Is it in our scope?**",
+    "strategic_note": "**Do you have any additional comments or strategic considerations?**",
+    "final_recommendation": "**What is the final recommendation?**",
+    "part_number": "**What is the Part Number?**",
+    "revision_level": "**What is the Revision Level?** *(Optional — you can omit it.)*",
+    "quantity": "**What is the Quantity?**",
+    "target_price": "**What is the Target Price?**",
+    "currency": "**What is the Currency?**",
+    "target_price_is_estimated": "**What is the Price source?**",
 }
 
 SYSTEM_MANAGED_CHAT_FIELDS = {"product_line_acronym"}
@@ -1393,12 +1393,12 @@ def _build_missing_fields_prompt(
                     f"{preferred_question}\n\n*(Optional — type **skip** to leave it blank.)*"
                 )
             prompt += (
-                "\n- Preferred exact wording for the next question: "
+                "\n- You MUST use EXACTLY this wording for the next question, verbatim (including bold markers): "
                 f"{json.dumps(preferred_question, ensure_ascii=False)}"
             )
         prompt += (
             "\n- When asking the next field, you MUST write a real question in natural "
-            "language. Never output only the bare field label."
+            "language in bold (**question?**). Never output only the bare field label."
         )
     if prioritize_rfq_files_now:
         prompt += (
@@ -3039,7 +3039,25 @@ async def _execute_tool_calls(
                         })
                         continue
                 if isinstance(existing_products, list) and isinstance(normalized_new_products, list):
-                    filtered_fields["products"] = existing_products + normalized_new_products
+                    # Edit-replay guard: if we're appending exactly 1 step-a stub
+                    # (only product+product_line set, no part_number/application) and
+                    # the last existing product is also stub-like (same condition), this
+                    # is an edited product-name selection — update in place, don't append.
+                    _is_edit_replay = (
+                        len(normalized_new_products) == 1
+                        and existing_products
+                        and not str(normalized_new_products[0].get("part_number") or "").strip()
+                        and not str(existing_products[-1].get("part_number") or "").strip()
+                        and not str(existing_products[-1].get("application") or "").strip()
+                    )
+                    if _is_edit_replay:
+                        _merged_last = dict(existing_products[-1])
+                        for _k, _v in normalized_new_products[0].items():
+                            if _v is not None:
+                                _merged_last[_k] = _v
+                        filtered_fields["products"] = existing_products[:-1] + [_merged_last]
+                    else:
+                        filtered_fields["products"] = existing_products + normalized_new_products
                     # Keep volumes aligned with the new products count — pad with empty rows
                     persisted_volumes = (
                         persisted_rfq_data.get("volumes")
@@ -3294,6 +3312,7 @@ class ChatRequest(BaseModel):
     message: str
     chat_mode: str = "rfq"
     document_type: RfqDocumentType | None = None
+    is_edit: bool = False
 
 
 class ChatEditRequest(BaseModel):
@@ -3399,8 +3418,9 @@ If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combin
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 FORMATTING RULE: When a missing field has allowed options, keep those options inline or nested under that field; never promote option values into separate top-level numbered items.
+FORMATTING RULE: EVERY question you ask the user MUST be written in bold (**question text?**). This applies to every single question without exception — whether it is a standalone question, part of a numbered list, or embedded in a longer message. Never ask a question in plain text.
 CRITICAL OPTIONAL FIELD RULE: The ONLY optional RFQ fields are `costing_data`, `ppap_date`, `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, `entry_barriers`, `products[*].revision_level`, `products[*].costing_data`, and `volumes`. You MUST NOT describe any other RFQ field as optional. In step-by-step mode, you MUST still ask optional RFQ fields when they appear next in the checklist order, EXCEPT for `products[*].revision_level` and `products[*].costing_data`: if a grouped product row already has its required values and only those optional product fields are missing, leave them blank and continue without a dedicated follow-up question. When you ask any other optional field, you MUST clearly say it is optional and that the user can type `skip` to leave it blank. If the user types "skip", "none", or "N/A" for an OPTIONAL field, save "_" (or an empty revision level / blank product-row costing data) and move on. If the user types "skip", "none", "N/A", or provides no useful answer for a REQUIRED field, you MUST NOT save "_" and you MUST NOT move on; ask for that same required field again.
-COSTING DATA RULE: `costing_data` is a special optional field and is NEVER in the missing fields list. After saving product_name + product_line_acronym, you MUST call retrieveProducts again with the exact product name to fetch its costing parameters. If the response contains costing parameters for that product, present them to the user as a bullet list exactly as they appear in the database response (one parameter per bullet, using the exact name from the DB). Start your message with: "**Please provide the Costing Data values for this product (optional).**" and on the next line add: "*(Optional — type **skip** to leave it blank.)*". Then list the parameters as bullets. If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the user provides partial values, save only the answered ones combined into a single string. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data.
+COSTING DATA RULE: `costing_data` is a special optional field and is NEVER in the missing fields list. After saving product_name + product_line_acronym, you MUST call retrieveProducts again with the exact product name to fetch its costing parameters. If the response contains costing parameters for that product, present them to the user as a bullet list exactly as they appear in the database response (one parameter per bullet, using the exact name from the DB). Start your message with: "**Please provide the Costing Data values for this product (optional).**" and on the next line add: "*(Optional — type **skip** to leave it blank.)*". Then list the parameters as bullets. If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the user provides partial values, save only the answered ones combined into a single string. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data. CRITICAL: do NOT output any message to the user in this case — no "No costing parameters", no "setting costing_data", no explanation whatsoever. The save must be completely invisible to the user; simply proceed to the next question.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
 2. NO GUESSING/PROPOSITIONS: When asking the user for missing information, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples, parenthetical hints, or sample values for open-ended fields.
@@ -3505,6 +3525,7 @@ MULTI-PRODUCT SUPPORT:
 - NEVER include phantom or template product rows in the products array. When you call updateFormFields with a products array, include ONLY rows that the user has explicitly provided data for. Do NOT copy existing product rows as empty templates for the next product. The products array you send must never contain more rows than the user has actually confirmed.
 - CRITICAL TOOL RULE: When you collect the very first product row, save it normally. When the user agrees to add a second, third, or subsequent product, you MUST call updateFormFields with the argument "append_products": true. If you forget this flag, you will delete the user's previous parts.
 - When the user says yes, collect the new product row starting from the beginning: Product Name (via retrieveProducts) → Application → Part Number → Drawing → SOP Year. Call updateFormFields with `append_products=true` so the new rows are APPENDED to existing ones instead of replacing them.
+- EDIT RECOVERY RULE: Before calling `updateFormFields` with `append_products: true` for Product N (N >= 2), check the CURRENT RFQ DATABASE STATE. Count how many product rows are already in `products`. If `len(products) >= N` (meaning products[N-1] already exists), you are RE-COLLECTING this product due to a message edit — NOT adding a new product. In that case, do NOT use `append_products: true`. Instead, build the complete updated products array: keep all existing rows intact and replace products[N-1] with the freshly-collected Product N data, then call `updateFormFields` with this full array (smart-merge, no `append_products`). This prevents duplicate rows when editing previous messages.
 - If the user provides yearly volumes, row-level target prices, delivery zones, plants, countries, or price-source details per part, save them in `volumes` as a separate array aligned by product-row index. Each `volumes[*]` row may contain `target_price`, `price_source`, `delivery_zone`, `plant`, `country`, and `volumes` as a year-to-quantity object. Never invent missing years or quantities.
 - When the user says no, move on to step 5 (Volumes table).
 - You MUST NOT jump to validator routing or ask for submission while Volumes table fields (target_price, currency, quantity) are still missing for any product row. These are collected in step 5.
@@ -3648,6 +3669,7 @@ You MUST NOT ask about or save any of these fields in Potential mode:
 
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks. NEVER output a single massive paragraph.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
+FORMATTING RULE: EVERY question you ask the user MUST be written in bold (**question text?**). This applies to every single question without exception — whether it is a standalone question, part of a numbered list, or embedded in a longer message. Never ask a question in plain text.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
 CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
 
@@ -3853,7 +3875,7 @@ async def edit_chat_message(
     await db.flush()
 
     return await handle_chat(
-        ChatRequest(rfq_id=req.rfq_id, message=edited_message, chat_mode="rfq"),
+        ChatRequest(rfq_id=req.rfq_id, message=edited_message, chat_mode="rfq", is_edit=True),
         db=db,
         db3=db3,
         current_user=current_user,
@@ -4229,6 +4251,21 @@ async def handle_chat(
                 "the field(s) explicitly mentioned in the user's latest message. Do NOT "
                 "resume the normal step-by-step checklist. Do NOT ask for downstream fields "
                 "that come after the updated field. After saving the requested update(s), stop."
+            )
+
+        if req.is_edit and chat_mode != "potential":
+            mode_specific_instructions += (
+                "\n25. MESSAGE EDIT MODE: The user has edited a previous message. The CURRENT "
+                "RFQ DATABASE STATE already contains data saved from the original conversation, "
+                "including any product rows that were collected. "
+                "CRITICAL: Do NOT use `append_products: true` under any circumstances — it "
+                "would create a duplicate product row. "
+                "If you need to update a product row (e.g., product name, application, part "
+                "number), use smart-merge: send the FULL products array with ALL existing rows, "
+                "replacing only the specific row that changed. "
+                "Count the existing products in the CURRENT RFQ DATABASE STATE to know the "
+                "current product count; do not add more rows than already exist unless the "
+                "user explicitly confirms they want to add a new product."
             )
 
         return f"""{base_system_prompt}
