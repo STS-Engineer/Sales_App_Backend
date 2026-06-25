@@ -18,7 +18,9 @@ class RfqOut(BaseModel):
     product_line_acronym: str | None
     contact_id: int | None
     zone_manager_email: str | None
+    zone_manager_name: str | None = None
     created_by_email: str
+    created_by_name: str | None = None
     rfq_data: dict[str, Any] | None
     chat_history: list[dict[str, Any]] | None
     costing_files: list[dict[str, Any]] | None
@@ -182,6 +184,67 @@ def _coerce_bool_or_none(value: Any) -> bool | None:
     return None
 
 
+def _coerce_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value:
+            return None
+        return int(value) if value.is_integer() else None
+
+    text = str(value).strip().replace("\u00a0", " ")
+    if not text:
+        return None
+    text = re.sub(r"[^0-9\-]", "", text.replace(" ", ""))
+    if not text or text == "-":
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _normalize_volume_price_source(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "Estimated" if value else "Official Customer Price"
+
+    normalized_bool = _coerce_bool_or_none(value)
+    if normalized_bool is True:
+        return "Estimated"
+    if normalized_bool is False:
+        return "Official Customer Price"
+
+    cleaned = _clean_text(value)
+    return cleaned or None
+
+
+def _normalize_volume_years(value: Any) -> dict[str, float]:
+    volumes_value = value
+    if isinstance(volumes_value, str):
+        try:
+            volumes_value = json.loads(volumes_value)
+        except json.JSONDecodeError:
+            return {}
+
+    if not isinstance(volumes_value, dict):
+        return {}
+
+    normalized_years: dict[str, float] = {}
+    for year, raw_amount in volumes_value.items():
+        year_key = str(year or "").strip()
+        amount = _coerce_float_or_none(raw_amount)
+        if not year_key or amount is None:
+            continue
+        normalized_years[year_key] = amount
+    return normalized_years
+
+
 def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
     if isinstance(raw_item, ProductItem):
         item = raw_item.model_dump()
@@ -190,6 +253,24 @@ def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
     else:
         return None
 
+    product = _clean_text(
+        _pick_first(
+            item,
+            (
+                "product",
+                "product_name",
+                "productName",
+            ),
+        )
+    )
+    application = _clean_text(
+        _pick_first(
+            item,
+            (
+                "application",
+            ),
+        )
+    )
     part_number = _clean_text(
         _pick_first(
             item,
@@ -201,6 +282,56 @@ def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
                 "pn",
                 "part_no",
                 "partNo",
+            ),
+        )
+    )
+    product_line = _clean_text(
+        _pick_first(
+            item,
+            (
+                "product_line",
+                "productLine",
+                "product_line_acronym",
+                "productLineAcronym",
+            ),
+        )
+    )
+    costing_data = _clean_text(
+        _pick_first(
+            item,
+            (
+                "costing_data",
+                "costingData",
+            ),
+        )
+    )
+    po_date = _clean_text(
+        _pick_first(
+            item,
+            (
+                "po_date",
+                "poDate",
+                "drawing_po_date",
+                "drawingPoDate",
+            ),
+        )
+    )
+    ppap_date = _clean_text(
+        _pick_first(
+            item,
+            (
+                "ppap_date",
+                "ppapDate",
+            ),
+        )
+    )
+    sop = _coerce_int_or_none(
+        _pick_first(
+            item,
+            (
+                "sop",
+                "sop_year",
+                "sopYear",
             ),
         )
     )
@@ -270,7 +401,14 @@ def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
     )
 
     normalized = {
+        "product": product,
+        "application": application,
         "part_number": part_number,
+        "product_line": product_line,
+        "costing_data": costing_data,
+        "po_date": po_date,
+        "ppap_date": ppap_date,
+        "sop": sop,
         "revision_level": revision_level,
         "quantity": quantity,
         "target_price": target_price,
@@ -279,6 +417,36 @@ def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
         "target_to": target_to,
     }
     if not any(value not in (None, "") for value in normalized.values()):
+        return None
+    return normalized
+
+
+def _normalize_volume_item(raw_item: Any) -> dict[str, Any] | None:
+    if isinstance(raw_item, dict):
+        item = dict(raw_item)
+    else:
+        return None
+
+    normalized = {
+        "target_price": _coerce_float_or_none(
+            _pick_first(item, ("target_price", "targetPrice"))
+        ),
+        "price_source": _normalize_volume_price_source(
+            _pick_first(item, ("price_source", "priceSource"))
+        ),
+        "delivery_zone": _clean_text(
+            _pick_first(item, ("delivery_zone", "deliveryZone"))
+        ),
+        "plant": _clean_text(
+            _pick_first(item, ("plant", "delivery_plant", "deliveryPlant"))
+        ),
+        "country": _clean_text(_pick_first(item, ("country",))),
+        "volumes": _normalize_volume_years(item.get("volumes")),
+    }
+    if not any(
+        value not in (None, "", {})
+        for value in normalized.values()
+    ):
         return None
     return normalized
 
@@ -304,9 +472,42 @@ def _normalize_products_input(raw_products: Any) -> list[dict[str, Any]]:
     return normalized_products
 
 
+def _normalize_volumes_input(raw_volumes: Any) -> list[dict[str, Any]]:
+    volumes_value = raw_volumes
+    if isinstance(volumes_value, str):
+        try:
+            volumes_value = json.loads(volumes_value)
+        except json.JSONDecodeError:
+            volumes_value = None
+
+    if isinstance(volumes_value, dict):
+        volumes_value = [volumes_value]
+    if not isinstance(volumes_value, list):
+        return []
+
+    normalized_volumes: list[dict[str, Any]] = []
+    for item in volumes_value:
+        normalized_item = _normalize_volume_item(item)
+        if normalized_item is not None:
+            normalized_volumes.append(normalized_item)
+    return normalized_volumes
+
+
 def _legacy_product_from_data(data: dict[str, Any]) -> dict[str, Any] | None:
     legacy_item = {
+        "product": data.get("product_name") or data.get("productName"),
+        "application": data.get("application"),
         "part_number": data.get("customer_pn") or data.get("customerPn"),
+        "product_line": (
+            data.get("product_line_acronym")
+            or data.get("productLineAcronym")
+            or data.get("product_line")
+            or data.get("productLine")
+        ),
+        "costing_data": data.get("costing_data") or data.get("costingData"),
+        "po_date": data.get("po_date") or data.get("poDate"),
+        "ppap_date": data.get("ppap_date") or data.get("ppapDate"),
+        "sop": data.get("sop_year") or data.get("sop") or data.get("sopYear"),
         "revision_level": data.get("revision_level") or data.get("revisionLevel"),
         "quantity": data.get("annual_volume") or data.get("qty_per_year") or data.get("qtyPerYear"),
         "target_price": _pick_first(
@@ -333,9 +534,11 @@ def normalize_rfq_data_products(
     *,
     products_authoritative: bool = False,
 ) -> dict[str, Any]:
-    """Return rfq_data with canonical products and legacy first-row mirrors."""
+    """Return rfq_data with canonical products/volumes and legacy first-row mirrors."""
     normalized = dict(data or {})
     products = _normalize_products_input(normalized.get("products"))
+    volumes = _normalize_volumes_input(normalized.get("volumes"))
+    volumes_authoritative = "volumes" in normalized
     legacy_price_source = _coerce_bool_or_none(
         _pick_first(
             normalized,
@@ -352,9 +555,45 @@ def normalize_rfq_data_products(
             normalized.get("target_price_currency") or normalized.get("targetPriceCurrency")
         )
         allow_legacy_currency_hydration = not products_authoritative
-        for product in products:
+        for _prod_idx, product in enumerate(products):
             if not isinstance(product, dict):
                 continue
+            # Only hydrate from top-level fields for the first product row.
+            # Subsequent rows are independent products and must not inherit
+            # Product 1's application, sop, costing_data, etc.
+            _is_first_row = _prod_idx == 0
+            if _is_first_row:
+                if not product.get("product"):
+                    product["product"] = _clean_text(
+                        normalized.get("product_name") or normalized.get("productName")
+                    )
+                if not product.get("application"):
+                    product["application"] = _clean_text(normalized.get("application"))
+                if not product.get("product_line"):
+                    product["product_line"] = _clean_text(
+                        normalized.get("product_line_acronym")
+                        or normalized.get("productLineAcronym")
+                        or normalized.get("product_line")
+                        or normalized.get("productLine")
+                    )
+                if not product.get("costing_data"):
+                    product["costing_data"] = _clean_text(
+                        normalized.get("costing_data") or normalized.get("costingData")
+                    )
+                if not product.get("po_date"):
+                    product["po_date"] = _clean_text(
+                        normalized.get("po_date") or normalized.get("poDate")
+                    )
+                if not product.get("ppap_date"):
+                    product["ppap_date"] = _clean_text(
+                        normalized.get("ppap_date") or normalized.get("ppapDate")
+                    )
+                if product.get("sop") is None:
+                    product["sop"] = _coerce_int_or_none(
+                        normalized.get("sop_year")
+                        or normalized.get("sop")
+                        or normalized.get("sopYear")
+                    )
             if product.get("currency") is None and product.get("target_price") is not None:
                 if fallback_currency:
                     product["currency"] = fallback_currency
@@ -384,6 +623,23 @@ def normalize_rfq_data_products(
 
         first_product = products[0] if products else {}
         if first_product:
+            if not _clean_text(normalized.get("product_name")) and first_product.get("product"):
+                normalized["product_name"] = first_product.get("product")
+            if (
+                not _clean_text(normalized.get("product_line_acronym"))
+                and first_product.get("product_line")
+            ):
+                normalized["product_line_acronym"] = first_product.get("product_line")
+            if not _clean_text(normalized.get("application")) and first_product.get("application"):
+                normalized["application"] = first_product.get("application")
+            if not _clean_text(normalized.get("costing_data")) and first_product.get("costing_data"):
+                normalized["costing_data"] = first_product.get("costing_data")
+            if not _clean_text(normalized.get("po_date")) and first_product.get("po_date"):
+                normalized["po_date"] = first_product.get("po_date")
+            if not _clean_text(normalized.get("ppap_date")) and first_product.get("ppap_date"):
+                normalized["ppap_date"] = first_product.get("ppap_date")
+            if normalized.get("sop_year") in (None, "") and first_product.get("sop") is not None:
+                normalized["sop_year"] = first_product.get("sop")
             normalized["customer_pn"] = first_product.get("part_number") or ""
             normalized["revision_level"] = first_product.get("revision_level") or ""
             normalized["annual_volume"] = first_product.get("quantity") or ""
@@ -403,6 +659,52 @@ def normalize_rfq_data_products(
                 shared_currency = _normalize_currency_code(normalized.get("target_price_currency"))
                 if shared_currency and shared_currency != "EUR":
                     normalized["to_total_local"] = total_target_to / 1000.0
+
+    if volumes or volumes_authoritative:
+        for index, volume in enumerate(volumes):
+            if not isinstance(volume, dict):
+                continue
+            linked_product = (
+                products[index]
+                if index < len(products) and isinstance(products[index], dict)
+                else {}
+            )
+            if volume.get("target_price") is None and linked_product:
+                volume["target_price"] = linked_product.get("target_price")
+            if not volume.get("price_source") and linked_product:
+                estimated_flag = _coerce_bool_or_none(
+                    linked_product.get("target_price_is_estimated")
+                )
+                if estimated_flag is True:
+                    volume["price_source"] = "Estimated"
+                elif estimated_flag is False:
+                    volume["price_source"] = "Official Customer Price"
+            # Only hydrate delivery_zone/plant/country from top-level for the first
+            # volume row. Subsequent rows are independent products and must start empty.
+            if index == 0:
+                if not volume.get("delivery_zone"):
+                    volume["delivery_zone"] = _clean_text(
+                        normalized.get("delivery_zone") or normalized.get("deliveryZone")
+                    )
+                if not volume.get("plant"):
+                    volume["plant"] = _clean_text(
+                        normalized.get("delivery_plant")
+                        or normalized.get("deliveryPlant")
+                        or normalized.get("plant")
+                    )
+                if not volume.get("country"):
+                    volume["country"] = _clean_text(normalized.get("country"))
+
+        normalized["volumes"] = volumes
+
+        first_volume = volumes[0] if volumes else {}
+        if first_volume:
+            if not _clean_text(normalized.get("delivery_zone")) and first_volume.get("delivery_zone"):
+                normalized["delivery_zone"] = first_volume.get("delivery_zone")
+            if not _clean_text(normalized.get("delivery_plant")) and first_volume.get("plant"):
+                normalized["delivery_plant"] = first_volume.get("plant")
+            if not _clean_text(normalized.get("country")) and first_volume.get("country"):
+                normalized["country"] = first_volume.get("country")
 
     normalized.pop("target_price_is_estimated", None)
     normalized.pop("targetPriceIsEstimated", None)

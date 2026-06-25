@@ -61,17 +61,14 @@ def test_legacy_single_product_fields_are_exposed_as_products():
         }
     )
 
-    assert data["products"] == [
-        {
-            "part_number": "LEGACY-PN",
-            "revision_level": "00",
-            "quantity": 500000,
-            "target_price": 0.25,
-            "currency": "EUR",
-            "target_price_is_estimated": True,
-            "target_to": 125000,
-        }
-    ]
+    assert len(data["products"]) == 1
+    assert data["products"][0]["part_number"] == "LEGACY-PN"
+    assert data["products"][0]["revision_level"] == "00"
+    assert data["products"][0]["quantity"] == 500000
+    assert data["products"][0]["target_price"] == 0.25
+    assert data["products"][0]["currency"] == "EUR"
+    assert data["products"][0]["target_price_is_estimated"] is True
+    assert data["products"][0]["target_to"] == 125000
     assert data["total_target_to"] == 125000
     assert data["to_total"] == 125
 
@@ -207,6 +204,85 @@ def test_conflicting_product_currencies_are_reported():
     )
 
     assert currencies == ["EUR", "USD"]
+
+
+def test_normalize_frontend_product_rows_preserves_extended_fields_and_top_level_mirrors():
+    data = normalize_rfq_data_products(
+        {
+            "products": [
+                {
+                    "product": "Brush Holder",
+                    "application": "Starter motor",
+                    "partNumber": "PN-NEW",
+                    "productLine": "BRU",
+                    "costingData": "Wire diameter: 0.8",
+                    "poDate": "2026-06-01",
+                    "ppapDate": "2026-07-01",
+                    "sop": "2028",
+                    "revisionLevel": "B",
+                    "quantity": "1200",
+                    "targetPrice": "3.2",
+                    "currency": "usd",
+                    "targetPriceIsEstimated": "estimated by avocarbon",
+                }
+            ]
+        },
+        products_authoritative=True,
+    )
+
+    assert data["products"][0]["product"] == "Brush Holder"
+    assert data["products"][0]["application"] == "Starter motor"
+    assert data["products"][0]["product_line"] == "BRU"
+    assert data["products"][0]["costing_data"] == "Wire diameter: 0.8"
+    assert data["products"][0]["po_date"] == "2026-06-01"
+    assert data["products"][0]["ppap_date"] == "2026-07-01"
+    assert data["products"][0]["sop"] == 2028
+    assert data["products"][0]["target_to"] == 3840
+    assert data["product_name"] == "Brush Holder"
+    assert data["application"] == "Starter motor"
+    assert data["product_line_acronym"] == "BRU"
+    assert data["costing_data"] == "Wire diameter: 0.8"
+    assert data["po_date"] == "2026-06-01"
+    assert data["ppap_date"] == "2026-07-01"
+    assert data["sop_year"] == 2028
+
+
+def test_normalize_frontend_volume_rows_preserves_years_and_hydrates_logistics():
+    data = normalize_rfq_data_products(
+        {
+            "delivery_zone": "Europe",
+            "delivery_plant": "Plant A",
+            "country": "France",
+            "products": [
+                {
+                    "part_number": "PN-1",
+                    "quantity": 100,
+                    "target_price": 1.5,
+                    "currency": "EUR",
+                    "target_price_is_estimated": False,
+                }
+            ],
+            "volumes": [
+                {
+                    "targetPrice": "1.5",
+                    "priceSource": "Estimated by Avocarbon",
+                    "volumes": {"2027": "1000", "2028": "1500"},
+                }
+            ],
+        },
+        products_authoritative=True,
+    )
+
+    assert data["volumes"] == [
+        {
+            "target_price": 1.5,
+            "price_source": "Estimated",
+            "delivery_zone": "Europe",
+            "plant": "Plant A",
+            "country": "France",
+            "volumes": {"2027": 1000, "2028": 1500},
+        }
+    ]
 
 
 @pytest.mark.asyncio

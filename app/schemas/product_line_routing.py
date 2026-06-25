@@ -24,3 +24,10 @@ class ProductLineRoutingOut(ProductLineRoutingBase):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class RoutingAssignRequest(BaseModel):
+    """Replace the full list of email assignments for a (product_line, role) pair."""
+    product_line: str
+    role: ProductLineRoutingRole
+    emails: list[EmailStr]

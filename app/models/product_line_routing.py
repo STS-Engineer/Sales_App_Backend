@@ -19,7 +19,8 @@ class ProductLineRouting(Base):
         UniqueConstraint(
             "product_line",
             "role",
-            name="uq_product_line_routing_product_line_role",
+            "email",
+            name="uq_product_line_routing_product_line_role_email",
         ),
     )
 

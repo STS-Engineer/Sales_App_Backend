@@ -175,6 +175,7 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "project_name",
     "costing_data",
     "products",
+    "volumes",
     "total_target_to",
     "customer_pn",
     "revision_level",
@@ -218,6 +219,7 @@ UPDATE_FORM_FIELD_ALIASES = {
     "products": "products",
     "productItems": "products",
     "lineItems": "products",
+    "volumes": "volumes",
     "totalTargetTo": "total_target_to",
     "productLineAcronym": "product_line_acronym",
     "projectName": "project_name",
@@ -267,7 +269,23 @@ PRODUCT_ITEM_TOOL_SCHEMA = {
     "items": {
         "type": "object",
         "properties": {
+            "product": {"type": "string"},
+            "application": {"type": "string"},
             "part_number": {"type": "string"},
+            "product_line": {"type": "string"},
+            "costing_data": {"type": "string"},
+            "po_date": {
+                "type": "string",
+                "description": "Date in YYYY-MM-DD format.",
+            },
+            "ppap_date": {
+                "type": "string",
+                "description": "Date in YYYY-MM-DD format.",
+            },
+            "sop": {
+                "type": "number",
+                "description": "SOP year for this product row.",
+            },
             "revision_level": {"type": "string"},
             "quantity": {"type": "number"},
             "target_price": {
@@ -301,7 +319,40 @@ PRODUCT_ITEM_TOOL_SCHEMA = {
         },
     },
 }
+VOLUME_ITEM_TOOL_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "target_price": {"type": "number"},
+            "price_source": {
+                "type": "string",
+                "description": (
+                    "Use the exact text supplied by the user, typically "
+                    "'Estimated' or 'Official Customer Price'."
+                ),
+            },
+            "delivery_zone": {
+                "type": "string",
+                "description": (
+                    "Must be one of the 7 approved delivery zones when known."
+                ),
+            },
+            "plant": {"type": "string"},
+            "country": {"type": "string"},
+            "volumes": {
+                "type": "object",
+                "description": (
+                    "Year-to-quantity mapping such as {'2027': 120000, "
+                    "'2028': 130000}."
+                ),
+                "additionalProperties": {"type": "number"},
+            },
+        },
+    },
+}
 UPDATE_FORM_FIELD_PROPERTIES["products"] = PRODUCT_ITEM_TOOL_SCHEMA
+UPDATE_FORM_FIELD_PROPERTIES["volumes"] = VOLUME_ITEM_TOOL_SCHEMA
 UPDATE_FORM_FIELD_PROPERTIES["total_target_to"] = {"type": "number"}
 UPDATE_FORM_FIELD_PROPERTIES["to_total"] = {"type": "number"}
 UPDATE_FORM_FIELD_PROPERTIES["to_total_local"] = {"type": "number"}
@@ -328,27 +379,27 @@ RFQ_STEPS: list[tuple[int, list[dict[str, object]]]] = [
     (
         1,
         [
-            _step_field("automotive_type"),
-            _step_field("customer_name"),
-            _step_field("application"),
-            _step_field("product_name"),
-            _step_field("product_line_acronym"),
-            _step_field("project_name"),
-            _step_field("costing_data", is_optional=True),
-            _step_field("rfq_files"),
-            _step_field("products"),
-            _step_field("delivery_zone"),
-            _step_field("delivery_plant"),
-            _step_field("country"),
-            _step_field("po_date"),
-            _step_field("ppap_date", is_optional=True),
-            _step_field("sop_year"),
-            _step_field("rfq_reception_date"),
-            _step_field("quotation_expected_date"),
-            _step_field("contact_name"),
-            _step_field("contact_role"),
-            _step_field("contact_phone"),
-            _step_field("contact_email"),
+            _step_field("automotive_type"),           # Customer Details 1
+            _step_field("customer_name"),             # Customer Details 2
+            _step_field("project_name"),              # Customer Details 3 (formulaire: 3e champ visible)
+            _step_field("product_name"),              # Products table col 1
+            _step_field("product_line_acronym"),      # Products table col 2
+            _step_field("costing_data", is_optional=True),  # Products table col 3 (optional)
+            _step_field("application"),               # Products table col 4
+            _step_field("products"),                  # Products section (col 5: part_number first)
+            _step_field("rfq_files"),                 # Products table col 6 (Drawing/Files)
+            _step_field("sop_year"),                  # Products table col 7 (SOP Year)
+            _step_field("delivery_zone"),             # Volumes table
+            _step_field("delivery_plant"),            # Volumes table
+            _step_field("country"),                   # Volumes table
+            _step_field("po_date"),                   # Logistics
+            _step_field("ppap_date", is_optional=True),  # Logistics (optional)
+            _step_field("rfq_reception_date"),        # Logistics
+            _step_field("quotation_expected_date"),   # Logistics
+            _step_field("contact_name"),              # Contact
+            _step_field("contact_role"),              # Contact
+            _step_field("contact_phone"),             # Contact
+            _step_field("contact_email"),             # Contact
         ],
     ),
     (
@@ -391,8 +442,8 @@ RFQ_OPTIONAL_FIELDS = {
     for _, step_fields in RFQ_STEPS
     for step_field in step_fields
     if bool(step_field.get("is_optional"))
-}
-RFQ_OPTIONAL_PRODUCT_FIELDS = {"revision_level"}
+} | {"volumes"}
+RFQ_OPTIONAL_PRODUCT_FIELDS = {"revision_level", "costing_data"}
 RFQ_CONTACT_FIELDS = {
     "contact_email",
     "contact_name",
@@ -418,6 +469,7 @@ FIELD_LABELS = {
     "project_name": "Project name",
     "costing_data": "Costing data",
     "products": "Products",
+    "volumes": "Volumes",
     "rfq_files": "RFQ Files",
     "delivery_zone": "Delivery zone",
     "delivery_plant": "Plant",
@@ -450,12 +502,16 @@ FIELD_LABELS = {
     "to_total_local": "Total turnover (local)",
     "zone_manager_email": "Validator Email",
     "validator_role": "Validator role",
+    "product": "Product",
     "part_number": "Part Number",
+    "product_line": "Product line",
     "revision_level": "Revision level",
+    "sop": "SOP year",
     "quantity": "Quantity",
     "target_price": "Target Price",
     "currency": "Currency",
     "target_price_is_estimated": "Price source",
+    "price_source": "Price source",
 }
 
 FIELD_QUESTION_OVERRIDES = {
@@ -465,6 +521,7 @@ FIELD_QUESTION_OVERRIDES = {
     "product_name": "Which Product name should we use for this RFQ?",
     "project_name": "What is the Project name?",
     "rfq_files": "Have you uploaded the RFQ files (drawings/specs) here?",
+    "volumes": "Please provide the yearly volumes and logistics details for each part number.",
     "delivery_zone": "Which delivery zone applies to this RFQ?",
     "delivery_plant": "What is the Plant?",
     "country": "What is the Country?",
@@ -479,7 +536,7 @@ FIELD_QUESTION_OVERRIDES = {
     "contact_phone": "What is the Contact phone number?",
     "expected_delivery_conditions": "What are the expected Delivery Conditions?",
     "expected_payment_terms": "What are the expected Payment Terms?",
-    "type_of_packaging": "Which type of packaging applies?",
+    "type_of_packaging": "Which type of packaging applies?\n\n1. carboard divider\n2. one way tray\n3. returnable plastic tray",
     "business_trigger": "What is the Business Trigger?",
     "customer_tooling_conditions": "What are the Customer Tooling Conditions?",
     "entry_barriers": "What are the Entry Barriers?",
@@ -492,7 +549,7 @@ FIELD_QUESTION_OVERRIDES = {
     "strategic_note": "Do you have any additional comments or strategic considerations?",
     "final_recommendation": "What is the final recommendation?",
     "part_number": "What is the Part Number?",
-    "revision_level": "What is the Revision Level?",
+    "revision_level": "What is the Revision Level? *(Optional — you can omit it.)*",
     "quantity": "What is the Quantity?",
     "target_price": "What is the Target Price?",
     "currency": "What is the Currency?",
@@ -524,6 +581,9 @@ _INTERNAL_TOOL_NAME_RE = re.compile(
     r"updateFormFields|submitValidation|retrieveZoneManager|retrieveProducts"
     r"|checkGroupeExistence|checkContactExistence|get_eur_exchange_rate|uploadRfqFiles"
     r")\b"
+)
+_PRODUCTS_VOLUME_FIELD_RE = re.compile(
+    r"^products\[\d+\]\.(quantity|target_price|currency|target_price_is_estimated)$"
 )
 
 # Matches any variant of the submit-for-validation question the LLM may generate.
@@ -929,6 +989,22 @@ def _sanitize_rfq_update_fields_for_chat(
             sanitized_fields[field_name] = sanitized_products
             continue
 
+        if field_name == "volumes":
+            normalized_volumes = normalize_rfq_data_products(
+                {"volumes": value}
+            ).get("volumes", [])
+            sanitized_volumes: list[dict[str, object]] = []
+            for volume in normalized_volumes:
+                next_volume = dict(volume)
+                canonical_delivery_zone = normalize_delivery_zone(
+                    next_volume.get("delivery_zone")
+                )
+                if canonical_delivery_zone:
+                    next_volume["delivery_zone"] = canonical_delivery_zone
+                sanitized_volumes.append(next_volume)
+            sanitized_fields[field_name] = sanitized_volumes
+            continue
+
         if _is_skip_like_value(value):
             if _is_optional_field(field_name):
                 sanitized_fields[field_name] = "_"
@@ -1296,14 +1372,23 @@ def _build_missing_fields_prompt(
         f"- Missing fields you must ASK THE USER for: {_format_field_list_for_prompt(user_keys_missing)}\n"
         f"- Missing fields YOU MUST GENERATE/CALCULATE yourself: {_format_field_list_for_prompt(ai_keys_missing)}"
     )
-    if next_field_to_ask:
+    if next_field_to_ask and _PRODUCTS_VOLUME_FIELD_RE.match(next_field_to_ask):
+        prompt += (
+            "\n- MULTI-PRODUCT COLLECTION CHECK: The next missing field is a Volumes table "
+            "field (quantity / target_price / currency / target_price_is_estimated). "
+            "These fields are collected in Step 5, NOT here. "
+            "Per the MULTI-PRODUCT COLLECTION RULE, before moving to Step 5 you MUST first "
+            "ask: \"Would you like to add another product to this request?\" "
+            "Only after the user says NO should you proceed to collect volumes."
+        )
+    elif next_field_to_ask:
         prompt += (
             "\n- Next field to ask for: "
             f"{_format_field_for_prompt(next_field_to_ask)}"
         )
         preferred_question = FIELD_QUESTION_OVERRIDES.get(next_field_to_ask)
         if preferred_question:
-            if _is_optional_field(next_field_to_ask):
+            if _is_optional_field(next_field_to_ask) and "optional" not in preferred_question.lower():
                 preferred_question = (
                     f"{preferred_question}\n\n*(Optional — type **skip** to leave it blank.)*"
                 )
@@ -1457,12 +1542,20 @@ def _normalize_external_tool_response_content(
 
 
 def _is_technical_parse_error_line(line: str) -> bool:
-    return bool(
-        re.match(
-            r"(?i)^\s*failed to parse as json\s*:",
-            str(line or "").strip(),
-        )
-    )
+    normalized = str(line or "").strip().lower()
+    if re.match(r"(?i)^\s*failed to parse as json\s*:", normalized):
+        return True
+    # LLM self-reports for invalid tool call JSON or other API-level errors
+    if normalized.startswith("oops"):
+        return True
+    # LLM leaks internal silent-update instructions (e.g. "No costing parameters; set costingdata "" silently.")
+    if re.search(r"silently\.?\s*$", normalized):
+        return True
+    if re.search(r"tool call arguments must be valid json", normalized):
+        return True
+    if re.match(r"^\s*error\s*:\s*(tool|function|call|json|parse)", normalized):
+        return True
+    return False
 
 
 def _strip_technical_error_lines(content: str) -> str:
@@ -2109,16 +2202,16 @@ def _build_products_collection_fallback_text(
     rfq: Rfq,
     product_index: int = 1,
 ) -> str:
-    document_label = _document_type_label(rfq.document_type)
     ordinal_label = "first" if product_index <= 1 else "next"
     return (
-        f"Please provide the {ordinal_label} part number details (one line item):\n\n"
+        f"Please provide the {ordinal_label} product details (one line item):\n\n"
+        "Product\n"
+        "Product Line\n"
+        "Costing Data (optional - you may omit it)\n"
+        "Application\n"
         "Part Number\n"
-        "Revision Level (optional — you may omit it)\n"
-        "Quantity\n"
-        "Target Price\n"
-        "Currency (3-letter code)\n"
-        "Price source (Must be either Estimated or Official Customer Price)"
+        "Revision Level (optional — you may omit it)\n\n"
+        "After the part number, you will be asked to upload the Drawing and provide the SOP Year."
     )
 
 
@@ -2947,6 +3040,20 @@ async def _execute_tool_calls(
                         continue
                 if isinstance(existing_products, list) and isinstance(normalized_new_products, list):
                     filtered_fields["products"] = existing_products + normalized_new_products
+                    # Keep volumes aligned with the new products count — pad with empty rows
+                    persisted_volumes = (
+                        persisted_rfq_data.get("volumes")
+                        if isinstance(persisted_rfq_data.get("volumes"), list)
+                        else (
+                            extracted_data.get("volumes")
+                            if isinstance(extracted_data.get("volumes"), list)
+                            else []
+                        )
+                    )
+                    new_product_count = len(filtered_fields["products"])
+                    while len(persisted_volumes) < new_product_count:
+                        persisted_volumes.append({})
+                    filtered_fields["volumes"] = persisted_volumes
 
             # ── smart-merge: patch existing product rows rather than replacing them ──
             # When the LLM sends a partial products update (e.g., only target_price),
@@ -2991,10 +3098,12 @@ async def _execute_tool_calls(
                         if str(p.get("part_number") or "").strip()
                     }
                     _unmatched = []
+                    _matched_existing_indices = set()
                     for _inc in _incoming_normalized:
                         _pn_key = str(_inc.get("part_number") or "").strip().lower()
                         if _pn_key and _pn_key in _existing_index:
                             _idx = _existing_index[_pn_key]
+                            _matched_existing_indices.add(_idx)
                             _merged = dict(_result[_idx])
                             # Update only the fields the LLM explicitly provided (non-None)
                             for _k, _v in _inc.items():
@@ -3008,7 +3117,74 @@ async def _execute_tool_calls(
                             _result[_idx] = _merged
                         else:
                             _unmatched.append(_inc)
-                    _result.extend(_unmatched)
+                    # Three-way dispatch for rows that didn't match by part_number:
+                    #
+                    # 1. Has pn (new value not yet in existing) → fill the first
+                    #    existing slot that has no pn yet; otherwise append as new product.
+                    #
+                    # 2. No pn, has product name → fill a no-pn slot if available;
+                    #    otherwise discard if the product name duplicates an already-
+                    #    matched row (phantom copy the LLM added as a template), or
+                    #    append as a genuinely new product.
+                    #
+                    # 3. No pn, no product name (sparse field update like just sop/currency)
+                    #    → fill a no-pn slot first, then fall back to any unmatched slot
+                    #    (handles updates sent without repeating the part_number).
+                    _slots_no_pn = [
+                        i for i in range(len(_result))
+                        if i not in _matched_existing_indices
+                        and not str(_result[i].get("part_number") or "").strip()
+                    ]
+                    _slots_any_unmatched = [
+                        i for i in range(len(_result))
+                        if i not in _matched_existing_indices
+                    ]
+                    _slots_used = set()
+                    for _inc in _unmatched:
+                        _inc_pn = str(_inc.get("part_number") or "").strip()
+                        _inc_product = str(_inc.get("product") or "").strip().lower()
+                        _avail_no_pn = next(
+                            (i for i in _slots_no_pn if i not in _slots_used), None
+                        )
+                        _avail_any = next(
+                            (i for i in _slots_any_unmatched if i not in _slots_used), None
+                        )
+                        _merge_target = None
+                        _do_append = False
+                        if _inc_pn:
+                            if _avail_no_pn is not None:
+                                _merge_target = _avail_no_pn
+                            else:
+                                _do_append = True
+                        elif _inc_product:
+                            if _avail_no_pn is not None:
+                                _merge_target = _avail_no_pn
+                            else:
+                                _is_phantom = any(
+                                    _inc_product == str(
+                                        _result[_mi].get("product") or ""
+                                    ).strip().lower()
+                                    for _mi in _matched_existing_indices
+                                )
+                                if not _is_phantom:
+                                    _do_append = True
+                        else:
+                            _merge_target = (
+                                _avail_no_pn if _avail_no_pn is not None else _avail_any
+                            )
+                        if _merge_target is not None:
+                            _slots_used.add(_merge_target)
+                            _merged = dict(_result[_merge_target])
+                            for _k, _v in _inc.items():
+                                if _v is not None:
+                                    _merged[_k] = _v
+                            _qty = _merged.get("quantity")
+                            _price = _merged.get("target_price")
+                            if isinstance(_qty, (int, float)) and isinstance(_price, (int, float)):
+                                _merged["target_to"] = _qty * _price
+                            _result[_merge_target] = _merged
+                        elif _do_append:
+                            _result.append(_inc)
                     filtered_fields["products"] = _result
 
             if not filtered_fields and rejected_required_fields:
@@ -3056,7 +3232,7 @@ async def _execute_tool_calls(
             for key, value in filtered_fields.items():
                 if key == "target_price_is_estimated":
                     extracted_data[key] = bool(value)
-                elif key == "products":
+                elif key in {"products", "volumes"}:
                     extracted_data[key] = value
                 elif key in {"total_target_to", "to_total", "to_total_local"}:
                     try:
@@ -3165,7 +3341,7 @@ CRITICAL NO-ROUNDING RULE: If a backend tool returns a converted EUR value, or i
 DIMENSION NORMALIZATION RULE: If the user provides physical dimensions or technical specifications in inches or any other non-mm unit, you MUST seamlessly convert them to millimeters (mm) before saving the data. Always store dimension data in mm.
 DELIVERY ZONE CLASSIFICATION RULE: When collecting the customer location or delivery destination, you MUST classify it into exactly one of these 7 approved `delivery_zone` strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". Never use any other spelling or region name. If the user gives a specific country, map it automatically to the correct approved zone (for example, France -> Europe, South Africa -> Africa, India -> India, United States -> North America, Brazil -> South America, China -> China / South Pacific, Japan -> Korea / Japan). If you cannot confidently map it, ask the user to clarify before saving. If you need the user to choose a delivery zone explicitly, you MUST present only these exact 7 options and no others.
 FORM STATE SYNC RULE: On every relevant turn, you MUST emit the native `updateFormFields` tool call so the frontend form stays synchronized with the latest data. Any `delivery_zone` you send through `updateFormFields` MUST exactly match one of the 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan".
-MULTI-PRODUCT COLLECTION RULE: First, ask the user how many part numbers/products are included in this request. Once they answer, ask them to provide the Part Number, Revision Level, Quantity, Target Price, Currency, and Price Source for each product. Revision Level is OPTIONAL. When you ask for a full product row in one grouped message, you MUST NOT require the user to type `skip` for Revision Level; they may simply omit it. If the user gives the other product row values but omits Revision Level, interpret it as blank, save the row, and continue. You MUST NOT ask a separate follow-up question only for the missing Revision Level. Save the result in `products` as an array of objects with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array.
+MULTI-PRODUCT COLLECTION RULE: Do NOT ask the user upfront how many products are included. For each product row, collect Part Number, then Drawing (rfq_files), then SOP Year — and ONLY AFTER all three are collected ask "Would you like to add another product to this request?". NEVER ask "Would you like to add another part number?". When the user provides a full product row, prefer saving it inside `products` as an array of objects. A product row may contain `product`, `application`, `part_number`, `product_line`, `costing_data`, `po_date`, `ppap_date`, `sop`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. Revision Level and Costing Data are OPTIONAL inside the product row. When the user gives the other product-row values but omits Revision Level or Costing Data, interpret them as blank and continue. `target_price` must remain the exact raw local amount the user stated. You may still accept legacy singular aliases (`customer_pn`, `revision_level`, `annual_volume`, `target_price_eur`), but prefer the `products` array. If the user also provides yearly volumes or line-level logistics per part, save them in `volumes`.
 
 STRICT FORM FIELD MAPPING:
 When calling updateFormFields, you MUST ONLY use the following exact keys:
@@ -3176,7 +3352,8 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - product_line_acronym
 - project_name
 - costing_data (Format ALL costing parameters as a single formatted string/list here)
-- products (array of product rows: part_number, revision_level, quantity, target_price, currency, target_price_is_estimated; `target_to` is derived and must not be invented)
+- products (array of product rows. Supported row keys: product, application, part_number, product_line, costing_data, po_date, ppap_date, sop, revision_level, quantity, target_price, currency, target_price_is_estimated; `target_to` is derived and must not be invented)
+- volumes (optional array aligned with the product rows. Supported row keys: target_price, price_source, delivery_zone, plant, country, and `volumes` as a year-to-quantity object such as {"2027": 120000, "2028": 130000})
 - total_target_to
 - customer_pn
 - revision_level
@@ -3222,7 +3399,7 @@ If you extract Costing Data (like Wire diameter, Current, etc.), you MUST combin
 FORMATTING RULES: You MUST structure your responses using Markdown. Use bolding (**text**), bullet points (- item), and line breaks to organize your thoughts. NEVER output a single massive paragraph. Keep it clean, professional, and scannable.
 FORMATTING RULE: When asking the user for missing fields, combine your response into ONE single, clean, concise message. Do not repeat the section header twice. Just ask the user directly for what is missing in a single numbered list.
 FORMATTING RULE: When a missing field has allowed options, keep those options inline or nested under that field; never promote option values into separate top-level numbered items.
-CRITICAL OPTIONAL FIELD RULE: The ONLY optional RFQ fields are `costing_data`, `ppap_date`, `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, `entry_barriers`, and `products[*].revision_level`. You MUST NOT describe any other RFQ field as optional. In step-by-step mode, you MUST still ask optional RFQ fields when they appear next in the checklist order, EXCEPT for `products[*].revision_level`: if a grouped product row already has its required values and only Revision Level is missing, leave Revision Level blank and continue without a dedicated follow-up question. When you ask any other optional field, you MUST clearly say it is optional and that the user can type `skip` to leave it blank. If the user types "skip", "none", or "N/A" for an OPTIONAL field, save "_" (or an empty revision level for `products[*].revision_level`) and move on. If the user types "skip", "none", "N/A", or provides no useful answer for a REQUIRED field, you MUST NOT save "_" and you MUST NOT move on; ask for that same required field again.
+CRITICAL OPTIONAL FIELD RULE: The ONLY optional RFQ fields are `costing_data`, `ppap_date`, `type_of_packaging`, `business_trigger`, `customer_tooling_conditions`, `entry_barriers`, `products[*].revision_level`, `products[*].costing_data`, and `volumes`. You MUST NOT describe any other RFQ field as optional. In step-by-step mode, you MUST still ask optional RFQ fields when they appear next in the checklist order, EXCEPT for `products[*].revision_level` and `products[*].costing_data`: if a grouped product row already has its required values and only those optional product fields are missing, leave them blank and continue without a dedicated follow-up question. When you ask any other optional field, you MUST clearly say it is optional and that the user can type `skip` to leave it blank. If the user types "skip", "none", or "N/A" for an OPTIONAL field, save "_" (or an empty revision level / blank product-row costing data) and move on. If the user types "skip", "none", "N/A", or provides no useful answer for a REQUIRED field, you MUST NOT save "_" and you MUST NOT move on; ask for that same required field again.
 COSTING DATA RULE: `costing_data` is a special optional field and is NEVER in the missing fields list. After saving product_name + product_line_acronym, you MUST call retrieveProducts again with the exact product name to fetch its costing parameters. If the response contains costing parameters for that product, present them to the user as a bullet list exactly as they appear in the database response (one parameter per bullet, using the exact name from the DB). Start your message with: "**Please provide the Costing Data values for this product (optional).**" and on the next line add: "*(Optional — type **skip** to leave it blank.)*". Then list the parameters as bullets. If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the user provides partial values, save only the answered ones combined into a single string. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
@@ -3256,10 +3433,11 @@ CRITICAL WORKFLOW RULES:
 2. NEVER ask again for any field that is already populated in the CURRENT RFQ DATABASE STATE. This is especially critical after a Potential opportunity is promoted to formal RFQ because shared fields may already be prefilled.
 3. If `automotive_type` is already filled, DO NOT ask for it again. If it is missing, ask exactly `Is this request related to the Automotive or Non Automotive market?` and present exactly these numbered options on separate lines: `1. Automotive` and `2. Non automotive`. As soon as the user answers, you MUST immediately call `updateFormFields` with `automotive_type` using the exact canonical value `Automotive` or `Non automotive`.
 4. If `customer_name` is already filled, DO NOT ask 'Who is the Customer?' again. If it is missing, ask it and INSTANTLY call checkGroupeExistence. If the tool returns that the customer does NOT exist, DO NOT ask them to verify or try again. Simply reply: 'New customer. It will be added to the database later after we get the contact details,' and IMMEDIATELY proceed to the next unresolved field.
-5. If `application` is already filled, DO NOT ask 'What is the Application?' again. If it is missing, ask it and save it with updateFormFields. DO NOT use the application text to search for products.
-6. If `product_name` is still missing, you MUST call retrieveProducts with an EMPTY STRING for productName ("") once the application is already saved or already present in the state. You MUST retrieve the entire list of products from the database, regardless of the application. Once the system returns the full list, present it to the user as a numbered list and ask them to choose one.
-7. When the user chooses a product from the list, you MUST call updateFormFields with BOTH `product_name` AND `product_line_acronym` in the SAME single call: {"fields_to_update": {"product_name": "<chosen_product>", "product_line_acronym": "<ACRONYM>"}}. NEVER save product_name without product_line_acronym or vice versa — they must always be written together in one call. After that single call completes, immediately call retrieveProducts again with that exact product name to fetch its costing parameters.
-8. If any contact fields (`contact_email`, `contact_name`, `contact_role`, `contact_phone`) are already filled because they were copied from Potential, DO NOT ask for them again. Only ask for the specific contact fields that are still missing.
+5. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
+6. If `product_name` is still missing, you MUST call retrieveProducts with an EMPTY STRING for productName ("") to fetch the entire product catalog. You MUST retrieve the entire list of products from the database. Once the system returns the full list, present it to the user as a numbered list and ask them to choose one.
+7. When the user chooses a product from the list, you MUST call updateFormFields with BOTH `product_name` AND `product_line_acronym` in the SAME single call: {"fields_to_update": {"product_name": "<chosen_product>", "product_line_acronym": "<ACRONYM>"}}. NEVER save product_name without product_line_acronym or vice versa — they must always be written together in one call. After that single call completes, immediately call retrieveProducts again with that exact product name to fetch its costing parameters. If the product has specific costing parameters, present them and ask the user to confirm or fill in the Costing Data (OPTIONAL — if the product has no costing parameters, skip this and do NOT ask about costing_data). THEN ask 'What is the Application?' ONLY IF `application` is currently missing.
+8. If `application` is already filled, DO NOT ask 'What is the Application?' again. If it is missing, ask it AFTER product_name is saved and save it with updateFormFields. DO NOT use the application text to search for products.
+9. If any contact fields (`contact_email`, `contact_name`, `contact_role`, `contact_phone`) are already filled because they were copied from Potential, DO NOT ask for them again. Only ask for the specific contact fields that are still missing.
 
 AUTHORIZED PRODUCT LINES:
 The system maps products to one of these strict acronyms:
@@ -3283,22 +3461,54 @@ STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in
    `2. Non automotive`
    If the user replies with `1` or `2`, you MUST map it to the exact saved value `Automotive` or `Non automotive` before calling `updateFormFields`.
 2. Ask 'Who is the Customer?' ONLY IF `customer_name` is currently missing. Once they answer, extract it and INSTANTLY call `checkGroupeExistence`.
-3. Ask 'What is the Application?' ONLY IF `application` is currently missing.
-4. CRITICAL RULE: Once the user answers the application question, you MUST immediately call `updateFormFields` with {"fields_to_update": {"application": "<user_answer>"}}. You are FORBIDDEN from calling `retrieveProducts` until the application is either already present in the state or has just been successfully saved.
-5. ONLY AFTER the application is saved or already present, call `retrieveProducts` with an empty string ("") to fetch the catalog IF `product_name` is still missing.
-6. Ask the user to select one of the products you retrieved ONLY IF `product_name` is still missing. Once selected, immediately save BOTH `product_name` AND `product_line_acronym` together in ONE single `updateFormFields` call. NEVER split them into two separate calls.
-7. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
-8. Ask for the drawing upload ONLY IF `rfq_files` is missing. Once confirmed, call `uploadRfqFiles`.
-8.b. A URL or link does NOT count as an uploaded RFQ file. If the user pastes a URL when `rfq_files` is the next missing field, do NOT accept it, do NOT call `uploadRfqFiles`, and tell them to upload the file directly with the `Attach files` button.
-9. Ask for the remaining Step 1 fields in checklist order, including optional ones. This includes product rows (`products`), Delivery Zone, Plant, Country, PO date, PPAP date, SOP year, RFQ reception date, and quotation expected date. You MUST explicitly mark `ppap_date` as optional and allow `skip`. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row must include Part Number, Quantity, Target Price, Currency, and Price Source. Revision Level is OPTIONAL. When asking for a full product row in one grouped prompt, do NOT tell the user to type `skip` for Revision Level; they may simply leave it out. If it is omitted while the required product row values are present, treat Revision Level as blank, save the row, and continue without a dedicated follow-up question.
+3. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, you MUST immediately call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
+4. For each product row (Product 1, Product 2, etc.), collect ALL the following fields in this exact order:
+   a. Call `retrieveProducts` with an empty string ("") to fetch the catalog, then ask the user to select the product.
+      IMMEDIATELY after the user selects a product — before asking any further question — you MUST call `updateFormFields` with:
+        - Top-level fields: `product_name` and `product_line_acronym` (the acronym, e.g. "ASS")
+        - A `products` array containing the new row with at minimum `product` and `product_line` — IMPORTANT: `product_line` inside the products row MUST be the same acronym as `product_line_acronym` (e.g. "ASS", never "Assembly")
+        - For Product 2 and beyond: `append_products: true` so the new row is APPENDED (not replacing existing rows)
+        - For Product 1: do NOT set `append_products` (or set it to false)
+      Example for Product 2: {"fields_to_update": {"product_name": "Busbar", "product_line_acronym": "ASS", "products": [{"product": "Busbar", "product_line": "ASS"}]}, "append_products": true}
+      Then immediately call `retrieveProducts` again with that exact product name to fetch its costing parameters.
+   a.5. (OPTIONAL) If the product has specific costing parameters, present them and ask the user to confirm or fill in the Costing Data. If the product has NO costing parameters, skip this step entirely.
+   b. Ask 'What is the Application?' for this product row. Once the user answers, IMMEDIATELY call `updateFormFields` to save `application` both at top level AND inside the current product row (by index). For Product 2+, do NOT use `append_products` here — use the smart-merge by sending the full updated products array.
+   c. Ask for the Part Number. CRITICAL: even if `products[*].quantity`, `products[*].target_price`, `products[*].currency`, or `products[*].target_price_is_estimated` appear in MISSING_FIELDS_PROMPT, do NOT ask for them here — they are Volumes table fields collected in step 5.
+   d. Ask for the drawing upload (rfq_files) by saying exactly: "Please upload the drawing for Product [N] using the \"Attach files\" button." Do NOT add any instruction like "reply done" or "confirm here" — as soon as the user's next message contains a file attachment, call `uploadRfqFiles` immediately. A URL or link does NOT count as an uploaded RFQ file — if the user pastes a URL, do NOT accept it and tell them to upload the file directly with the `Attach files` button.
+   e. Ask for SOP Year. IMMEDIATELY after the user answers, call `updateFormFields` to save `sop` in the current product row.
+   After all five fields (Product Name + Application + Part Number + Drawing + SOP Year) are collected for the current product row, ask: "Would you like to add another product to this request?"
+   - If YES: collect the next product row following steps a–e above, using `append_products: true` in step a.
+   - If NO: move on to step 5 (Volumes table).
+5. Collect the Volumes table details. CRITICAL ORDER RULE: complete ALL fields for Product 1 before asking anything about Product 2. Then complete ALL fields for Product 2, and so on. Never interleave questions across products. For each product row (in order):
+   a. Ask ONE combined question that collects ALL of the following at once for that product. Use EXACTLY this format:
+      "For **Product [N]** (Part Number: **[pn]**), please provide the following in one message:
+
+      1. **Revision Level** *(optional — you can omit it)*
+      2. **Yearly quantities** (year: quantity)
+      3. **Target Price and Currency**
+      4. **Price Source** — choose one: **Estimated** or **Official Customer Price**"
+      Parse the user's reply and IMMEDIATELY save every value they provided — do NOT wait for all fields before saving. If some fields are missing, save what was given and ask ONLY for what remains. Save as follows:
+      - Revision Level → `products[index].revision_level` (leave blank if omitted)
+      - Yearly quantities → `volumes[index].volumes` (year-to-quantity object) AND total to `products[index].quantity`
+      - Target Price → `volumes[index].target_price` AND `products[index].target_price`
+      - Currency → `products[index].currency`
+      - Price Source → `volumes[index].price_source` AND `products[index].target_price_is_estimated`
+   b. Then ask separately:
+      - Delivery Zone (one of the 7 approved zones). Save to `volumes[index].delivery_zone` AND top-level `delivery_zone`.
+      - Delivery Plant. Save to `volumes[index].plant` AND top-level `delivery_plant`.
+      - Country. Save to `volumes[index].country` AND top-level `country`.
+   Only after all fields above are collected for Product N, move on to Product N+1.
+6. Ask for the remaining Step 1 logistics fields: PO date, PPAP date (optional — allow `skip`), RFQ reception date, and quotation expected date. You MUST explicitly mark `ppap_date` as optional and allow `skip`. CRITICAL RULE: collect all part rows in `products`, not as separate made-up keys. Each product row should preserve as much of the new frontend structure as the user actually provides. Supported row keys are `product`, `application`, `part_number`, `product_line`, `costing_data`, `po_date`, `ppap_date`, `sop`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. For the Products section, a row requires at minimum a Part Number; Quantity, Target Price, Currency, and Price Source are filled in step 5 (Volumes table). Revision Level and row-level Costing Data are OPTIONAL. When asking for a product row in step 4, do NOT tell the user to type `skip` for optional row fields; they may simply leave them out.
 MULTI-PRODUCT SUPPORT:
-- NEVER ask the user how many part numbers/products there are upfront.
-- After each part number is saved, ask: "Would you like to add another part number to this request?"
-- CRITICAL TOOL RULE: When you collect the very first part number, save it normally. When the user agrees to add a second, third, or subsequent part number, you MUST call updateFormFields with the argument "append_products": true. If you forget this flag, you will delete the user's previous parts.
-- When the user says yes, collect the new product row and call updateFormFields with `append_products=true` so the new rows are APPENDED to existing ones instead of replacing them.
-- When the user says no, move on to the remaining Step 1 fields.
-- You MUST NOT jump to validator routing or ask for submission while `products` still have missing fields (target_price, currency, quantity).
-CRITICAL PRODUCT COMPLETENESS RULE: A product row is NOT complete until it has ALL of: part_number, quantity, target_price, currency, and target_price_is_estimated. `revision_level` is OPTIONAL. If ANY required product fields are missing, you MUST ask for them BEFORE moving on. NEVER skip target_price or currency.
+- NEVER ask the user how many products there are upfront.
+- NEVER ask "Would you like to add another part number?" — always ask "Would you like to add another product?" and ONLY AFTER all five fields (Product Name + Application + Part Number + Drawing + SOP Year) for the current product row have been collected.
+- NEVER include phantom or template product rows in the products array. When you call updateFormFields with a products array, include ONLY rows that the user has explicitly provided data for. Do NOT copy existing product rows as empty templates for the next product. The products array you send must never contain more rows than the user has actually confirmed.
+- CRITICAL TOOL RULE: When you collect the very first product row, save it normally. When the user agrees to add a second, third, or subsequent product, you MUST call updateFormFields with the argument "append_products": true. If you forget this flag, you will delete the user's previous parts.
+- When the user says yes, collect the new product row starting from the beginning: Product Name (via retrieveProducts) → Application → Part Number → Drawing → SOP Year. Call updateFormFields with `append_products=true` so the new rows are APPENDED to existing ones instead of replacing them.
+- If the user provides yearly volumes, row-level target prices, delivery zones, plants, countries, or price-source details per part, save them in `volumes` as a separate array aligned by product-row index. Each `volumes[*]` row may contain `target_price`, `price_source`, `delivery_zone`, `plant`, `country`, and `volumes` as a year-to-quantity object. Never invent missing years or quantities.
+- When the user says no, move on to step 5 (Volumes table).
+- You MUST NOT jump to validator routing or ask for submission while Volumes table fields (target_price, currency, quantity) are still missing for any product row. These are collected in step 5.
+CRITICAL PRODUCT COMPLETENESS RULE: For the Products table section (step 4), a product row is complete once it has a `product`, `product_line`, `application`, `part_number`, a drawing (`rfq_files`), and a `sop_year`. Quantity, Target Price, Currency, Price Source, Delivery Zone, Delivery Plant, and Country are Volumes table fields — collect them in step 5, NOT here. Only `revision_level` and `costing_data` are optional row-level fields. NEVER skip any of the 6 volumes fields for any product row.
 CRITICAL DELIVERY ZONE RULE: Whenever you save `delivery_zone`, it MUST be exactly one of these 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". If the user gives a country or city, convert it to the approved zone before calling `updateFormFields`. If you cannot confidently map it, ask a clarification question instead of guessing. If you ask the user to choose a zone, you MUST present only those exact 7 options.
 
 STEP 1 VALIDATION RULE:
@@ -3324,7 +3534,7 @@ Ask sequentially for the Step 2 fields in this exact order:
 - Customer Tooling Conditions (OPTIONAL — allow `skip`)
 - Entry Barriers (OPTIONAL — allow `skip`)
 CRITICAL TARGET PRICE RULE:
-1. When collecting product target prices, you MUST save each line price in the `products` array exactly as the user stated it. Save each product row with `part_number`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` MUST remain the raw local amount the user provided. You may also collect these request-level price metadata fields:
+1. When collecting product target prices, you MUST save each line price in the `products` array exactly as the user stated it. Save each product row with its line-level context when available, especially `product`, `application`, `part_number`, `product_line`, `sop`, `revision_level`, `quantity`, `target_price`, `currency`, and `target_price_is_estimated`. `target_price` MUST remain the raw local amount the user provided. You may also collect these request-level price metadata fields:
    a. The target price amount for each product row in the user's local currency.
    b. The currency code for the provided product target prices (for example, EUR, USD, GBP, MXN, or CNY).
    c. Whether this price is 'Estimated by Avocarbon' or 'Given by Customer'.
@@ -3982,7 +4192,7 @@ async def handle_chat(
 3. Use the populated fields and the missing-fields engine to determine exactly which step of the checklist you are currently on.
 4. If the user replies with "1" or "2" to choose between step-by-step guidance and paragraph mode, treat that reply as a conversational command only. THIS IS NOT RFQ DATA. You MUST NOT call `updateFormFields` for it or save it into any RFQ field.
 5. If the user selects Option 2 or says they want to provide a paragraph, your immediate response MUST ONLY be: 'Great! Please paste your entire RFQ paragraph below.'
-6. After the user pastes the paragraph, extract every possible field across ALL relevant steps and call `updateFormFields` immediately.
+6. After the user pastes the paragraph, extract every possible field across ALL relevant steps and call `updateFormFields` immediately. If the paragraph includes line-level yearly volumes or logistics per part, save them in `volumes`.
 7. If you extract a product_name from the paragraph, you MUST immediately call `retrieveProducts` for that specific product before asking for manual costing details.
 8. Then use the MISSING_FIELDS_PROMPT to identify only the missing fields for the CURRENT step.
 9. STATE RECONCILIATION IS MANDATORY: compare the recent chat history against the CURRENT RFQ DATABASE STATE on every turn and save any missing data immediately with `updateFormFields`.

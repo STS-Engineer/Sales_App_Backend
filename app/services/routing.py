@@ -119,6 +119,34 @@ async def resolve_product_line_context(
     }
 
 
+async def resolve_product_line_role_emails(
+    db: AsyncSession,
+    *,
+    role: ProductLineRoutingRole,
+    identifier: str | None = None,
+    product_line: str | None = None,
+    acronym: str | None = None,
+) -> list[str]:
+    context = await resolve_product_line_context(
+        db,
+        identifier=identifier,
+        product_line=product_line,
+        acronym=acronym,
+    )
+    if context is None:
+        return []
+
+    result = await db.execute(
+        select(ProductLineRouting.email)
+        .where(
+            ProductLineRouting.product_line == context["product_line"],
+            ProductLineRouting.role == role,
+        )
+        .order_by(ProductLineRouting.id.asc())
+    )
+    return [str(e or "").strip() for e in result.scalars().all() if e]
+
+
 async def resolve_product_line_role_email(
     db: AsyncSession,
     *,
@@ -127,6 +155,24 @@ async def resolve_product_line_role_email(
     product_line: str | None = None,
     acronym: str | None = None,
 ) -> str | None:
+    emails_list = await resolve_product_line_role_emails(
+        db,
+        role=role,
+        identifier=identifier,
+        product_line=product_line,
+        acronym=acronym,
+    )
+    return emails_list[0] if emails_list else None
+
+
+async def resolve_product_line_role_assignments_multi(
+    db: AsyncSession,
+    *,
+    role: ProductLineRoutingRole,
+    identifier: str | None = None,
+    product_line: str | None = None,
+    acronym: str | None = None,
+) -> list[dict[str, str]]:
     context = await resolve_product_line_context(
         db,
         identifier=identifier,
@@ -134,15 +180,14 @@ async def resolve_product_line_role_email(
         acronym=acronym,
     )
     if context is None:
-        return None
+        return []
 
-    result = await db.execute(
-        select(ProductLineRouting.email).where(
-            ProductLineRouting.product_line == context["product_line"],
-            ProductLineRouting.role == role,
-        )
+    emails_list = await resolve_product_line_role_emails(
+        db,
+        role=role,
+        product_line=context["product_line"],
     )
-    return result.scalar_one_or_none()
+    return [{**context, "email": email} for email in emails_list]
 
 
 async def resolve_product_line_role_assignment(
@@ -153,24 +198,14 @@ async def resolve_product_line_role_assignment(
     product_line: str | None = None,
     acronym: str | None = None,
 ) -> dict[str, str] | None:
-    context = await resolve_product_line_context(
+    entries = await resolve_product_line_role_assignments_multi(
         db,
+        role=role,
         identifier=identifier,
         product_line=product_line,
         acronym=acronym,
     )
-    if context is None:
-        return None
-
-    email = await resolve_product_line_role_email(
-        db,
-        role=role,
-        product_line=context["product_line"],
-    )
-    if not email:
-        return None
-
-    return {**context, "email": email}
+    return entries[0] if entries else None
 
 
 async def get_assigned_product_line_acronyms(

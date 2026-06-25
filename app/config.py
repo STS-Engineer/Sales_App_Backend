@@ -45,6 +45,20 @@ class Settings(BaseSettings):
     AZURE_RFQ_FILES_CONTAINER: str = "rfq-files"
     CRON_TOKEN: str | None = None
 
+    # Microsoft Graph / SharePoint integration
+    AZURE_TENANT_ID: str | None = None
+    AZURE_CLIENT_ID: str | None = None
+    AZURE_CLIENT_SECRET: str | None = None
+    SHAREPOINT_GROUP_NAME: str = "Product Development & Costing"
+    SHAREPOINT_LIBRARY_NAME: str = "RFQ_Costing Files"
+    SHAREPOINT_RFQ_ROOT_FOLDER: str = "RFQ"
+    SHAREPOINT_SITE_ID: str | None = None
+    SHAREPOINT_DRIVE_ID: str | None = None
+    # Set to false to disable SharePoint sync without removing credentials
+    SHAREPOINT_SYNC_ENABLED: bool = True
+    # Set to true locally to surface Graph errors instead of swallowing them
+    SHAREPOINT_SYNC_RAISE_ERRORS: bool = False
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE))
 
     @property
@@ -98,6 +112,48 @@ class Settings(BaseSettings):
     @property
     def azure_rfq_files_container(self) -> str:
         return (self.AZURE_RFQ_FILES_CONTAINER or "rfq-files").strip().lower()
+
+    # --- SharePoint / Microsoft Graph accessors ---
+
+    @property
+    def azure_tenant_id(self) -> str:
+        return (self.AZURE_TENANT_ID or "").strip()
+
+    @property
+    def azure_client_id(self) -> str:
+        return (self.AZURE_CLIENT_ID or "").strip()
+
+    @property
+    def azure_client_secret(self) -> str:
+        return (self.AZURE_CLIENT_SECRET or "").strip()
+
+    @property
+    def sharepoint_group_name(self) -> str:
+        return (self.SHAREPOINT_GROUP_NAME or "").strip()
+
+    @property
+    def sharepoint_library_name(self) -> str:
+        return (self.SHAREPOINT_LIBRARY_NAME or "").strip()
+
+    @property
+    def sharepoint_rfq_root_folder(self) -> str:
+        return (self.SHAREPOINT_RFQ_ROOT_FOLDER or "RFQ").strip()
+
+    @property
+    def sharepoint_site_id(self) -> str:
+        return (self.SHAREPOINT_SITE_ID or "").strip()
+
+    @property
+    def sharepoint_drive_id(self) -> str:
+        return (self.SHAREPOINT_DRIVE_ID or "").strip()
+
+    @property
+    def sharepoint_sync_enabled(self) -> bool:
+        return bool(self.SHAREPOINT_SYNC_ENABLED)
+
+    @property
+    def sharepoint_sync_raise_errors(self) -> bool:
+        return bool(self.SHAREPOINT_SYNC_RAISE_ERRORS)
 
     @staticmethod
     def _build_async_db_url(raw_url: str | None) -> URL | None:

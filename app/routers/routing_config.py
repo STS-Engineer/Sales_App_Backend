@@ -1,5 +1,7 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -11,7 +13,10 @@ from app.schemas.product_line_routing import (
     ProductLineRoutingCreate,
     ProductLineRoutingOut,
     ProductLineRoutingUpdate,
+    RoutingAssignRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/owner/routing-config", tags=["routing-config"])
 
@@ -46,6 +51,72 @@ async def list_product_line_routing(
     return result.scalars().all()
 
 
+@router.put("/assign", response_model=list[ProductLineRoutingOut])
+async def assign_product_line_routing(
+    body: RoutingAssignRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(UserRole.OWNER)),
+):
+    """Replace all email assignments for a (product_line, role) pair atomically.
+
+    Only the assignments for the given product_line + role are touched;
+    all other product lines and roles remain unchanged.
+    """
+    product_line = await _ensure_product_line_exists(db, body.product_line)
+
+    # Deduplicate, preserve order, keep only non-empty emails
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_email in body.emails:
+        email = str(raw_email).strip()
+        key = email.lower()
+        if email and key not in seen:
+            seen.add(key)
+            normalized.append(email)
+
+    logger.debug(
+        "ROUTING SETTINGS: assigning product_line=%r role=%r users_count=%d",
+        product_line,
+        body.role.value,
+        len(normalized),
+    )
+
+    # Delete existing assignments for this (product_line, role) only
+    await db.execute(
+        sa_delete(ProductLineRouting).where(
+            ProductLineRouting.product_line == product_line,
+            ProductLineRouting.role == body.role,
+        )
+    )
+
+    # Insert new assignments
+    for email in normalized:
+        db.add(ProductLineRouting(
+            product_line=product_line,
+            role=body.role,
+            email=email,
+        ))
+
+    await db.commit()
+
+    result = await db.execute(
+        select(ProductLineRouting)
+        .where(
+            ProductLineRouting.product_line == product_line,
+            ProductLineRouting.role == body.role,
+        )
+        .order_by(ProductLineRouting.id.asc())
+    )
+    saved = result.scalars().all()
+
+    logger.debug(
+        "ROUTING SETTINGS: assignments saved successfully — saved_count=%d",
+        len(saved),
+    )
+
+    return saved
+
+
 @router.post("", response_model=ProductLineRoutingOut, status_code=status.HTTP_201_CREATED)
 async def create_product_line_routing(
     body: ProductLineRoutingCreate,
@@ -57,12 +128,13 @@ async def create_product_line_routing(
         select(ProductLineRouting).where(
             ProductLineRouting.product_line == product_line,
             ProductLineRouting.role == body.role,
+            ProductLineRouting.email == str(body.email).strip(),
         )
     )
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(
             status_code=409,
-            detail="A routing entry already exists for this product line and role.",
+            detail="This email is already assigned to this product line and role.",
         )
 
     entry = ProductLineRouting(
@@ -95,13 +167,14 @@ async def update_product_line_routing(
         select(ProductLineRouting).where(
             ProductLineRouting.product_line == product_line,
             ProductLineRouting.role == body.role,
+            ProductLineRouting.email == str(body.email).strip(),
             ProductLineRouting.id != routing_id,
         )
     )
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(
             status_code=409,
-            detail="A routing entry already exists for this product line and role.",
+            detail="This email is already assigned to this product line and role.",
         )
 
     entry.product_line = product_line

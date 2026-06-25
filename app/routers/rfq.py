@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,6 +61,7 @@ from app.schemas.rfq import (
     rfq_data_payload_to_dict,
 )
 from app.services.audit import log_action
+from app.services.sharepoint_service import sync_rfq_to_sharepoint, upload_feasibility_to_sharepoint
 from app.services.costing_template import (
     build_costing_template_filename,
     render_costing_template_pdf,
@@ -92,8 +93,8 @@ from app.services.notifications import (
 from app.services.offer_preparation_store import get_offer_preparation_data_snapshot
 from app.services.routing import (
     get_assigned_product_line_acronyms,
-    resolve_product_line_role_assignment,
-    resolve_product_line_role_email,
+    resolve_product_line_role_assignments_multi,
+    resolve_product_line_role_emails,
 )
 from app.utils import emails
 from app.utils.currency import get_eur_exchange_rate
@@ -670,30 +671,30 @@ def _set_pricing_workflow_state(rfq: Rfq, **updates: object | None) -> None:
 
 
 async def _is_assigned_plm(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
-    email = await resolve_product_line_role_email(
+    assigned = await resolve_product_line_role_emails(
         db,
         role=ProductLineRoutingRole.PLM,
         acronym=rfq.product_line_acronym,
     )
-    return _normalize_email(current_user.email) == _normalize_email(email)
+    return _normalize_email(current_user.email) in {_normalize_email(e) for e in assigned}
 
 
 async def _is_assigned_costing_agent(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
-    email = await resolve_product_line_role_email(
+    assigned = await resolve_product_line_role_emails(
         db,
         role=ProductLineRoutingRole.COSTING,
         acronym=rfq.product_line_acronym,
     )
-    return _normalize_email(current_user.email) == _normalize_email(email)
+    return _normalize_email(current_user.email) in {_normalize_email(e) for e in assigned}
 
 
 async def _is_assigned_rnd(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
-    email = await resolve_product_line_role_email(
+    assigned = await resolve_product_line_role_emails(
         db,
         role=ProductLineRoutingRole.RND,
         acronym=rfq.product_line_acronym,
     )
-    return _normalize_email(current_user.email) == _normalize_email(email)
+    return _normalize_email(current_user.email) in {_normalize_email(e) for e in assigned}
 
 
 async def _assert_costing_phase_assignment(
@@ -1618,11 +1619,11 @@ async def list_rfqs(
     current_user: User = Depends(get_current_user),
 ):
     query = _rfq_query().order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
-
+ 
     document_type_filters = _parse_document_type_filters(document_type)
     if document_type_filters:
         query = query.where(Rfq.document_type.in_(document_type_filters))
-
+ 
     if current_user.role != UserRole.OWNER:
         if current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}:
             routing_role = {
@@ -1647,14 +1648,31 @@ async def list_rfqs(
                 Rfq.zone_manager_email == current_user.email,
             ]
             query = query.where(or_(*visibility_filters))
-
+ 
     result = await db.execute(query)
     rfqs = result.scalars().all()
+ 
+    # Batch-fetch user names for creator and validator emails
+    unique_emails = {
+        e
+        for rfq in rfqs
+        for e in (rfq.created_by_email, rfq.zone_manager_email)
+        if e
+    }
+    name_by_email: dict[str, str] = {}
+    if unique_emails:
+        users_result = await db.execute(select(User).where(User.email.in_(unique_emails)))
+        for user in users_result.scalars().all():
+            if user.full_name:
+                name_by_email[user.email] = user.full_name
+ 
     for rfq in rfqs:
         set_committed_value(rfq, "rfq_data", normalize_rfq_data_products(rfq.rfq_data))
+        rfq.created_by_name = name_by_email.get(rfq.created_by_email)
+        rfq.zone_manager_name = name_by_email.get(rfq.zone_manager_email or "")
     return rfqs
-
-
+ 
+ 
 @router.get("/{rfq_id}", response_model=RfqOut)
 async def get_rfq(
     rfq_id: str,
@@ -1667,8 +1685,14 @@ async def get_rfq(
     if rfq.chat_history and _ensure_revision_greeting_in_history(rfq):
         await db.commit()
         await db.refresh(rfq)
+    emails = {e for e in (rfq.created_by_email, rfq.zone_manager_email) if e}
+    if emails:
+        users_result = await db.execute(select(User).where(User.email.in_(emails)))
+        name_map = {u.email: u.full_name for u in users_result.scalars().all() if u.full_name}
+        rfq.created_by_name = name_map.get(rfq.created_by_email)
+        rfq.zone_manager_name = name_map.get(rfq.zone_manager_email or "")
     return rfq
-
+ 
 
 @router.get("/{rfq_id}/discussion", response_model=list[DiscussionMessageOut])
 async def get_rfq_discussion(
@@ -1806,6 +1830,7 @@ async def create_costing_message(
 @router.get("/{rfq_id}/costing-template")
 async def download_costing_template(
     rfq_id: str,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1829,6 +1854,14 @@ async def download_costing_template(
             status_code=500,
             detail=f"Unable to generate the costing template PDF. {exc}",
         ) from exc
+
+    # Upload to SharePoint 08-Costing Output in background — never blocks or fails the download
+    background_tasks.add_task(
+        upload_feasibility_to_sharepoint,
+        rfq_id=rfq_id,
+        filename=filename,
+        file_bytes=document_pdf,
+    )
 
     return Response(
         content=document_pdf,
@@ -2123,6 +2156,7 @@ async def get_notification_logs(
 async def validate_rfq(
     rfq_id: str,
     body: ValidateRfqRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(
         require_role(UserRole.COMMERCIAL, UserRole.ZONE_MANAGER, UserRole.OWNER)
@@ -2182,31 +2216,60 @@ async def validate_rfq(
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
     if body.approved:
-        route_entry = await resolve_product_line_role_assignment(
+        route_entries = await resolve_product_line_role_assignments_multi(
             db,
             role=ProductLineRoutingRole.COSTING,
             acronym=refreshed_rfq.product_line_acronym,
         )
-        if route_entry:
+        if route_entries:
             refreshed_data = dict(refreshed_rfq.rfq_data or {})
-            recipient_email = str(route_entry.get("email") or "")
-            email_sent = emails.send_costing_entry_email(
-                recipient_email,
-                str(route_entry.get("product_line") or ""),
-                str(route_entry.get("acronym") or ""),
-                str(refreshed_data.get("systematic_rfq_id") or ""),
-                _build_rfq_link(refreshed_rfq.rfq_id),
-            )
-            if email_sent:
+            notified_costing: list[str] = []
+            for route_entry in route_entries:
+                recipient_email = str(route_entry.get("email") or "")
+                if emails.send_costing_entry_email(
+                    recipient_email,
+                    str(route_entry.get("product_line") or ""),
+                    str(route_entry.get("acronym") or ""),
+                    str(refreshed_data.get("systematic_rfq_id") or ""),
+                    _build_rfq_link(refreshed_rfq.rfq_id),
+                ):
+                    notified_costing.append(recipient_email)
+            if notified_costing:
                 refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
                 await record_notification_sent(
                     db,
                     rfq_id=refreshed_rfq.rfq_id,
-                    recipients=recipient_email,
+                    recipients=notified_costing,
                     email_type=EMAIL_COSTING_ENTRY,
                 )
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
+
+    logger.warning(
+        "DEBUG SHAREPOINT: approval reached — rfq_id=%s approved=%s",
+        rfq_id,
+        body.approved,
+    )
+
+    if body.approved:
+        _sp_rfq_name = str((refreshed_rfq.rfq_data or {}).get("systematic_rfq_id") or "")
+        _sp_product_line = str(refreshed_rfq.product_line_acronym or "")
+        _sp_files = list((refreshed_rfq.rfq_data or {}).get("rfq_files") or [])
+        logger.warning(
+            "DEBUG SHAREPOINT: scheduling sync — rfq_id=%s rfq_name='%s' product_line='%s' files_count=%d",
+            rfq_id,
+            _sp_rfq_name,
+            _sp_product_line,
+            len(_sp_files),
+        )
+        background_tasks.add_task(
+            sync_rfq_to_sharepoint,
+            rfq_id=rfq_id,
+            rfq_name=_sp_rfq_name,
+            product_line_acronym=_sp_product_line,
+            rfq_files=_sp_files,
+        )
+
     return refreshed_rfq
 
 
@@ -2273,26 +2336,29 @@ async def costing_review(
         )
 
     if body.scope:
-        route_entry = await resolve_product_line_role_assignment(
+        route_entries = await resolve_product_line_role_assignments_multi(
             db,
             role=ProductLineRoutingRole.COSTING,
             acronym=refreshed_rfq.product_line_acronym,
         )
-        if route_entry:
-            recipient_email = str(route_entry.get("email") or "")
-            handoff_email_sent = emails.send_costing_handoff_email(
-                recipient_email,
-                str(route_entry.get("product_line") or ""),
-                str(route_entry.get("acronym") or ""),
-                systematic_rfq_id,
-                rfq_link,
-            )
-            if handoff_email_sent:
+        if route_entries:
+            notified_handoff: list[str] = []
+            for route_entry in route_entries:
+                recipient_email = str(route_entry.get("email") or "")
+                if emails.send_costing_handoff_email(
+                    recipient_email,
+                    str(route_entry.get("product_line") or ""),
+                    str(route_entry.get("acronym") or ""),
+                    systematic_rfq_id,
+                    rfq_link,
+                ):
+                    notified_handoff.append(recipient_email)
+            if notified_handoff:
                 refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
                 await record_notification_sent(
                     db,
                     rfq_id=refreshed_rfq.rfq_id,
-                    recipients=recipient_email,
+                    recipients=notified_handoff,
                     email_type=EMAIL_COSTING_HANDOFF,
                 )
         if str(refreshed_rfq.product_line_acronym or "").upper() == "ASS":
@@ -2305,6 +2371,7 @@ async def costing_review(
 @router.post("/{rfq_id}/costing-file-action", response_model=RfqOut)
 async def submit_costing_file_action(
     rfq_id: str,
+    background_tasks: BackgroundTasks,
     action: str = Form(...),
     note: str = Form(...),
     feasibility_status: str = Form(...),
@@ -2356,8 +2423,17 @@ async def submit_costing_file_action(
             detail="file must not be provided when action is 'NA'.",
         )
 
+    # Read file bytes before _upload_costing_action_file consumes the stream,
+    # so the same bytes can be forwarded to SharePoint via a background task.
+    sp_file_bytes: bytes | None = None
+    sp_filename: str | None = None
+
     file_meta = None
     if normalized_action == COSTING_FILE_STATUS_UPLOADED and file is not None:
+        sp_file_bytes = await file.read()
+        sp_filename = _safe_upload_filename(file.filename)
+        await file.seek(0)  # reset so _upload_costing_action_file reads from the start
+
         file_meta = await _upload_costing_action_file(
             rfq_id=rfq_id,
             file=file,
@@ -2415,6 +2491,22 @@ async def submit_costing_file_action(
                 recipients=refreshed_rfq.created_by_email,
                 email_type=EMAIL_FEASIBILITY_RESULT,
             )
+
+    # Upload the feasibility file to SharePoint 08-Costing Output in background.
+    # Never blocks the response — Azure upload above already succeeded.
+    if sp_file_bytes and sp_filename:
+        logger.warning(
+            "DEBUG SHAREPOINT FEASIBILITY: scheduling upload for RFQ %s — filename='%s' size=%d bytes",
+            rfq_id,
+            sp_filename,
+            len(sp_file_bytes),
+        )
+        background_tasks.add_task(
+            upload_feasibility_to_sharepoint,
+            rfq_id=rfq_id,
+            filename=sp_filename,
+            file_bytes=sp_file_bytes,
+        )
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
@@ -2489,21 +2581,24 @@ async def upload_pricing_bom_file(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
-    recipient_email = await resolve_product_line_role_email(
+    costing_emails_bom = await resolve_product_line_role_emails(
         db,
         role=ProductLineRoutingRole.COSTING,
         acronym=refreshed_rfq.product_line_acronym,
-    ) or ""
-    email_sent = emails.send_bom_ready_email(
-        recipient_email,
-        str(refreshed_data.get("systematic_rfq_id") or ""),
-        _build_rfq_link(refreshed_rfq.rfq_id),
     )
-    if email_sent:
+    notified_bom: list[str] = []
+    for recipient_email in costing_emails_bom:
+        if emails.send_bom_ready_email(
+            recipient_email,
+            str(refreshed_data.get("systematic_rfq_id") or ""),
+            _build_rfq_link(refreshed_rfq.rfq_id),
+        ):
+            notified_bom.append(recipient_email)
+    if notified_bom:
         await record_notification_sent(
             db,
             rfq_id=refreshed_rfq.rfq_id,
-            recipients=recipient_email,
+            recipients=notified_bom,
             email_type=EMAIL_BOM_READY,
         )
     await _refresh_rfq_response_state(db, refreshed_rfq)
@@ -2513,6 +2608,7 @@ async def upload_pricing_bom_file(
 @router.post("/{rfq_id}/pricing-final-price", response_model=RfqOut)
 async def upload_pricing_final_price_file(
     rfq_id: str,
+    background_tasks: BackgroundTasks,
     note: str = Form(...),
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
@@ -2556,6 +2652,11 @@ async def upload_pricing_final_price_file(
     if not trimmed_note:
         raise HTTPException(status_code=400, detail="note is required.")
 
+    # Read bytes before _upload_costing_action_file consumes the stream
+    sp_file_bytes = await file.read()
+    sp_filename = _safe_upload_filename(file.filename)
+    await file.seek(0)
+
     file_meta = await _upload_costing_action_file(
         rfq_id=rfq_id,
         file=file,
@@ -2591,23 +2692,42 @@ async def upload_pricing_final_price_file(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
-    recipient_email = await resolve_product_line_role_email(
+    plm_emails_pricing = await resolve_product_line_role_emails(
         db,
         role=ProductLineRoutingRole.PLM,
         acronym=refreshed_rfq.product_line_acronym,
-    ) or ""
-    email_sent = emails.send_pricing_ready_email(
-        recipient_email,
-        str(refreshed_data.get("systematic_rfq_id") or ""),
-        _build_rfq_link(refreshed_rfq.rfq_id),
     )
-    if email_sent:
+    notified_pricing: list[str] = []
+    for recipient_email in plm_emails_pricing:
+        if emails.send_pricing_ready_email(
+            recipient_email,
+            str(refreshed_data.get("systematic_rfq_id") or ""),
+            _build_rfq_link(refreshed_rfq.rfq_id),
+        ):
+            notified_pricing.append(recipient_email)
+    if notified_pricing:
         await record_notification_sent(
             db,
             rfq_id=refreshed_rfq.rfq_id,
-            recipients=recipient_email,
+            recipients=notified_pricing,
             email_type=EMAIL_PRICING_READY,
         )
+
+    # Upload to SharePoint 08-Costing Output in background — never blocks the response
+    logger.warning(
+        "DEBUG SHAREPOINT PRICING: scheduling upload for RFQ %s — filename='%s' size=%d bytes",
+        rfq_id,
+        sp_filename,
+        len(sp_file_bytes),
+    )
+    background_tasks.add_task(
+        upload_feasibility_to_sharepoint,
+        rfq_id=rfq_id,
+        filename=sp_filename,
+        file_bytes=sp_file_bytes,
+        file_label="PRICING",
+    )
+
     await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
@@ -2717,23 +2837,26 @@ async def costing_validation(
                 email_type=email_type,
             )
     else:
-        costing_agent_email = await resolve_product_line_role_email(
+        costing_emails_rej = await resolve_product_line_role_emails(
             db,
             role=ProductLineRoutingRole.COSTING,
             acronym=refreshed_rfq.product_line_acronym,
-        ) or ""
-        email_sent = emails.send_costing_rejected_email(
-            costing_agent_email,
-            refreshed_rfq.created_by_email,
-            systematic_rfq_id,
-            rfq_link,
-            str(body.rejection_reason or ""),
         )
-        if email_sent:
+        notified_rej: list[str] = []
+        for costing_agent_email in costing_emails_rej:
+            if emails.send_costing_rejected_email(
+                costing_agent_email,
+                refreshed_rfq.created_by_email,
+                systematic_rfq_id,
+                rfq_link,
+                str(body.rejection_reason or ""),
+            ):
+                notified_rej.append(costing_agent_email)
+        if notified_rej:
             await record_notification_sent(
                 db,
                 rfq_id=refreshed_rfq.rfq_id,
-                recipients=[costing_agent_email, refreshed_rfq.created_by_email],
+                recipients=[*notified_rej, refreshed_rfq.created_by_email],
                 email_type=EMAIL_COSTING_REJECTED,
             )
 

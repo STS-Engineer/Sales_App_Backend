@@ -177,6 +177,7 @@ def test_build_user_facing_fallback_text_explains_internal_avocarbon_contact_rej
         rfq=rfq,
         chat_mode="rfq",
         extracted_data={
+            "automotive_type": "Automotive",
             "customer_name": "Bosch",
             "application": "Motor",
             "product_name": "Brush Holder",
@@ -220,6 +221,7 @@ def test_build_user_facing_fallback_text_rejects_url_for_rfq_files():
         rfq=rfq,
         chat_mode="rfq",
         extracted_data={
+            "automotive_type": "Automotive",
             "customer_name": "Bosch",
             "application": "Motor",
             "product_name": "Brush Holder",
@@ -236,6 +238,7 @@ def test_should_reject_rfq_file_url_message_only_when_rfq_files_is_next():
     assert chat._should_reject_rfq_file_url_message(
         chat_mode="rfq",
         extracted_data={
+            "automotive_type": "Automotive",
             "customer_name": "Bosch",
             "application": "Motor",
             "product_name": "Brush Holder",
@@ -248,6 +251,7 @@ def test_should_reject_rfq_file_url_message_only_when_rfq_files_is_next():
     assert chat._should_reject_rfq_file_url_message(
         chat_mode="rfq",
         extracted_data={
+            "automotive_type": "Automotive",
             "customer_name": "Bosch",
             "application": "Motor",
         },
@@ -257,6 +261,7 @@ def test_should_reject_rfq_file_url_message_only_when_rfq_files_is_next():
     assert chat._should_reject_rfq_file_url_message(
         chat_mode="rfq",
         extracted_data={
+            "automotive_type": "Automotive",
             "customer_name": "Bosch",
             "application": "Motor",
             "product_name": "Brush Holder",
@@ -331,6 +336,7 @@ def test_build_user_facing_fallback_text_asks_modify_before_submission():
         rfq=rfq,
         chat_mode="rfq",
         extracted_data={
+            "automotive_type": "Automotive",
             "customer_name": "Comstar",
             "application": "Starter",
             "product_name": "Brush for high commutation",
@@ -441,6 +447,7 @@ def test_rewrite_submit_prompt_to_modify_prompt_if_needed():
         rfq=rfq,
         chat_mode="rfq",
         extracted_data={
+            "automotive_type": "Automotive",
             "customer_name": "Comstar",
             "application": "Starter",
             "product_name": "Brush Holder",
@@ -535,6 +542,7 @@ def test_is_field_filled_treats_internal_avocarbon_contact_as_missing():
 
 def test_get_current_step_includes_optional_rfq_fields_in_order():
     data = {
+        "automotive_type": "Automotive",
         "customer_name": "TPEG",
         "application": "Electronic",
         "product_name": "Rod Choke",
@@ -578,12 +586,13 @@ def test_get_current_step_includes_optional_rfq_fields_in_order():
 def test_system_prompt_allows_grouped_product_rows_to_omit_revision_level():
     assert (
         "When asking for a full product row in one grouped prompt, do NOT tell "
-        "the user to type `skip` for Revision Level; they may simply leave it out."
+        "the user to type `skip` for those optional row fields; they may simply "
+        "leave them out."
         in chat.SYSTEM_PROMPT
     )
     assert (
-        "If it is omitted while the required product row values are present, treat "
-        "Revision Level as blank, save the row, and continue without a dedicated "
+        "If they are omitted while the required product row values are present, "
+        "treat them as blank, save the row, and continue without a dedicated "
         "follow-up question."
         in chat.SYSTEM_PROMPT
     )
@@ -763,6 +772,7 @@ async def test_submit_validation_is_blocked_while_required_fields_remain_missing
     monkeypatch.setattr(chat, "_submit_rfq_for_validation_internal", _should_not_submit)
 
     saved_data = {
+        "automotive_type": "Automotive",
         "customer_name": "Nidec",
         "application": "Traction motor",
         "product_name": "Brush Holder",
@@ -867,10 +877,11 @@ async def test_handle_chat_submit_yes_submits_without_reasking(monkeypatch):
                 ),
             }
         ],
-        rfq_data={
-            "customer_name": "Comstar",
-            "application": "Starter",
-            "product_name": "Brush Holder",
+            rfq_data={
+                "automotive_type": "Automotive",
+                "customer_name": "Comstar",
+                "application": "Starter",
+                "product_name": "Brush Holder",
             "product_line_acronym": "BRU",
             "project_name": "CPPR3T-11056-AA",
             "rfq_files": [{"name": "cppr3t-11056-aa_20211208.pdf"}],
@@ -931,7 +942,7 @@ async def test_handle_chat_submit_yes_submits_without_reasking(monkeypatch):
 
     assert response.tool_calls_used == ["submitValidation"]
     assert response.response == (
-        "Your RFQ was submitted and is now PENDING FOR VALIDATION. "
+        "Your RFQ was submitted and is now PENDING_FOR_VALIDATION. "
         "The validation workflow has started."
     )
     assert rfq.sub_status == chat.RfqSubStatus.PENDING_FOR_VALIDATION
@@ -1613,7 +1624,7 @@ async def test_update_form_fields_appends_products_from_persisted_rfq_state():
 
 
 @pytest.mark.asyncio
-async def test_update_form_fields_without_append_overwrites_products():
+async def test_update_form_fields_without_append_keeps_unmatched_existing_products():
     extracted_data = {
         "products": [
             _build_product(part_number="PN-1", quantity=100, target_price=2.5)
@@ -1653,7 +1664,10 @@ async def test_update_form_fields_without_append_overwrites_products():
     payload = json.loads(tool_messages[0]["content"])
 
     assert payload["success"] is True
-    assert [product["part_number"] for product in extracted_data["products"]] == ["PN-9"]
+    assert [product["part_number"] for product in extracted_data["products"]] == [
+        "PN-1",
+        "PN-9",
+    ]
 
 
 @pytest.mark.asyncio

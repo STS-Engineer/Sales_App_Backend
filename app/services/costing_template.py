@@ -15,27 +15,26 @@ from typing import Any
 from app.models.rfq import Rfq
 from app.schemas.rfq import normalize_rfq_data_products
 
+# Section marker sentinel used for table-only sections (Products / Volumes).
+# The rendering layer checks the section title and calls the appropriate table builder.
+_TABLE_SECTION: list[tuple[str, tuple[str, ...]]] = []
+
 FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
     (
         "Customer details",
         [
+            ("Automotive type", ("automotive_type", "automotiveType")),
             ("Customer", ("customer_name", "customer", "client")),
-            ("Application", ("application",)),
-            ("Product name", ("product_name", "productName")),
-            ("Product line", ("product_line_acronym", "productLine")),
             ("Project name", ("project_name", "projectName")),
-            ("Costing data", ("costing_data", "costingData")),
         ],
     ),
+    ("Products", _TABLE_SECTION),    # rendered as a Products info table
+    ("Volumes", _TABLE_SECTION),     # rendered as a Volumes table
     (
         "Logistics details",
         [
-            ("Delivery zone", ("delivery_zone", "deliveryZone")),
-            ("Plant", ("delivery_plant", "plant")),
-            ("Country", ("country",)),
             ("PO date", ("po_date", "poDate")),
             ("PPAP date", ("ppap_date", "ppapDate")),
-            ("SOP year", ("sop_year", "sop")),
             ("RFQ reception date", ("rfq_reception_date", "rfqReceptionDate")),
             ("Expected quotation date", ("quotation_expected_date", "expectedQuotationDate")),
         ],
@@ -52,60 +51,32 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
     (
         "Commercial expectations",
         [
-            (
-                "Expected delivery conditions",
-                ("expected_delivery_conditions", "expectedDeliveryConditions"),
-            ),
+            ("Expected delivery conditions", ("expected_delivery_conditions", "expectedDeliveryConditions")),
             ("Expected payment terms", ("expected_payment_terms", "expectedPaymentTerms")),
             ("Type of packaging", ("type_of_packaging", "typeOfPackaging")),
             ("Business trigger", ("business_trigger", "businessTrigger")),
-            (
-                "Customer tooling conditions",
-                ("customer_tooling_conditions", "customerToolingConditions"),
-            ),
+            ("Customer tooling conditions", ("customer_tooling_conditions", "customerToolingConditions")),
             ("Entry barriers", ("entry_barriers", "entryBarriers")),
         ],
     ),
     (
         "Commercial questions",
         [
-            (
-                "Design responsible",
-                ("responsibility_design", "design_responsible", "designResponsible"),
-            ),
-            (
-                "Validation responsible",
-                (
-                    "responsibility_validation",
-                    "validation_responsible",
-                    "validationResponsible",
-                ),
-            ),
+            ("Design responsible", ("responsibility_design", "design_responsible", "designResponsible")),
+            ("Validation responsible", ("responsibility_validation", "validation_responsible", "validationResponsible")),
             ("Design owner", ("product_ownership", "design_owner", "designOwner")),
-            (
-                "Development costs",
-                ("pays_for_development", "development_costs", "developmentCosts"),
-            ),
-            (
-                "Technical capacity",
-                ("capacity_available", "technical_capacity", "technicalCapacity"),
-            ),
+            ("Development costs", ("pays_for_development", "development_costs", "developmentCosts")),
+            ("Technical capacity", ("capacity_available", "technical_capacity", "technicalCapacity")),
             ("Scope", ("scope",)),
             ("Strategic note", ("strategic_note", "strategicNote")),
-            (
-                "Final recommendation",
-                ("is_feasible", "final_recommendation", "finalRecommendation"),
-            ),
+            ("Final recommendation", ("is_feasible", "final_recommendation", "finalRecommendation")),
         ],
     ),
     (
         "RFQ validation and submission",
         [
             ("Total Turnover", ("to_total", "toTotal")),
-            (
-                "Validator Email",
-                ("zone_manager_email", "validator_email", "validatorEmail"),
-            ),
+            ("Validator Email", ("zone_manager_email", "validator_email", "validatorEmail")),
         ],
     ),
 ]
@@ -172,7 +143,8 @@ def render_costing_template_html(rfq: Rfq) -> str:
     customer = _pick_first_value(data, ("customer_name", "customer", "client"))
     phase = _stringify_value(getattr(rfq.phase, "value", getattr(rfq, "phase", None))) or None
     sub_status = _stringify_value(getattr(rfq.sub_status, "value", getattr(rfq, "sub_status", None))) or None
-    product_rows = _build_product_reference_rows(data)
+    products_info_rows = _build_products_info_rows(data)
+    volumes_rows_data = _build_volumes_rows(data)
 
     meta_cards = [
         ("RFQ ID", systematic_rfq_id),
@@ -189,7 +161,11 @@ def render_costing_template_html(rfq: Rfq) -> str:
     badge_sub = f'<span class="pill">Sub-status\u00a0: {escape(sub_status or "—")}</span>' if sub_status else ""
 
     sections_html = "".join(
-        _render_field_group(title, fields, data, index, product_rows=product_rows)
+        _render_field_group(
+            title, fields, data, index,
+            products_info_rows=products_info_rows,
+            volumes_rows_data=volumes_rows_data,
+        )
         for index, (title, fields) in enumerate(FIELD_GROUPS)
     )
 
@@ -806,8 +782,6 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
     customer = _pick_first_value(data, ("customer_name", "customer", "client"))
     phase = _stringify_value(getattr(rfq.phase, "value", getattr(rfq, "phase", None))) or "-"
     sub_status = _stringify_value(getattr(rfq.sub_status, "value", getattr(rfq, "sub_status", None))) or "-"
-    product_rows = _build_product_reference_rows(data)
-
     tide = colors.HexColor("#046eaf")
     sun = colors.HexColor("#ef7807")
     mint = colors.HexColor("#0e4e78")
@@ -1065,6 +1039,27 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
 
     story.append(Spacer(1, 10))
 
+    rl_products_info = _build_products_info_rows(data)
+    rl_volumes_rows = _build_volumes_rows(data)
+
+    _ref_table_style = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), mint),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fbfd")]),
+        ("BOX", (0, 0), (-1, -1), 0.8, border_color),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#eef3f7")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ])
+
+    def _make_ref_cell(value: str) -> Paragraph:
+        return Paragraph(
+            _paragraph_html(value),
+            reference_empty_style if value == "-" else reference_value_style,
+        )
+
     for index, (title, fields) in enumerate(FIELD_GROUPS):
         accent, head_bg, _, _ = SECTION_ACCENTS[index % len(SECTION_ACCENTS)]
         accent_color = colors.HexColor(accent)
@@ -1088,74 +1083,76 @@ def _render_reportlab_pdf(rfq: Rfq) -> bytes:
             ("BOTTOMPADDING", (1, 0), (1, 0), 7),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ]))
+        story.append(header)
 
-        field_rows = []
-        for label, keys in fields:
-            display_value = _get_field_display_value(label, keys, data, product_rows=product_rows)
-            value_style = field_empty_style if display_value == "-" else field_value_style
-            field_rows.append([
-                Paragraph(escape(label.upper()), field_label_style),
-                Paragraph(_paragraph_html(display_value), value_style),
-            ])
-
-        body = Table(field_rows, colWidths=[56 * mm, 124 * mm])
-        body.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-            ("BOX", (0, 0), (-1, -1), 0.8, border_color),
-            ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#eef3f7")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 12),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 12),
-            ("TOPPADDING", (0, 0), (-1, -1), 7),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ]))
-
-        story.extend([header, body])
-
-        if index == 0 and product_rows:
-            reference_table_rows = [
-                [
-                    Paragraph(text, reference_header_style)
-                    for text in ("#", "Part number", "Revision", "Qty/year", "Target price", "Price source", "Target TO")
-                ]
+        if title == "Products":
+            rl_rows = [
+                [Paragraph(h, reference_header_style) for h in
+                 ("#", "Product", "Product line", "Costing data", "Application", "Part number", "SOP year")]
             ]
-            for row in product_rows:
-                reference_table_rows.append(
-                    [
-                        Paragraph(escape(row["index"]), reference_value_style),
-                        Paragraph(_paragraph_html(row["part_number"]), reference_empty_style if row["part_number"] == "-" else reference_value_style),
-                        Paragraph(_paragraph_html(row["revision_level"]), reference_empty_style if row["revision_level"] == "-" else reference_value_style),
-                        Paragraph(_paragraph_html(row["quantity"]), reference_empty_style if row["quantity"] == "-" else reference_value_style),
-                        Paragraph(_paragraph_html(row["target_price_display"]), reference_empty_style if row["target_price_display"] == "-" else reference_value_style),
-                        Paragraph(_paragraph_html(row["price_source"]), reference_empty_style if row["price_source"] == "-" else reference_value_style),
-                        Paragraph(_paragraph_html(row["target_to_display"]), reference_empty_style if row["target_to_display"] == "-" else reference_value_style),
-                    ]
-                )
+            for row in rl_products_info:
+                rl_rows.append([
+                    Paragraph(escape(row["index"]), reference_value_style),
+                    _make_ref_cell(row["product"]),
+                    _make_ref_cell(row["product_line"]),
+                    _make_ref_cell(row["costing_data"]),
+                    _make_ref_cell(row["application"]),
+                    _make_ref_cell(row["part_number"]),
+                    _make_ref_cell(row["sop_year"]),
+                ])
+            if len(rl_rows) > 1:
+                # 8+36+28+32+28+28+20 = 180mm (matches section header width)
+                t = Table(rl_rows, colWidths=[8*mm, 36*mm, 28*mm, 32*mm, 28*mm, 28*mm, 20*mm], repeatRows=1)
+                t.setStyle(_ref_table_style)
+                story.extend([Spacer(1, 4), t])
 
-            reference_table = Table(
-                reference_table_rows,
-                colWidths=[10 * mm, 32 * mm, 20 * mm, 24 * mm, 44 * mm, 22 * mm, 28 * mm],
-                repeatRows=1,
-            )
-            reference_table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), mint),
-                        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fbfd")]),
-                        ("BOX", (0, 0), (-1, -1), 0.8, border_color),
-                        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#eef3f7")),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 7),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-                        ("TOPPADDING", (0, 0), (-1, -1), 6),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ]
-                )
-            )
-            story.extend([Spacer(1, 5), reference_table])
+        elif title == "Volumes":
+            rl_rows = [
+                [Paragraph(h, reference_header_style) for h in
+                 ("#", "Part number", "Revision level", "Qty / year", "Target price", "Currency", "Price source", "Delivery zone", "Delivery plant", "Country")]
+            ]
+            for row in rl_volumes_rows:
+                rl_rows.append([
+                    Paragraph(escape(row["index"]), reference_value_style),
+                    _make_ref_cell(row["part_number"]),
+                    _make_ref_cell(row["revision_level"]),
+                    _make_ref_cell(row["quantity"]),
+                    _make_ref_cell(row["target_price"]),
+                    _make_ref_cell(row["currency"]),
+                    _make_ref_cell(row["price_source"]),
+                    _make_ref_cell(row["delivery_zone"]),
+                    _make_ref_cell(row["plant"]),
+                    _make_ref_cell(row["country"]),
+                ])
+            if len(rl_rows) > 1:
+                # 8+23+13+25+21+14+20+20+18+18 = 180mm (matches section header width)
+                t = Table(rl_rows, colWidths=[8*mm, 23*mm, 13*mm, 25*mm, 21*mm, 14*mm, 20*mm, 20*mm, 18*mm, 18*mm], repeatRows=1)
+                t.setStyle(_ref_table_style)
+                story.extend([Spacer(1, 4), t])
 
-        story.extend([Spacer(1, 10)])
+        else:
+            field_rows = []
+            for label, keys in fields:
+                display_value = _get_field_display_value(label, keys, data)
+                value_style = field_empty_style if display_value == "-" else field_value_style
+                field_rows.append([
+                    Paragraph(escape(label.upper()), field_label_style),
+                    Paragraph(_paragraph_html(display_value), value_style),
+                ])
+            body = Table(field_rows, colWidths=[56 * mm, 124 * mm])
+            body.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+                ("BOX", (0, 0), (-1, -1), 0.8, border_color),
+                ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#eef3f7")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]))
+            story.append(body)
+
+        story.append(Spacer(1, 10))
 
     note = Table(
         [[Paragraph("<b>Note:</b> Empty fields are displayed as &mdash;. This document is generated automatically from the RFQ system and does not constitute a contractual commitment.", note_style)]],
@@ -1185,29 +1182,33 @@ def _render_field_group(
     data: dict[str, Any],
     index: int,
     *,
-    product_rows: list[dict[str, str]] | None = None,
+    products_info_rows: list[dict[str, str]] | None = None,
+    volumes_rows_data: list[dict[str, str]] | None = None,
 ) -> str:
     accent, head_bg, num_bg, num_color = SECTION_ACCENTS[index % len(SECTION_ACCENTS)]
     section_number = index + 1
-    rows: list[str] = []
-    extra_body = ""
-
-    for label, keys in fields:
-        display_value = _get_field_display_value(label, keys, data, product_rows=product_rows)
-        is_empty = display_value == "-"
-        cell_class = "value-empty" if is_empty else "value"
-        cell_content = "&mdash;" if is_empty else _format_html_value(display_value)
-        rows.append(
-            f'<tr>'
-            f'<td class="label">{escape(label)}</td>'
-            f'<td class="{cell_class}">{cell_content}</td>'
-            f'</tr>'
-        )
-
-    if index == 0 and product_rows:
-        extra_body = _render_product_reference_table_html(product_rows)
-
     border_color = accent + "33"
+
+    if title == "Products":
+        rows_data = products_info_rows if products_info_rows is not None else _build_products_info_rows(data)
+        section_body = f'<div class="section-body">{_render_products_info_table_html(rows_data)}</div>'
+    elif title == "Volumes":
+        rows_data_v = volumes_rows_data if volumes_rows_data is not None else _build_volumes_rows(data)
+        section_body = f'<div class="section-body">{_render_volumes_table_html(rows_data_v)}</div>'
+    else:
+        rows: list[str] = []
+        for label, keys in fields:
+            display_value = _get_field_display_value(label, keys, data)
+            is_empty = display_value == "-"
+            cell_class = "value-empty" if is_empty else "value"
+            cell_content = "&mdash;" if is_empty else _format_html_value(display_value)
+            rows.append(
+                f'<tr>'
+                f'<td class="label">{escape(label)}</td>'
+                f'<td class="{cell_class}">{cell_content}</td>'
+                f'</tr>'
+            )
+        section_body = f'<div class="section-body"><table class="fields">{"".join(rows)}</table></div>'
 
     return f"""
     <div class="section">
@@ -1218,10 +1219,7 @@ def _render_field_group(
           <h2>{escape(title)}</h2>
         </div>
       </div>
-      <div class="section-body">
-        <table class="fields">{''.join(rows)}</table>
-        {extra_body}
-      </div>
+      {section_body}
     </div>
     """
 
@@ -1251,6 +1249,9 @@ def _render_product_reference_table_html(product_rows: list[dict[str, str]]) -> 
             f"<td>{escape(row['target_price_display'])}</td>"
             f"<td>{escape(row['price_source'])}</td>"
             f"<td>{escape(row['target_to_display'])}</td>"
+            f"<td>{escape(row.get('delivery_zone', '-'))}</td>"
+            f"<td>{escape(row.get('plant', '-'))}</td>"
+            f"<td>{escape(row.get('country', '-'))}</td>"
             "</tr>"
         )
         for row in product_rows
@@ -1268,11 +1269,70 @@ def _render_product_reference_table_html(product_rows: list[dict[str, str]]) -> 
           <th>Target price</th>
           <th>Price source</th>
           <th>Target TO</th>
+          <th>Delivery Zone</th>
+          <th>Plant</th>
+          <th>Country</th>
         </tr>
       </thead>
       <tbody>{table_rows}</tbody>
     </table>
     """
+
+
+def _render_products_info_table_html(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return '<p style="font-style:italic;color:#b8c9d6;font-size:10pt;margin:6pt 0;">No products recorded.</p>'
+    table_rows = "".join(
+        f"<tr>"
+        f'<td class="reference-index">{escape(row["index"])}</td>'
+        f"<td>{escape(row['product'])}</td>"
+        f"<td>{escape(row['product_line'])}</td>"
+        f"<td>{escape(row['costing_data'])}</td>"
+        f"<td>{escape(row['application'])}</td>"
+        f"<td>{escape(row['part_number'])}</td>"
+        f"<td>{escape(row['sop_year'])}</td>"
+        f"</tr>"
+        for row in rows
+    )
+    return (
+        '<table class="reference-table">'
+        "<thead><tr>"
+        "<th>#</th><th>Product</th><th>Product line</th><th>Costing data</th>"
+        "<th>Application</th><th>Part number</th><th>SOP year</th>"
+        "</tr></thead>"
+        f"<tbody>{table_rows}</tbody>"
+        "</table>"
+    )
+
+
+def _render_volumes_table_html(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return '<p style="font-style:italic;color:#b8c9d6;font-size:10pt;margin:6pt 0;">No volumes data recorded.</p>'
+    table_rows = "".join(
+        f"<tr>"
+        f'<td class="reference-index">{escape(row["index"])}</td>'
+        f"<td>{escape(row['part_number'])}</td>"
+        f"<td>{escape(row['revision_level'])}</td>"
+        f"<td>{escape(row['quantity'])}</td>"
+        f"<td>{escape(row['target_price'])}</td>"
+        f"<td>{escape(row['currency'])}</td>"
+        f"<td>{escape(row['price_source'])}</td>"
+        f"<td>{escape(row['delivery_zone'])}</td>"
+        f"<td>{escape(row['plant'])}</td>"
+        f"<td>{escape(row['country'])}</td>"
+        f"</tr>"
+        for row in rows
+    )
+    return (
+        '<table class="reference-table">'
+        "<thead><tr>"
+        "<th>#</th><th>Part number</th><th>Revision level</th><th>Qty / year</th>"
+        "<th>Target price</th><th>Currency</th><th>Price source</th>"
+        "<th>Delivery zone</th><th>Delivery plant</th><th>Country</th>"
+        "</tr></thead>"
+        f"<tbody>{table_rows}</tbody>"
+        "</table>"
+    )
 
 
 def _render_logo_html() -> str:
@@ -1346,10 +1406,116 @@ def _format_target_price_display(data: dict[str, Any]) -> str:
         eur_rate=_derive_eur_rate(data, shared_currency),
     )
 
+def _build_products_info_rows(data: dict[str, Any]) -> list[dict[str, str]]:
+    """Rows for the Products table: product name, line, application, part number, costing data, SOP year."""
+    products = data.get("products")
+    if not isinstance(products, list):
+        return []
+    rows: list[dict[str, str]] = []
+    for index, product in enumerate(products, start=1):
+        if not isinstance(product, dict):
+            continue
+        rows.append({
+            "index": str(index),
+            "product": _pick_first_value(product, ("product", "product_name", "productName")),
+            "product_line": _pick_first_value(
+                product,
+                ("product_line", "product_line_acronym", "productLine", "productLineAcronym"),
+            ),
+            "application": (
+                _pick_first_value(product, ("application",))
+                or _pick_first_value(data, ("application",))
+            ),
+            "part_number": _pick_first_value(product, ("part_number", "partNumber", "customer_pn")),
+            "costing_data": (
+                _pick_first_value(product, ("costing_data", "costingData"))
+                or _pick_first_value(data, ("costing_data", "costingData"))
+            ),
+            "sop_year": _pick_first_value(product, ("sop", "sop_year", "sopYear")),
+        })
+    return rows
+
+
+def _build_volumes_rows(data: dict[str, Any]) -> list[dict[str, str]]:
+    """Rows for the Volumes table: per-product quantities, prices, and delivery info."""
+    products = data.get("products")
+    if not isinstance(products, list):
+        return []
+    volumes_list = data.get("volumes")
+    if not isinstance(volumes_list, list):
+        volumes_list = []
+    shared_currency = _resolve_shared_product_currency(data)
+    rows: list[dict[str, str]] = []
+    for index, product in enumerate(products, start=1):
+        if not isinstance(product, dict):
+            continue
+        volume = (
+            volumes_list[index - 1]
+            if index - 1 < len(volumes_list) and isinstance(volumes_list[index - 1], dict)
+            else {}
+        )
+        yearly_volumes: dict[str, Any] = volume.get("volumes") or {}
+        if yearly_volumes and isinstance(yearly_volumes, dict):
+            total_qty = sum(v for v in yearly_volumes.values() if isinstance(v, (int, float)))
+            if len(yearly_volumes) == 1:
+                year_key = next(iter(yearly_volumes))
+                quantity_display = f"{_format_numeric_display(total_qty)} ({year_key})"
+            else:
+                quantity_display = "\n".join(
+                    f"{k}: {_format_numeric_display(v)}" for k, v in sorted(yearly_volumes.items())
+                )
+        else:
+            qty_raw = _pick_first_raw_value(
+                product, ("quantity", "qty", "annual_volume", "annualVolume")
+            )
+            quantity_display = _format_numeric_display(qty_raw)
+        target_price_raw = (
+            volume.get("target_price")
+            if volume.get("target_price") is not None
+            else _pick_first_raw_value(product, ("target_price", "targetPrice", "price"))
+        )
+        row_currency = (
+            _stringify_value(
+                _pick_first_raw_value(
+                    product,
+                    ("currency", "target_price_currency", "targetPriceCurrency"),
+                )
+            ).strip().upper()
+            or shared_currency
+        )
+        price_source_raw = (
+            volume.get("price_source")
+            if volume.get("price_source") is not None
+            else _pick_first_raw_value(
+                product,
+                ("target_price_is_estimated", "targetPriceIsEstimated", "price_source"),
+            )
+        )
+        rows.append({
+            "index": str(index),
+            "part_number": _pick_first_value(product, ("part_number", "partNumber", "customer_pn")),
+            "revision_level": _pick_first_value(
+                product, ("revision_level", "revisionLevel", "revision")
+            ),
+            "quantity": quantity_display,
+            "target_price": _format_currency_amount_display(target_price_raw, row_currency),
+            "currency": row_currency or "-",
+            "price_source": _format_price_source_display(price_source_raw),
+            "delivery_zone": _stringify_value(volume.get("delivery_zone")) or "-",
+            "plant": _stringify_value(volume.get("plant")) or "-",
+            "country": _stringify_value(volume.get("country")) or "-",
+        })
+    return rows
+
+
 def _build_product_reference_rows(data: dict[str, Any]) -> list[dict[str, str]]:
     products = data.get("products")
     if not isinstance(products, list):
         return []
+
+    volumes_list = data.get("volumes")
+    if not isinstance(volumes_list, list):
+        volumes_list = []
 
     shared_currency = _resolve_shared_product_currency(data)
     eur_rate = _derive_eur_rate(data, shared_currency)
@@ -1358,25 +1524,45 @@ def _build_product_reference_rows(data: dict[str, Any]) -> list[dict[str, str]]:
         if not isinstance(product, dict):
             continue
 
-        quantity_raw = _pick_first_raw_value(
-            product,
-            ("quantity", "qty", "annual_volume", "annualVolume", "qty_per_year", "qtyPerYear"),
-        )
-        target_price_raw = _pick_first_raw_value(product, ("target_price", "targetPrice", "price"))
+        volume = volumes_list[index - 1] if index - 1 < len(volumes_list) and isinstance(volumes_list[index - 1], dict) else {}
+
+        # Qty: prefer yearly breakdown from volumes[i].volumes dict; fallback to products[i].quantity
+        yearly_volumes: dict[str, Any] = volume.get("volumes") or {}
+        if yearly_volumes and isinstance(yearly_volumes, dict):
+            total_qty = sum(v for v in yearly_volumes.values() if isinstance(v, (int, float)))
+            if len(yearly_volumes) == 1:
+                year_key = next(iter(yearly_volumes))
+                quantity_display = f"{_format_numeric_display(total_qty)} ({year_key})"
+            else:
+                lines = " / ".join(f"{k}: {_format_numeric_display(v)}" for k, v in sorted(yearly_volumes.items()))
+                quantity_display = lines
+            quantity_number = total_qty
+        else:
+            quantity_raw = _pick_first_raw_value(
+                product,
+                ("quantity", "qty", "annual_volume", "annualVolume", "qty_per_year", "qtyPerYear"),
+            )
+            quantity_display = _format_numeric_display(quantity_raw)
+            quantity_number = _coerce_float_value(quantity_raw)
+
+        # Target price: prefer volumes[i].target_price, fallback to products[i].target_price
+        target_price_raw = volume.get("target_price") if volume.get("target_price") is not None else _pick_first_raw_value(product, ("target_price", "targetPrice", "price"))
+
         row_currency = _stringify_value(
             _pick_first_raw_value(
                 product,
                 ("currency", "target_price_currency", "targetPriceCurrency", "target_currency", "targetCurrency"),
             )
         ).strip().upper() or shared_currency
-        estimated_value = _pick_first_raw_value(
+
+        # Price source: prefer volumes[i].price_source (already a string), fallback to products[i].target_price_is_estimated
+        price_source_raw = volume.get("price_source") if volume.get("price_source") is not None else _pick_first_raw_value(
             product,
             ("target_price_is_estimated", "targetPriceIsEstimated", "price_source", "priceSource"),
         )
-        target_to_raw = _pick_first_raw_value(product, ("target_to", "targetTo", "turnover"))
 
-        quantity_number = _coerce_float_value(quantity_raw)
         target_price_number = _coerce_float_value(target_price_raw)
+        target_to_raw = _pick_first_raw_value(product, ("target_to", "targetTo", "turnover"))
         if target_to_raw is None and quantity_number is not None and target_price_number is not None:
             target_to_raw = quantity_number * target_price_number
 
@@ -1385,7 +1571,7 @@ def _build_product_reference_rows(data: dict[str, Any]) -> list[dict[str, str]]:
             row_currency,
             eur_rate=eur_rate if row_currency == shared_currency else None,
         )
-        price_source_display = _format_price_source_display(estimated_value)
+        price_source_display = _format_price_source_display(price_source_raw)
         target_to_display = _format_dual_currency_turnover_display(
             target_to_raw,
             row_currency,
@@ -1397,11 +1583,14 @@ def _build_product_reference_rows(data: dict[str, Any]) -> list[dict[str, str]]:
                 "index": str(index),
                 "part_number": _pick_first_value(product, ("part_number", "partNumber", "customer_pn", "customerPn")),
                 "revision_level": _pick_first_value(product, ("revision_level", "revisionLevel", "revision")),
-                "quantity": _format_numeric_display(quantity_raw),
+                "quantity": quantity_display,
                 "target_price_display": target_price_display,
                 "price_source": price_source_display,
                 "target_price_summary": target_price_display,
                 "target_to_display": target_to_display,
+                "delivery_zone": _stringify_value(volume.get("delivery_zone")) or "-",
+                "plant": _stringify_value(volume.get("plant")) or "-",
+                "country": _stringify_value(volume.get("country")) or "-",
             }
         )
 
@@ -1606,10 +1795,15 @@ def _format_target_to_display(value: Any, currency: str | None) -> str:
 def _format_price_source_display(value: Any) -> str:
     if value is None:
         return "-"
-    text = _stringify_value(value)
+    text = _stringify_value(value).strip()
     if not text:
         return "-"
-    return "Estimated" if _coerce_bool(value) else "Official customer price"
+    lower = text.lower()
+    if lower == "estimated" or lower == "true" or lower == "1" or lower == "yes":
+        return "Estimated"
+    if lower in ("official customer price", "official", "false", "0", "no"):
+        return "Official Customer Price"
+    return text
 
 
 def _coerce_bool(value: Any) -> bool:

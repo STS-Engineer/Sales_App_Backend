@@ -21,6 +21,7 @@ from app.routers.chat import (
 
 def _build_base_rfq_state():
     return {
+        "automotive_type": "Automotive",
         "customer_name": "Nidec",
         "application": "Traction motor",
         "product_name": "Brush Holder",
