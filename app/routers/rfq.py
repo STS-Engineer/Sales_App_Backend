@@ -76,6 +76,8 @@ from app.services.potential import (
     sync_potential_to_rfq_data,
 )
 from app.services.notifications import (
+    EMAIL_BEGIN_FEASIBILITY,
+    EMAIL_BEGIN_PRICING,
     EMAIL_BOM_READY,
     EMAIL_COSTING_APPROVED,
     EMAIL_COSTING_ENTRY,
@@ -93,6 +95,7 @@ from app.services.notifications import (
 from app.services.offer_preparation_store import get_offer_preparation_data_snapshot
 from app.services.routing import (
     get_assigned_product_line_acronyms,
+    resolve_product_line_context,
     resolve_product_line_role_assignments_multi,
     resolve_product_line_role_emails,
 )
@@ -751,7 +754,7 @@ def _append_revision_note(existing_notes: str | None, prefix: str, detail: str |
 def _default_costing_file_state() -> dict[str, str | None]:
     return {
         "file_status": COSTING_FILE_STATUS_PENDING,
-        "file_note": None,
+        "file_note": "",
         "action_by": None,
         "action_at": None,
         "file": None,
@@ -763,13 +766,12 @@ def _build_costing_file_entry(
     *,
     file_role: str,
     phase: RfqSubStatus,
-    note: str | None = None,
+    note: str = "",
 ) -> dict[str, str]:
     entry = dict(file_meta or {})
     entry["file_role"] = file_role
     entry["phase"] = phase.value
-    if note is not None:
-        entry["note"] = note
+    entry["note"] = note
     return entry
 
 
@@ -806,7 +808,7 @@ def _effective_costing_file_state(rfq: Rfq) -> dict:
         latest_file = legacy_files[-1]
         return {
             "file_status": COSTING_FILE_STATUS_UPLOADED,
-            "file_note": state.get("file_note"),
+            "file_note": state.get("file_note") or "",
             "action_by": latest_file.get("uploaded_by") or latest_file.get("owner"),
             "action_at": latest_file.get("uploaded_at") or latest_file.get("updated_at"),
             "file": latest_file,
@@ -1158,13 +1160,12 @@ async def _submit_rfq_for_validation_internal(
 ) -> dict[str, str | bool]:
     _assert_can_edit_rfq_phase(current_user, rfq)
 
-    if (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ):
+    is_resubmission = (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ)
+
+    if is_resubmission and rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Only RFQs in RFQ/NEW_RFQ can be submitted for validation. "
-                f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
-            ),
+            detail="This RFQ is already pending validation.",
         )
     if _is_potential(rfq):
         raise HTTPException(
@@ -1212,6 +1213,15 @@ async def _submit_rfq_for_validation_internal(
             db, acronym, revision
         )
     systematic_rfq_id = str(extracted_data["systematic_rfq_id"])
+    extracted_data.pop("post_validation_edit_unlocked", None)
+    if is_resubmission:
+        extracted_data["is_resubmission"] = True
+        extracted_data["resubmission_restore_phase"] = rfq.phase.value
+        extracted_data["resubmission_restore_sub_status"] = rfq.sub_status.value
+    else:
+        extracted_data.pop("is_resubmission", None)
+        extracted_data.pop("resubmission_restore_phase", None)
+        extracted_data.pop("resubmission_restore_sub_status", None)
     rfq.rfq_data = extracted_data
     rfq.zone_manager_email = zone_manager_email
     rfq.product_line_acronym = acronym
@@ -1219,11 +1229,12 @@ async def _submit_rfq_for_validation_internal(
     rfq.rejected_at = None
     _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION)
 
+    action_label = "re-submitted for validation" if is_resubmission else "submitted for validation"
     await log_action(
         db,
         rfq.rfq_id,
         (
-            "RFQ submitted for validation -> "
+            f"RFQ {action_label} -> "
             f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_FOR_VALIDATION.value}"
         ),
         current_user.email,
@@ -1257,6 +1268,7 @@ async def _submit_rfq_for_validation_internal(
         "zone_manager_email": zone_manager_email,
         "validator_role": validator_role,
         "email_sent": email_sent,
+        "is_resubmission": is_resubmission,
     }
 
 
@@ -1855,14 +1867,6 @@ async def download_costing_template(
             detail=f"Unable to generate the costing template PDF. {exc}",
         ) from exc
 
-    # Upload to SharePoint 08-Costing Output in background — never blocks or fails the download
-    background_tasks.add_task(
-        upload_feasibility_to_sharepoint,
-        rfq_id=rfq_id,
-        filename=filename,
-        file_bytes=document_pdf,
-    )
-
     return Response(
         content=document_pdf,
         media_type="application/pdf",
@@ -1955,6 +1959,21 @@ async def submit_rfq_for_validation(
         current_user=current_user,
         send_email=True,
     )
+
+
+@router.post("/{rfq_id}/unlock-chat", response_model=RfqOut)
+async def unlock_chat_for_edit(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    _assert_can_edit_rfq_phase(current_user, rfq)
+    next_data = dict(rfq.rfq_data or {})
+    next_data["post_validation_edit_unlocked"] = True
+    rfq.rfq_data = next_data
+    await db.commit()
+    return await _get_rfq_or_404(db, rfq_id)
 
 
 @router.post("/{rfq_id}/request-revision", response_model=RfqOut)
@@ -2189,7 +2208,22 @@ async def validate_rfq(
         )
 
     if body.approved:
-        _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.FEASIBILITY)
+        _pre_commit_data = dict(rfq.rfq_data or {})
+        _is_resubmission_approval = bool(_pre_commit_data.get("is_resubmission"))
+        if _is_resubmission_approval:
+            _restore_phase_val = _pre_commit_data.get("resubmission_restore_phase")
+            _restore_sub_val = _pre_commit_data.get("resubmission_restore_sub_status")
+            try:
+                _restore_phase = RfqPhase(_restore_phase_val) if _restore_phase_val else RfqPhase.COSTING
+                _restore_sub = RfqSubStatus(_restore_sub_val) if _restore_sub_val else RfqSubStatus.FEASIBILITY
+            except ValueError:
+                _restore_phase = RfqPhase.COSTING
+                _restore_sub = RfqSubStatus.FEASIBILITY
+            _set_phase_sub_status(rfq, _restore_phase, _restore_sub)
+            _log_approval_target = f"{_restore_phase.value}/{_restore_sub.value}"
+        else:
+            _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.FEASIBILITY)
+            _log_approval_target = f"{RfqPhase.COSTING.value}/{RfqSubStatus.FEASIBILITY.value}"
         rfq.approved_at = datetime.datetime.now(datetime.timezone.utc)
         rfq.rejected_at = None
         rfq.rejection_reason = None
@@ -2197,7 +2231,7 @@ async def validate_rfq(
         await log_action(
             db,
             rfq_id,
-            f"Validator approved -> {RfqPhase.COSTING.value}/{RfqSubStatus.FEASIBILITY.value}",
+            f"Validator approved -> {_log_approval_target}",
             current_user.email,
         )
     else:
@@ -2223,16 +2257,31 @@ async def validate_rfq(
         )
         if route_entries:
             refreshed_data = dict(refreshed_rfq.rfq_data or {})
+            is_resubmission_approval = bool(refreshed_data.get("is_resubmission"))
+            systematic_rfq_id_val = str(refreshed_data.get("systematic_rfq_id") or "")
+            acronym_val = str(refreshed_rfq.product_line_acronym or "")
+            rfq_link_val = _build_rfq_link(refreshed_rfq.rfq_id)
             notified_costing: list[str] = []
             for route_entry in route_entries:
                 recipient_email = str(route_entry.get("email") or "")
-                if emails.send_costing_entry_email(
-                    recipient_email,
-                    str(route_entry.get("product_line") or ""),
-                    str(route_entry.get("acronym") or ""),
-                    str(refreshed_data.get("systematic_rfq_id") or ""),
-                    _build_rfq_link(refreshed_rfq.rfq_id),
-                ):
+                if not recipient_email:
+                    continue
+                if is_resubmission_approval:
+                    sent = emails.send_rfq_revalidation_notification(
+                        recipient_email,
+                        systematic_rfq_id_val,
+                        acronym_val,
+                        rfq_link_val,
+                    )
+                else:
+                    sent = emails.send_costing_entry_email(
+                        recipient_email,
+                        str(route_entry.get("product_line") or ""),
+                        str(route_entry.get("acronym") or ""),
+                        systematic_rfq_id_val,
+                        rfq_link_val,
+                    )
+                if sent:
                     notified_costing.append(recipient_email)
             if notified_costing:
                 refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
@@ -2242,6 +2291,13 @@ async def validate_rfq(
                     recipients=notified_costing,
                     email_type=EMAIL_COSTING_ENTRY,
                 )
+            if is_resubmission_approval:
+                next_data = dict(refreshed_rfq.rfq_data or {})
+                next_data.pop("is_resubmission", None)
+                next_data.pop("resubmission_restore_phase", None)
+                next_data.pop("resubmission_restore_sub_status", None)
+                refreshed_rfq.rfq_data = next_data
+                await db.commit()
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
 
@@ -2291,7 +2347,9 @@ async def costing_review(
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
-
+    # Capture before logging so we can detect first-time approval for the R&D email
+    was_already_approved = await _has_costing_review_approval(db, rfq_id)
+ 
     if body.scope:
         await log_action(
             db,
@@ -2336,34 +2394,89 @@ async def costing_review(
         )
 
     if body.scope:
-        route_entries = await resolve_product_line_role_assignments_multi(
-            db,
-            role=ProductLineRoutingRole.COSTING,
-            acronym=refreshed_rfq.product_line_acronym,
-        )
-        if route_entries:
-            notified_handoff: list[str] = []
-            for route_entry in route_entries:
-                recipient_email = str(route_entry.get("email") or "")
-                if emails.send_costing_handoff_email(
-                    recipient_email,
-                    str(route_entry.get("product_line") or ""),
-                    str(route_entry.get("acronym") or ""),
-                    systematic_rfq_id,
-                    rfq_link,
-                ):
-                    notified_handoff.append(recipient_email)
-            if notified_handoff:
-                refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
-                await record_notification_sent(
-                    db,
-                    rfq_id=refreshed_rfq.rfq_id,
-                    recipients=notified_handoff,
-                    email_type=EMAIL_COSTING_HANDOFF,
-                )
+        # Disabled: costing handoff email replaced by Begin Pricing email
+        # (sent later when FEASIBILITY advances to PRICING via the advance endpoint)
+        # route_entries = await resolve_product_line_role_assignments_multi(
+        #     db,
+        #     role=ProductLineRoutingRole.COSTING,
+        #     acronym=refreshed_rfq.product_line_acronym,
+        # )
+        # if route_entries:
+        #     notified_handoff: list[str] = []
+        #     for route_entry in route_entries:
+        #         recipient_email = str(route_entry.get("email") or "")
+        #         if emails.send_costing_handoff_email(
+        #             recipient_email,
+        #             str(route_entry.get("product_line") or ""),
+        #             str(route_entry.get("acronym") or ""),
+        #             systematic_rfq_id,
+        #             rfq_link,
+        #         ):
+        #             notified_handoff.append(recipient_email)
+        #     if notified_handoff:
+        #         refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
+        #         await record_notification_sent(
+        #             db,
+        #             rfq_id=refreshed_rfq.rfq_id,
+        #             recipients=notified_handoff,
+        #             email_type=EMAIL_COSTING_HANDOFF,
+        #         )
         if str(refreshed_rfq.product_line_acronym or "").upper() == "ASS":
             await sync_rfq_to_assembly(refreshed_rfq)
-
+ 
+        # Send Begin Feasibility email to R&D — only on first approval transition
+        if not was_already_approved:
+            logger.debug(
+                "DEBUG FEASIBILITY EMAIL: approval detected for rfq_id=%s", rfq_id
+            )
+            rnd_emails = await resolve_product_line_role_emails(
+                db,
+                role=ProductLineRoutingRole.RND,
+                acronym=refreshed_rfq.product_line_acronym,
+            )
+            pl_context = await resolve_product_line_context(
+                db, acronym=refreshed_rfq.product_line_acronym
+            )
+            product_line_display = (
+                pl_context["product_line"]
+                if pl_context
+                else str(refreshed_rfq.product_line_acronym or "")
+            )
+            logger.debug(
+                "DEBUG FEASIBILITY EMAIL: product_line resolved='%s'",
+                product_line_display,
+            )
+            if rnd_emails:
+                logger.debug(
+                    "DEBUG FEASIBILITY EMAIL: R&D recipients count=%d", len(rnd_emails)
+                )
+                notified_rnd: list[str] = []
+                for rnd_email in rnd_emails:
+                    if emails.send_begin_feasibility_rnd_email(
+                        rnd_email,
+                        systematic_rfq_id,
+                        product_line_display,
+                        rfq_link,
+                    ):
+                        notified_rnd.append(rnd_email)
+                if notified_rnd:
+                    logger.debug(
+                        "DEBUG FEASIBILITY EMAIL: Begin Feasibility email scheduled"
+                    )
+                    await record_notification_sent(
+                        db,
+                        rfq_id=refreshed_rfq.rfq_id,
+                        recipients=notified_rnd,
+                        email_type=EMAIL_BEGIN_FEASIBILITY,
+                    )
+            else:
+                logger.warning(
+                    "WARNING FEASIBILITY EMAIL: no R&D recipients found for"
+                    " product_line='%s', rfq_id=%s",
+                    product_line_display,
+                    rfq_id,
+                )
+ 
     await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
@@ -2373,7 +2486,7 @@ async def submit_costing_file_action(
     rfq_id: str,
     background_tasks: BackgroundTasks,
     action: str = Form(...),
-    note: str = Form(...),
+    note: str = Form(""),
     feasibility_status: str = Form(...),
     file: UploadFile | None = File(default=None),
     db: AsyncSession = Depends(get_db),
@@ -2581,26 +2694,27 @@ async def upload_pricing_bom_file(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
     refreshed_data = dict(refreshed_rfq.rfq_data or {})
-    costing_emails_bom = await resolve_product_line_role_emails(
-        db,
-        role=ProductLineRoutingRole.COSTING,
-        acronym=refreshed_rfq.product_line_acronym,
-    )
-    notified_bom: list[str] = []
-    for recipient_email in costing_emails_bom:
-        if emails.send_bom_ready_email(
-            recipient_email,
-            str(refreshed_data.get("systematic_rfq_id") or ""),
-            _build_rfq_link(refreshed_rfq.rfq_id),
-        ):
-            notified_bom.append(recipient_email)
-    if notified_bom:
-        await record_notification_sent(
-            db,
-            rfq_id=refreshed_rfq.rfq_id,
-            recipients=notified_bom,
-            email_type=EMAIL_BOM_READY,
-        )
+    # BOM email disabled
+    # costing_emails_bom = await resolve_product_line_role_emails(
+    #     db,
+    #     role=ProductLineRoutingRole.COSTING,
+    #     acronym=refreshed_rfq.product_line_acronym,
+    # )
+    # notified_bom: list[str] = []
+    # for recipient_email in costing_emails_bom:
+    #     if emails.send_bom_ready_email(
+    #         recipient_email,
+    #         str(refreshed_data.get("systematic_rfq_id") or ""),
+    #         _build_rfq_link(refreshed_rfq.rfq_id),
+    #     ):
+    #         notified_bom.append(recipient_email)
+    # if notified_bom:
+    #     await record_notification_sent(
+    #         db,
+    #         rfq_id=refreshed_rfq.rfq_id,
+    #         recipients=notified_bom,
+    #         email_type=EMAIL_BOM_READY,
+    #     )
     await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
 
@@ -2627,27 +2741,27 @@ async def upload_pricing_final_price_file(
         )
 
     pricing_workflow_state = _effective_pricing_workflow_state(rfq)
-    workflow_state = pricing_workflow_state.get("workflow_state")
-    if workflow_state not in {
-        PRICING_WORKFLOW_STATE_BOM_UPLOADED,
-        PRICING_WORKFLOW_STATE_REJECTED,
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Final price uploads are only allowed after the BOM upload or after a rejection."
-            ),
-        )
-
-    has_pricing_bom_file = isinstance(pricing_workflow_state.get("bom_file"), dict)
-    if not has_pricing_bom_file:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Upload the costing file with BOM data before adding the final price file."
-            ),
-        )
-
+    # BOM validations disabled - final price can be uploaded without BOM
+    # workflow_state = pricing_workflow_state.get("workflow_state")
+    # if workflow_state not in {
+    #     PRICING_WORKFLOW_STATE_BOM_UPLOADED,
+    #     PRICING_WORKFLOW_STATE_REJECTED,
+    # }:
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail=(
+    #             "Final price uploads are only allowed after the BOM upload or after a rejection."
+    #         ),
+    #     )
+ 
+    # has_pricing_bom_file = isinstance(pricing_workflow_state.get("bom_file"), dict)
+    # if not has_pricing_bom_file:
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail=(
+    #             "Upload the costing file with BOM data before adding the final price file."
+    #         ),
+    #     )
     trimmed_note = str(note or "").strip()
     if not trimmed_note:
         raise HTTPException(status_code=400, detail="note is required.")
@@ -2968,4 +3082,58 @@ async def advance_status(
         current_user.email,
     )
     await db.commit()
+    # Send Begin Pricing email to Costing when FEASIBILITY advances to PRICING
+    if target_state == (RfqPhase.COSTING, RfqSubStatus.PRICING):
+        rfq_data_adv = dict(rfq.rfq_data or {})
+        systematic_rfq_id_adv = str(rfq_data_adv.get("systematic_rfq_id") or "")
+        rfq_link_adv = _build_rfq_link(rfq_id)
+        costing_emails_adv = await resolve_product_line_role_emails(
+            db,
+            role=ProductLineRoutingRole.COSTING,
+            acronym=rfq.product_line_acronym,
+        )
+        pl_context_adv = await resolve_product_line_context(
+            db, acronym=rfq.product_line_acronym
+        )
+        product_line_display_adv = (
+            pl_context_adv["product_line"]
+            if pl_context_adv
+            else str(rfq.product_line_acronym or "")
+        )
+        logger.debug(
+            "DEBUG BEGIN PRICING EMAIL: feasibility completed for rfq_id=%s", rfq_id
+        )
+        logger.debug(
+            "DEBUG BEGIN PRICING EMAIL: product_line=%s role_filter=Costing recipients_count=%d",
+            product_line_display_adv,
+            len(costing_emails_adv),
+        )
+        if costing_emails_adv:
+            notified_pricing: list[str] = []
+            for costing_email in costing_emails_adv:
+                if emails.send_begin_pricing_email(
+                    costing_email,
+                    systematic_rfq_id_adv,
+                    product_line_display_adv,
+                    rfq_link_adv,
+                ):
+                    notified_pricing.append(costing_email)
+            if notified_pricing:
+                logger.debug(
+                    "DEBUG BEGIN PRICING EMAIL: pricing_url=%s", rfq_link_adv
+                )
+                await record_notification_sent(
+                    db,
+                    rfq_id=rfq_id,
+                    recipients=notified_pricing,
+                    email_type=EMAIL_BEGIN_PRICING,
+                )
+        else:
+            logger.warning(
+                "WARNING BEGIN PRICING EMAIL: no Costing recipients found for"
+                " product_line='%s', rfq_id=%s",
+                product_line_display_adv,
+                rfq_id,
+            )
+ 
     return await _get_rfq_or_404(db, rfq_id)

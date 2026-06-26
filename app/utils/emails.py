@@ -460,28 +460,123 @@ def send_costing_handoff_email(
 ) -> bool:
     rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
     rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
-    subject = f"Begin Feasibility And BOM{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    subject = f"Costing Reception Approved{_rfq_id_subject_suffix(systematic_rfq_id)}"
     text_body = f"""Hello,
 
-Please begin the Feasibility and BOM work for this RFQ.
+The reception review for this RFQ has been approved. Please proceed with the feasibility work.
 
 {rfq_id_line}Product line: {product_line} ({product_code})
 
-Please download the templates and open the RFQ here:
+Please download the template and open the RFQ here:
 {rfq_link}
 """
     html_body = _build_base_html(
-        "Begin Feasibility And BOM",
+        "Costing Reception Approved",
         f"""
           <p>Hello,</p>
-          <p>Please begin the <strong>Feasibility and BOM</strong> work for this RFQ.</p>
+          <p>The reception review for this RFQ has been <strong>approved</strong>.</p>
+          <p>Please proceed with the feasibility work.</p>
           <ul>
             {rfq_id_html}
             <li><strong>Product line:</strong> {product_line} ({product_code})</li>
           </ul>
           <div style="margin: 30px 0; text-align: center;">
             <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
-              Open RFQ And Download Templates
+              Open RFQ And Download Template
+            </a>
+          </div>
+        """,
+    )
+    return send_email(recipient_email, subject, text_body, html_body=html_body)
+
+
+def send_begin_pricing_email(
+    recipient_email: str,
+    systematic_rfq_id: str,
+    product_line: str,
+    rfq_link: str,
+) -> bool:
+    normalized_rfq_id = _normalize_systematic_rfq_id(systematic_rfq_id)
+    subject = (
+        f"Begin Pricing - RFQ {normalized_rfq_id}"
+        if normalized_rfq_id
+        else "Begin Pricing"
+    )
+    rfq_id_line = _rfq_id_text_block(normalized_rfq_id)
+    rfq_id_html = _rfq_id_html_item(normalized_rfq_id)
+    text_body = f"""Hello,
+
+The feasibility step for RFQ {normalized_rfq_id} has been completed.
+
+Please begin the pricing analysis for Product Line: {product_line}.
+
+{rfq_id_line}Product Line: {product_line}
+Next step: Pricing
+
+Open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "Begin Pricing",
+        f"""
+          <p>Hello,</p>
+          <p>The feasibility step for this RFQ has been <strong>completed</strong>.</p>
+          <p>Please begin the pricing analysis.</p>
+          <ul>
+            {rfq_id_html}
+            <li><strong>Product Line:</strong> {product_line}</li>
+            <li><strong>Next step:</strong> Pricing</li>
+          </ul>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Begin Pricing
+            </a>
+          </div>
+        """,
+    )
+    return send_email(recipient_email, subject, text_body, html_body=html_body)
+
+
+def send_begin_feasibility_rnd_email(
+    recipient_email: str,
+    systematic_rfq_id: str,
+    product_line: str,
+    rfq_link: str,
+) -> bool:
+    normalized_rfq_id = _normalize_systematic_rfq_id(systematic_rfq_id)
+    subject = (
+        f"Begin Feasibility - RFQ {normalized_rfq_id}"
+        if normalized_rfq_id
+        else "Begin Feasibility"
+    )
+    rfq_id_line = _rfq_id_text_block(normalized_rfq_id)
+    rfq_id_html = _rfq_id_html_item(normalized_rfq_id)
+    text_body = f"""Hello,
+
+The reception review for RFQ {normalized_rfq_id} has been approved.
+
+Please begin the feasibility analysis for Product Line: {product_line}.
+
+{rfq_id_line}Product Line: {product_line}
+Decision: Approved
+
+You can open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "Begin Feasibility",
+        f"""
+          <p>Hello,</p>
+          <p>The reception review for this RFQ has been <strong>approved</strong>.</p>
+          <p>Please begin the feasibility analysis.</p>
+          <ul>
+            {rfq_id_html}
+            <li><strong>Product Line:</strong> {product_line}</li>
+            <li><strong>Decision:</strong> Approved</li>
+          </ul>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
             </a>
           </div>
         """,
@@ -821,6 +916,49 @@ Open the RFQ here:
               Open RFQ
             </a>
           </div>
+        """,
+    )
+    return send_email(recipient_email, subject, text_body, html_body=html_body)
+
+def send_rfq_revalidation_notification(
+    recipient_email: str,
+    systematic_rfq_id: str,
+    acronym: str,
+    rfq_link: str,
+) -> bool:
+    rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
+    rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    subject = f"RFQ Updated — Re-validation Required{_rfq_id_subject_suffix(systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+An RFQ that is currently in your costing queue has been updated by the sales team and has been re-submitted for validation.
+
+{rfq_id_line}Product line: {acronym}
+
+Once the validator approves the updated RFQ, please review the changes and update your costing accordingly.
+
+Open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "RFQ Updated — Re-validation Required",
+        f"""
+          <p>Hello,</p>
+          <p>An RFQ that is currently in your costing queue has been <strong>updated by the sales team</strong> and has been re-submitted for validation.</p>
+          <ul>
+            {rfq_id_html}
+            <li><strong>Product line:</strong> {acronym}</li>
+          </ul>
+          <p>Once the validator approves the updated RFQ, please review the changes and update your costing accordingly.</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #d97706; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+          <p style="font-size: 14px; color: #666666;">
+            If the button above does not work, copy and paste this link into your browser:<br>
+            <a href="{rfq_link}" style="color: #2563eb; word-break: break-all;">{rfq_link}</a>
+          </p>
         """,
     )
     return send_email(recipient_email, subject, text_body, html_body=html_body)

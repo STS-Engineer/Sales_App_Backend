@@ -67,9 +67,16 @@ LANGUAGE_SELECTION_RULE = (
 STATE_RECONCILIATION_DIRECTIVE = """
 CRITICAL DIRECTIVE - PROACTIVE DATA EXTRACTION:
 1. You are an automated data extraction engine. You MUST NOT wait for the user to ask you to save or update the form.
-2. STATE RECONCILIATION: On every single turn, you must compare the recent conversation history against the 'CURRENT RFQ DATABASE STATE'. 
+2. STATE RECONCILIATION: On every single turn, you must compare the recent conversation history against the 'CURRENT RFQ DATABASE STATE'.
 3. If the user has provided ANY valid information in the recent chat history that is currently missing or empty in the database state, your IMMEDIATE and ONLY next action MUST be to call the 'updateFormFields' tool to save that data.
 4. Do not acknowledge the user's answer in text without ALSO calling the tool in the same response.
+5. MULTI-FIELD EXTRACTION RULE: Even in step-by-step mode, if the user's message contains information for multiple fields simultaneously (for example: "the customer is Renault, project is ABC, delivery in Europe"), you MUST extract ALL recognizable fields from that single message and save them ALL in ONE single `updateFormFields` call. Never discard or ignore data the user voluntarily provides just because you only asked about one field. After saving all extracted fields, ask only the next unanswered required field (one question).
+6. CONTEXTUAL ANSWER MAPPING RULE: When you asked a question about a specific field in the previous turn and the user's latest message is a reply to that question — even if the reply is short, informal, indirect, or in a different language — you MUST interpret it as the answer to exactly that field. Examples:
+   - You asked "What is the customer name?" → user replies "it's Renault" → save customer_name = "Renault"
+   - You asked "What is the SOP year?" → user replies "2027" or "pour 2027" → save sop_year = 2027
+   - You asked "What is the application?" → user replies "automotive seals" → save application = "automotive seals"
+   - You asked "What is the delivery zone?" → user replies "Europe" → save delivery_zone = "europe"
+   Never fail to save an answer just because it is brief, lacks an explicit field label, or is phrased conversationally. The CONTEXT of your last question is the key to mapping the answer to the right field.
 """
 ENGLISH_INITIAL_GREETING_TEMPLATE = (
     "Hello, I'm your sales assistant. I'll be helping you fill your RFQ. "
@@ -584,6 +591,10 @@ _INTERNAL_TOOL_NAME_RE = re.compile(
 )
 _PRODUCTS_VOLUME_FIELD_RE = re.compile(
     r"^products\[\d+\]\.(quantity|target_price|currency|target_price_is_estimated)$"
+)
+# Matches Products-table fields that must be completed before moving to Volumes.
+_PRODUCTS_TABLE_FIELD_RE = re.compile(
+    r"^products\[\d+\]\.(part_number|application|sop|revision_level)$"
 )
 
 # Matches any variant of the submit-for-validation question the LLM may generate.
@@ -1150,6 +1161,13 @@ def _is_revision_requested(rfq: Rfq) -> bool:
     )
 
 
+def _rfq_is_submittable(rfq: Rfq) -> bool:
+    return rfq.sub_status not in (
+        RfqSubStatus.PENDING_FOR_VALIDATION,
+        RfqSubStatus.REVISION_REQUESTED,
+    )
+
+
 def _is_self_revision_note(revision_notes: str | None) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", " ", str(revision_notes or "").casefold()).strip()
     return normalized == "self update initiated by assigned validator"
@@ -1373,14 +1391,30 @@ def _build_missing_fields_prompt(
         f"- Missing fields YOU MUST GENERATE/CALCULATE yourself: {_format_field_list_for_prompt(ai_keys_missing)}"
     )
     if next_field_to_ask and _PRODUCTS_VOLUME_FIELD_RE.match(next_field_to_ask):
-        prompt += (
-            "\n- MULTI-PRODUCT COLLECTION CHECK: The next missing field is a Volumes table "
-            "field (quantity / target_price / currency / target_price_is_estimated). "
-            "These fields are collected in Step 5, NOT here. "
-            "Per the MULTI-PRODUCT COLLECTION RULE, before moving to Step 5 you MUST first "
-            "ask: \"Would you like to add another product to this request?\" "
-            "Only after the user says NO should you proceed to collect volumes."
-        )
+        # Check whether any Products-table fields are still missing (per-row or top-level).
+        _PRODUCTS_TABLE_TOP_LEVEL = {"rfq_files", "sop_year", "application"}
+        incomplete_products_table_fields = [
+            f for f in user_keys_missing
+            if _PRODUCTS_TABLE_FIELD_RE.match(f) or f in _PRODUCTS_TABLE_TOP_LEVEL
+        ]
+        if incomplete_products_table_fields:
+            prompt += (
+                "\n- MULTI-PRODUCT COMPLETION BLOCKER: Before collecting any Volumes table data, "
+                "you MUST finish the Products table for EVERY product row. "
+                "The following Products table fields are still missing: "
+                f"{incomplete_products_table_fields}. "
+                "Complete these fields first, product by product in order (Product 1 before Product 2, etc.), "
+                "BEFORE asking any Volumes questions (quantity / target_price / currency / delivery zone, etc.)."
+            )
+        else:
+            prompt += (
+                "\n- MULTI-PRODUCT COLLECTION CHECK: The next missing field is a Volumes table "
+                "field (quantity / target_price / currency / target_price_is_estimated). "
+                "These fields are collected in Step 5, NOT here. "
+                "Per the MULTI-PRODUCT COLLECTION RULE, before moving to Step 5 you MUST first "
+                "ask: \"Would you like to add another product to this request?\" "
+                "Only after the user says NO should you proceed to collect volumes."
+            )
     elif next_field_to_ask:
         prompt += (
             "\n- Next field to ask for: "
@@ -2130,7 +2164,7 @@ def _rewrite_submit_prompt_to_modify_prompt_if_needed(
     chat_mode: str,
     extracted_data: dict,
 ) -> str:
-    if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+    if not _rfq_is_submittable(rfq):
         return text
 
     current_step, missing_fields = _get_current_step_and_missing_fields(
@@ -2366,7 +2400,7 @@ def _build_user_facing_fallback_text(
             extracted_data=extracted_data,
         )
 
-    if not missing_fields and current_step >= 4:
+    if not missing_fields and current_step >= 4 and _rfq_is_submittable(rfq):
         return _build_modify_before_submission_question()
 
     return "Please send your last answer again."
@@ -3313,6 +3347,7 @@ class ChatRequest(BaseModel):
     chat_mode: str = "rfq"
     document_type: RfqDocumentType | None = None
     is_edit: bool = False
+    is_post_validation_edit: bool = False
 
 
 class ChatEditRequest(BaseModel):
@@ -3423,15 +3458,27 @@ CRITICAL OPTIONAL FIELD RULE: The ONLY optional RFQ fields are `costing_data`, `
 COSTING DATA RULE: `costing_data` is a special optional field and is NEVER in the missing fields list. After saving product_name + product_line_acronym, you MUST call retrieveProducts again with the exact product name to fetch its costing parameters. If the response contains costing parameters for that product, present them to the user as a bullet list exactly as they appear in the database response (one parameter per bullet, using the exact name from the DB). Start your message with: "**Please provide the Costing Data values for this product (optional).**" and on the next line add: "*(Optional — type **skip** to leave it blank.)*". Then list the parameters as bullets. If the user types "skip" or provides no useful answer, call updateFormFields with costing_data = "_" and move on. If the user provides partial values, save only the answered ones combined into a single string. If the response contains NO costing parameters for that product, immediately call updateFormFields with costing_data = "_" and move on without asking the user anything about costing data. CRITICAL: do NOT output any message to the user in this case — no "No costing parameters", no "setting costing_data", no explanation whatsoever. The save must be completely invisible to the user; simply proceed to the next question.
 CRITICAL OUTPUT RULES:
 1. NO SCRATCHPAD MATH: NEVER output your internal calculations, scratchpad math, or reasoning steps (e.g., '0.009 * 500 = 4.5'). If you calculate a value, do it silently. Your final output must ONLY contain the conversational response.
-2. NO GUESSING/PROPOSITIONS: When asking the user for missing information, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples, parenthetical hints, or sample values for open-ended fields.
+2. NO GUESSING/PROPOSITIONS: When asking the user for missing information for the FIRST TIME, ask the question directly and STOP. Do NOT suggest potential answers, guess their intent, or provide examples, parenthetical hints, or sample values for open-ended fields.
 3. ENUM EXCEPTION: You may ONLY provide options if the field is strictly constrained to a predefined list already instructed by the system.
+
+PRE-QUESTION STATE CHECK RULE: Before formulating ANY question, you MUST re-read the CURRENT RFQ DATABASE STATE in this exact turn. If the field you were about to ask is already present and non-empty in that state, skip it entirely and move to the next missing field. Never ask a question whose answer is already stored — not even to "confirm" it. This check applies every single turn, especially after tool calls.
+
+INTELLIGENT RETRY RULE: When the user's reply to a question is invalid, unrecognizable, incomplete, or does not match the expected format or allowed values for that field:
+- Do NOT simply repeat the identical question verbatim. That is unhelpful.
+- Instead: briefly acknowledge what the user provided (one clause), explain in one short sentence why it cannot be accepted (wrong format, not in the allowed list, missing required detail, etc.), then re-ask the question with a concise contextual hint about what is expected.
+- For ENUM fields (fixed list like delivery zone, automotive type, packaging type): remind the user of the exact allowed options.
+- For DATE fields: remind the user of the expected YYYY-MM-DD format and give a brief example ("e.g. 2026-09-01").
+- For NUMBER fields (prices, volumes): clarify that only a numeric value is expected, with the unit or currency if relevant.
+- For FREE-TEXT fields (project name, application, strategic note): rephrase the question slightly differently to guide the user toward a useful answer without suggesting specific content.
+- Keep the retry message SHORT — one line of context + the question. Do not lecture the user.
+- EXCEPTION: If the user typed "skip", "N/A", or "none" for an OPTIONAL field, that IS a valid answer — accept it, save "_", and move on. Never retry an optional field after a skip signal.
 STRICT CHECKLIST RULE: You MUST ONLY ask the user for the exact fields explicitly listed in the injected MISSING_FIELDS_PROMPT. You are strictly FORBIDDEN from inventing new questions, fields, or requirements (such as "delivery city", "full address", or "zip code"). If it is not in the missing fields array, do not ask for it. EXCEPTION — costing_data: this field is NEVER in MISSING_FIELDS_PROMPT. It must be handled exclusively via rule #6 after retrieveProducts: ask only if the product's database record contains costing parameters; otherwise set it to "_" silently.
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
 CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
 INTERNAL CONTACT RULE: Any email address from the `avocarbon.com` domain is an internal Avocarbon address, not a customer contact. You MUST NEVER save an `@avocarbon.com` email, or the associated person details, into `contact_email`, `contact_name`, `contact_role`, or `contact_phone`. If the user provides internal Avocarbon personal details, ignore them for customer contact purposes and keep asking for the external customer contact instead.
 
 DUAL-MODE RULE:
-- If the user wants step-by-step guidance, ask only the next focused question for the current step.
+- If the user wants step-by-step guidance, ask only the next focused question for the current step. HOWEVER, if the user's reply contains data for multiple fields beyond the one you asked (e.g. "customer is Renault, project is ABC, delivery in France"), you MUST extract ALL recognizable fields from that message and save them ALL in ONE `updateFormFields` call — then ask only the single next unanswered question. Never discard voluntarily provided data.
 - CRITICAL MENU RULE: If the user replies with "1" or "2" to choose between step-by-step guidance and paragraph mode, treat that reply only as a guidance-mode command. Do NOT call `updateFormFields` for that reply, and do NOT save it into any RFQ field.
 - CRITICAL RULE FOR PARAGRAPH MODE: If the user selects Option 2 (or says they want to provide a paragraph), your immediate response MUST be extremely brief. You must ONLY say: 'Great! Please paste your entire RFQ paragraph below.' DO NOT list the required fields. DO NOT provide examples. Wait for the user to paste the text.
 - AFTER THE USER PASTES THE PARAGRAPH:
@@ -3450,7 +3497,7 @@ You are a state-aware assistant. Your progress is determined by the 'CURRENT RFQ
 CRITICAL TOOL RULE: You must NEVER output raw JSON, tool call arguments, or data payloads in your conversational text responses. Tool calls must be made silently in the background. Your text responses to the user must be clean, natural language only.
 CRITICAL WORKFLOW RULES:
 1. Before asking anything, inspect BOTH the CURRENT RFQ DATABASE STATE and the injected MISSING_FIELDS_PROMPT.
-2. NEVER ask again for any field that is already populated in the CURRENT RFQ DATABASE STATE. This is especially critical after a Potential opportunity is promoted to formal RFQ because shared fields may already be prefilled.
+2. NEVER ask again for any field that is already populated in the CURRENT RFQ DATABASE STATE. This is especially critical after a Potential opportunity is promoted to formal RFQ because shared fields may already be prefilled. This rule has ZERO exceptions: if a field appears in the database state with a non-empty value, do not ask for it, do not confirm it, do not mention it — simply treat it as done and move on to the next missing field.
 3. If `automotive_type` is already filled, DO NOT ask for it again. If it is missing, ask exactly `Is this request related to the Automotive or Non Automotive market?` and present exactly these numbered options on separate lines: `1. Automotive` and `2. Non automotive`. As soon as the user answers, you MUST immediately call `updateFormFields` with `automotive_type` using the exact canonical value `Automotive` or `Non automotive`.
 4. If `customer_name` is already filled, DO NOT ask 'Who is the Customer?' again. If it is missing, ask it and INSTANTLY call checkGroupeExistence. If the tool returns that the customer does NOT exist, DO NOT ask them to verify or try again. Simply reply: 'New customer. It will be added to the database later after we get the contact details,' and IMMEDIATELY proceed to the next unresolved field.
 5. Ask 'What is the Project name?' ONLY IF `project_name` is currently missing. As soon as the user answers, call `updateFormFields` with {"fields_to_update": {"project_name": "<user_answer>"}}.
@@ -3471,7 +3518,8 @@ The system maps products to one of these strict acronyms:
 When the user selects a Product, you MUST save BOTH `product_name` and the authorized `product_line_acronym` in a SINGLE `updateFormFields` call: {"fields_to_update": {"product_name": "<chosen_product>", "product_line_acronym": "<ACRONYM>"}}. NEVER save one without the other.
 NEVER ask the user for the Product Line acronym. It is always automatically mapped from the product name.
 
-You must only ask ONE question at a time. Do not overwhelm the user. Wait for their answer before moving to the next.
+CRITICAL ONE-QUESTION-PER-TURN RULE: You MUST ask exactly ONE question per message. Never combine two or more questions in a single response — even if multiple fields are missing, pick only the next one in the strict imposed order and ask solely that question. Never skip ahead, never reorder questions, never mix questions from different steps. Wait for the user's answer before moving to the next question. Violating this rule by asking multiple questions in one message is strictly forbidden.
+IMPORTANT CLARIFICATION: This rule governs how many questions you ASK, not how many fields you EXTRACT. If the user's reply contains data for multiple fields at once, you MUST still extract and save ALL of them in one `updateFormFields` call — then ask only the single next unanswered question.
 You must strictly follow this exact sequential checklist to collect data. Do not move to the next step until the current one is completed.
 STRICT SEQUENCE RULE: You MUST complete all fields in Step 1, then all fields in Step 2, and then all fields in Step 3 BEFORE you are allowed to calculate Turnover, assign a validator, or ask the user to submit in Step 4. Do not jump to Step 4 if Step 3 fields are empty.
 
@@ -3529,6 +3577,12 @@ MULTI-PRODUCT SUPPORT:
 - If the user provides yearly volumes, row-level target prices, delivery zones, plants, countries, or price-source details per part, save them in `volumes` as a separate array aligned by product-row index. Each `volumes[*]` row may contain `target_price`, `price_source`, `delivery_zone`, `plant`, `country`, and `volumes` as a year-to-quantity object. Never invent missing years or quantities.
 - When the user says no, move on to step 5 (Volumes table).
 - You MUST NOT jump to validator routing or ask for submission while Volumes table fields (target_price, currency, quantity) are still missing for any product row. These are collected in step 5.
+CRITICAL MULTI-PRODUCT COMPLETION RULE: If the user provides data for multiple products in a single message (e.g. "Product 1: Seals, PN 001; Product 2: Brushes, PN 002"), you MUST:
+  1. Extract and save ALL provided product data immediately via `updateFormFields`.
+  2. BEFORE moving to step 5 (Volumes table), go through EVERY product row one by one and verify it has ALL 5 required fields: Product Name + Application + Part Number + Drawing (rfq_files) + SOP Year.
+  3. If ANY product row is missing any of these 5 fields, ask the missing question for that product first (one question at a time, product by product, in order: Product 1 first, then Product 2, etc.).
+  4. Only once EVERY product row has all 5 required fields complete, THEN move to step 5 (Volumes table).
+  NEVER jump to Volumes questions while any product row still has missing Products table fields. The Products table must be 100% complete for all products before Volumes questions begin.
 CRITICAL PRODUCT COMPLETENESS RULE: For the Products table section (step 4), a product row is complete once it has a `product`, `product_line`, `application`, `part_number`, a drawing (`rfq_files`), and a `sop_year`. Quantity, Target Price, Currency, Price Source, Delivery Zone, Delivery Plant, and Country are Volumes table fields — collect them in step 5, NOT here. Only `revision_level` and `costing_data` are optional row-level fields. NEVER skip any of the 6 volumes fields for any product row.
 CRITICAL DELIVERY ZONE RULE: Whenever you save `delivery_zone`, it MUST be exactly one of these 7 approved strings: "Europe", "Africa", "India", "North America", "South America", "China / South Pacific", "Korea / Japan". If the user gives a country or city, convert it to the approved zone before calling `updateFormFields`. If you cannot confidently map it, ask a clarification question instead of guessing. If you ask the user to choose a zone, you MUST present only those exact 7 options.
 
@@ -3673,8 +3727,12 @@ FORMATTING RULE: EVERY question you ask the user MUST be written in bold (**ques
 TOOL USAGE RULE: NEVER print raw tool call JSON or placeholders such as {"toolcallid": "...", "toolname": "..."} to the user. You must use real tool calling only.
 CRITICAL TOOL RULE: NEVER type raw JSON or 'tooluses' blocks into your standard text response. When you need to call a tool, you MUST use the native function calling mechanism.
 
+PRE-QUESTION STATE CHECK RULE: Before formulating ANY question, re-read the CURRENT RFQ DATABASE STATE in this exact turn. If the field you were about to ask is already present and non-empty in that state, skip it entirely and move to the next missing field. NEVER ask a question whose answer is already stored — not even to "confirm" it. ZERO exceptions.
+
+INTELLIGENT RETRY RULE: When the user's reply is invalid, unrecognizable, or does not match the expected format for a field — do NOT repeat the identical question verbatim. Instead: briefly acknowledge what was understood and why it cannot be accepted (one short sentence), then re-ask with a concise contextual hint about what is expected. Keep the retry message SHORT (one line of context + the question). EXCEPTION: "skip", "N/A", or "none" for an optional field is always valid — accept it, save "_", and move on.
+
 DUAL-MODE RULE:
-- If the user wants step-by-step guidance, ask only the next focused question for the current step.
+- If the user wants step-by-step guidance, ask only the next focused question for the current step. HOWEVER, if the user's reply contains data for multiple fields beyond the one you asked (e.g. "customer is Renault, project is ABC"), you MUST extract ALL recognizable fields from that message and save them ALL in ONE `updateFormFields` call — then ask only the single next unanswered question. Never discard voluntarily provided data.
 - CRITICAL MENU RULE: If the user replies with "1" or "2" to choose between step-by-step guidance and paragraph mode, treat that reply only as a guidance-mode command. Do NOT call `updateFormFields` for that reply, and do NOT save it into any RFQ field.
 - CRITICAL RULE FOR PARAGRAPH MODE: If the user selects Option 2 (or says they want to provide a paragraph), your immediate response MUST be extremely brief. You must ONLY say: 'Great! Please paste your entire RFQ paragraph below.' DO NOT list the required fields. DO NOT provide examples. Wait for the user to paste the text.
 - AFTER THE USER PASTES THE PARAGRAPH:
@@ -3969,15 +4027,20 @@ async def handle_chat(
     history.append({"role": "user", "content": req.message})
 
     last_assistant_text = _get_last_visible_assistant_text(history[:-1])
-    pre_submission_modify_turn = _is_pre_submission_modify_turn(
+    _allow_pre_submission_flow = _rfq_is_submittable(rfq) and chat_mode != "potential"
+    pre_submission_modify_turn = _allow_pre_submission_flow and _is_pre_submission_modify_turn(
         last_assistant_text=last_assistant_text,
         user_message=req.message,
         rfq=rfq,
     )
-    pending_pre_submission_action = _match_pre_submission_prompt_action(
-        last_assistant_text=last_assistant_text,
-        user_message=req.message,
-        rfq=rfq,
+    pending_pre_submission_action = (
+        _match_pre_submission_prompt_action(
+            last_assistant_text=last_assistant_text,
+            user_message=req.message,
+            rfq=rfq,
+        )
+        if _allow_pre_submission_flow
+        else None
     )
 
     if pending_pre_submission_action and chat_mode != "potential":
@@ -4093,12 +4156,48 @@ async def handle_chat(
                     successful_submit_payload,
                 )
             else:
-                final_text = _build_user_facing_fallback_text(
-                    rfq=rfq,
-                    chat_mode=chat_mode,
-                    extracted_data=extracted_data,
-                    user_message=req.message,
+                # submitValidation failed — only fall back to the field-question flow
+                # if there are genuinely user-fillable missing fields.  Falling back to
+                # _build_user_facing_fallback_text unconditionally causes a loop: when
+                # all user fields are complete (step >= 4) it returns the "would you like
+                # to modify?" question, making the chatbot cycle endlessly.
+                _sv_failed_payload = None
+                for _sv_tm in tool_messages:
+                    if isinstance(_sv_tm, dict) and _sv_tm.get("name") == "submitValidation":
+                        _sv_failed_payload = _try_load_json_payload(
+                            _sv_tm.get("content") or ""
+                        )
+                        break
+                _sv_missing = (
+                    list(_sv_failed_payload.get("missing_fields") or [])
+                    if isinstance(_sv_failed_payload, dict)
+                    else []
                 )
+                _sv_user_missing = [
+                    f for f in _sv_missing
+                    if f not in AI_GENERATED_STEP_FIELDS
+                    and f not in SYSTEM_MANAGED_CHAT_FIELDS
+                ]
+                if _sv_user_missing:
+                    final_text = _build_user_facing_fallback_text(
+                        rfq=rfq,
+                        chat_mode=chat_mode,
+                        extracted_data=extracted_data,
+                        user_message=req.message,
+                    )
+                else:
+                    _sv_error = (
+                        str(_sv_failed_payload.get("error") or "").strip()
+                        if isinstance(_sv_failed_payload, dict)
+                        else ""
+                    )
+                    if _sv_error:
+                        final_text = f"Unable to submit: {_sv_error}"
+                    else:
+                        final_text = (
+                            "I was unable to submit this RFQ at this time. "
+                            "Please try again or contact support if the issue persists."
+                        )
             final_text = _append_assistant_text_if_new(history, final_text)
 
             if not await _persist_chat_state(
@@ -4151,6 +4250,40 @@ async def handle_chat(
             return ChatResponse(response=_build_chat_persistence_error_text())
         return ChatResponse(response=final_text)
 
+    # If the RFQ has moved beyond the submission stage but the chat history still
+    # contains a stale submit/modify question, intercept yes/no responses before
+    # they reach the LLM — the LLM would otherwise generate the modify question
+    # again (it infers context from history regardless of system-prompt guards).
+    if not _allow_pre_submission_flow and chat_mode != "potential":
+        _stale_action = _match_pre_submission_prompt_action(
+            last_assistant_text=last_assistant_text,
+            user_message=req.message,
+            rfq=rfq,
+        )
+        if _stale_action:
+            document_label = _document_type_label(rfq.document_type)
+            if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+                _stale_msg = (
+                    f"Your {document_label} is currently awaiting validator approval. "
+                    "No further submission actions are available until the validator responds."
+                )
+            else:
+                _stale_msg = (
+                    f"This {document_label} has a revision requested. "
+                    "Please update the requested fields, then use the **Submit Updates** "
+                    "button at the top of the page."
+                )
+            final_text = _append_assistant_text_if_new(history, _stale_msg)
+            if not await _persist_chat_state(
+                db=db,
+                rfq=rfq,
+                extracted_data=extracted_data,
+                history=history,
+                chat_mode=chat_mode,
+            ):
+                return ChatResponse(response=_build_chat_persistence_error_text())
+            return ChatResponse(response=final_text)
+
     # Keep a wider short-term history window so the assistant can reconcile
     # recent user answers against the current RFQ state before responding.
     start_idx = max(0, len(history) - 20)
@@ -4194,7 +4327,7 @@ async def handle_chat(
         else:
             document_type_prompt = "This document is an RFQ. Use RFQ in user-facing wording."
 
-        if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+        if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION and not req.is_post_validation_edit:
             missing_fields_prompt = (
                 f"The {document_type_value} has been successfully submitted and is currently "
                 "PENDING_FOR_VALIDATION. The data entry phase is completely finished. "
@@ -4230,7 +4363,8 @@ async def handle_chat(
 19. If the request document_type is POTENTIAL, do NOT ask for detailed NEW_RFQ fields until it is converted to RFQ.
 20. If the RFQ sub_status is REVISION_REQUESTED, treat it as an editable RFQ revision workflow. Do NOT claim the user must return to NEW_RFQ before updates can be saved.
 21. If the RFQ sub_status is REVISION_REQUESTED, you may update already-populated fields when the user wants to revise them.
-22. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen."""
+22. If the RFQ sub_status is REVISION_REQUESTED, NEVER use any tool to submit or change RFQ status. When the user says the updates are finished, instruct them to click the physical "Submit Updates" button at the top of their screen.
+23. CONTEXTUAL ANSWER MAPPING: Look at the LAST question you asked (in the previous assistant turn). The user's current message is most likely a direct answer to that question. Use the context of your last question as the primary key to identify which field the user is answering — even if the reply is a single word, a number, informal phrasing, or in a different language. Map it to that field and call `updateFormFields` immediately. Never fail to save data just because the user did not explicitly name the field."""
 
         if (
             paragraph_mode_active
@@ -4244,9 +4378,31 @@ async def handle_chat(
                 "MUST be the RFQ files upload question before any later remaining Step 1 field."
             )
 
+        if not _allow_pre_submission_flow and chat_mode != "potential":
+            if rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+                mode_specific_instructions += (
+                    f"\n24. VALIDATION LOCK: This {document_type_value} is currently "
+                    "awaiting validator approval (PENDING_FOR_VALIDATION). STRICTLY FORBIDDEN:\n"
+                    "- Do NOT ask 'Would you like to update or modify any field before submission?'\n"
+                    "- Do NOT ask 'Do you want to submit this RFQ for validation?'\n"
+                    "- Do NOT call `submitValidation`.\n"
+                    "If the user asks about submission, tell them the RFQ is already waiting "
+                    "for the validator's response."
+                )
+            else:
+                mode_specific_instructions += (
+                    f"\n24. REVISION LOCK: This {document_type_value} has a revision requested. "
+                    "STRICTLY FORBIDDEN:\n"
+                    "- Do NOT ask 'Would you like to update or modify any field before submission?'\n"
+                    "- Do NOT ask 'Do you want to submit this RFQ for validation?'\n"
+                    "- Do NOT call `submitValidation`.\n"
+                    "When the user has finished updating, instruct them to click the "
+                    "'Submit Updates' button at the top of the page."
+                )
+
         if pre_submission_modify_turn and chat_mode != "potential":
             mode_specific_instructions += (
-                "\n24. PRE-SUBMISSION MODIFICATION MODE: The user is updating one or more "
+                "\n25. PRE-SUBMISSION MODIFICATION MODE: The user is updating one or more "
                 "already-existing fields before submission. You MUST ONLY extract and save "
                 "the field(s) explicitly mentioned in the user's latest message. Do NOT "
                 "resume the normal step-by-step checklist. Do NOT ask for downstream fields "
@@ -4255,7 +4411,7 @@ async def handle_chat(
 
         if req.is_edit and chat_mode != "potential":
             mode_specific_instructions += (
-                "\n25. MESSAGE EDIT MODE: The user has edited a previous message. The CURRENT "
+                "\n26. MESSAGE EDIT MODE: The user has edited a previous message. The CURRENT "
                 "RFQ DATABASE STATE already contains data saved from the original conversation, "
                 "including any product rows that were collected. "
                 "CRITICAL: Do NOT use `append_products: true` under any circumstances — it "
@@ -4266,6 +4422,21 @@ async def handle_chat(
                 "Count the existing products in the CURRENT RFQ DATABASE STATE to know the "
                 "current product count; do not add more rows than already exist unless the "
                 "user explicitly confirms they want to add a new product."
+            )
+
+        if req.is_post_validation_edit and chat_mode != "potential":
+            mode_specific_instructions += (
+                "\n27. POST_VALIDATION_EDIT_MODE: The user has unlocked this RFQ to update "
+                "specific fields after it entered validation or a later phase. Rules:\n"
+                "- ONLY save the field(s) the user explicitly mentions. Do NOT resume the "
+                "full step-by-step checklist or ask for unrelated missing fields.\n"
+                "- After saving ANY change: if `target_price` OR `quantity` (yearly quantities) "
+                "was modified for any product row, you MUST immediately call `retrieveZoneManager` "
+                "(do NOT pass `to_total` — the backend calculates it automatically) to recalculate "
+                "the TO Total and re-assign the correct validator.\n"
+                "- Do NOT change the RFQ phase, sub_status, or validation state.\n"
+                "- After saving, acknowledge what was updated in one short sentence. If turnover "
+                "was recalculated and/or the validator changed, mention it explicitly."
             )
 
         return f"""{base_system_prompt}
