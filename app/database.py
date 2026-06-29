@@ -69,6 +69,14 @@ async def get_db3() -> AsyncSession:
         yield session
 
 
+async def get_db3_optional():
+    try:
+        async with AsyncSessionLocal3() as session:
+            yield session
+    except Exception:
+        yield None
+
+
 async def get_db4() -> AsyncSession:
     if AsyncSessionLocal4 is None:
         raise HTTPException(status_code=503, detail="KPI database (DATABASE_URL4) is not configured.")

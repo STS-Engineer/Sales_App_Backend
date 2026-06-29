@@ -17,7 +17,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.config import settings
 from app.database_assembly import sync_rfq_to_assembly
-from app.database import get_db, get_db3, get_db4_optional
+from app.database import get_db, get_db3, get_db3_optional, get_db4_optional
 from app.middleware.auth import get_current_user, require_role
 from app.models.audit_log import AuditLog
 from app.models.contact import Contact
@@ -94,6 +94,7 @@ from app.services.notifications import (
 )
 from app.services.offer_preparation_store import get_offer_preparation_data_snapshot
 from app.services.routing import (
+    assign_validator,
     get_assigned_product_line_acronyms,
     resolve_product_line_context,
     resolve_product_line_role_assignments_multi,
@@ -1243,7 +1244,11 @@ async def _submit_rfq_for_validation_internal(
     await db.refresh(rfq)
 
     email_sent = False
-    if send_email:
+    creator_is_validator = (
+        (rfq.created_by_email or "").strip().lower()
+        == zone_manager_email.lower()
+    )
+    if send_email and not creator_is_validator:
         email_sent = emails.send_validation_email(
             zone_manager_email,
             systematic_rfq_id,
@@ -1276,7 +1281,7 @@ async def _submit_rfq_for_validation_internal(
 async def create_rfq(
     body: RfqCreateRequest | None = None,
     db: AsyncSession = Depends(get_db),
-    db3: AsyncSession = Depends(get_db3),
+    db3: AsyncSession | None = Depends(get_db3_optional),
     current_user: User = Depends(
         require_role(UserRole.COMMERCIAL, UserRole.OWNER, UserRole.ZONE_MANAGER)
     ),
@@ -1297,7 +1302,7 @@ async def create_rfq(
         document_type=document_type,
         phase=RfqPhase.RFQ,
         sub_status=initial_sub_status,
-        product_line_acronym=rfq_data.get("product_line_acronym"),
+        product_line_acronym=rfq_data.get("product_line_acronym") or None,
         zone_manager_email=zone_manager_email,
         created_by_email=current_user.email,
         rfq_data=rfq_data,
@@ -1314,7 +1319,7 @@ async def create_rfq(
     zone_manager_email = (
         rfq_data.get("zone_manager_email") or rfq_data.get("validator_email") or None
     )
-    rfq.product_line_acronym = rfq_data.get("product_line_acronym")
+    rfq.product_line_acronym = rfq_data.get("product_line_acronym") or None
     rfq.zone_manager_email = zone_manager_email
     rfq.rfq_data = rfq_data
     rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, rfq_data)
@@ -1329,7 +1334,7 @@ async def create_rfq(
 @router.get("/fx/eur-rate", response_model=RfqFxRateOut)
 async def get_rfq_eur_fx_rate(
     currency_code: str = Query(..., min_length=1),
-    db3: AsyncSession = Depends(get_db3),
+    db3: AsyncSession | None = Depends(get_db3_optional),
     current_user: User = Depends(get_current_user),
 ):
     del current_user
@@ -1352,42 +1357,54 @@ async def update_rfq_data(
     rfq_id: str,
     body: RfqDataUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    db3: AsyncSession = Depends(get_db3),
+    db3: AsyncSession | None = Depends(get_db3_optional),
     current_user: User = Depends(get_current_user),
 ):
-    rfq = await _get_rfq_or_404(db, rfq_id)
-    _assert_can_edit_base_rfq_data(current_user, rfq)
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    try:
+        rfq = await _get_rfq_or_404(db, rfq_id)
+        _assert_can_edit_base_rfq_data(current_user, rfq)
 
-    incoming_data = rfq_data_payload_to_dict(body.rfq_data)
-    incoming_data.pop("rfq_files", None)
-    next_data = dict(rfq.rfq_data or {})
-    next_data.update(incoming_data)
-    next_data = normalize_rfq_data_products(
-        next_data,
-        products_authoritative="products" in incoming_data,
-    )
-    next_data = await _sync_product_line_from_product_name(
-        db,
-        rfq,
-        next_data,
-        force="product_name" in incoming_data,
-    )
-    _raise_for_conflicting_product_currencies(next_data)
-    next_data = await _sync_rfq_product_derived_fields(next_data, db3=db3)
-    rfq.rfq_data = next_data
-
-    if "product_line_acronym" in incoming_data or "product_name" in incoming_data:
-        rfq.product_line_acronym = next_data.get("product_line_acronym")
-    if "zone_manager_email" in incoming_data or "validator_email" in incoming_data:
-        rfq.zone_manager_email = (
-            incoming_data.get("zone_manager_email")
-            or incoming_data.get("validator_email")
+        incoming_data = rfq_data_payload_to_dict(body.rfq_data)
+        incoming_data.pop("rfq_files", None)
+        next_data = dict(rfq.rfq_data or {})
+        next_data.update(incoming_data)
+        next_data = normalize_rfq_data_products(
+            next_data,
+            products_authoritative="products" in incoming_data,
         )
+        next_data = await _sync_product_line_from_product_name(
+            db,
+            rfq,
+            next_data,
+            force="product_name" in incoming_data,
+        )
+        _raise_for_conflicting_product_currencies(next_data)
+        next_data = await _sync_rfq_product_derived_fields(next_data, db3=db3)
+        rfq.rfq_data = next_data
 
-    rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, next_data)
+        if "product_line_acronym" in incoming_data or "product_name" in incoming_data:
+            rfq.product_line_acronym = next_data.get("product_line_acronym") or None
+        if "zone_manager_email" in incoming_data or "validator_email" in incoming_data:
+            rfq.zone_manager_email = (
+                incoming_data.get("zone_manager_email")
+                or incoming_data.get("validator_email")
+            )
 
-    await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+        rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, next_data)
+
+        await db.commit()
+        rfq_result = await _get_rfq_or_404(db, rfq_id)
+        # Validate inside try/except so any MissingGreenlet / ResponseValidationError
+        # is caught here rather than escaping to the generic 500 handler.
+        return RfqOut.model_validate(rfq_result, from_attributes=True)
+    except Exception as exc:
+        _log.exception("update_rfq_data failed for rfq_id=%s error=%s: %s", rfq_id, type(exc).__name__, exc)
+        from fastapi import HTTPException as _HTTPException
+        if isinstance(exc, _HTTPException):
+            raise
+        raise _HTTPException(status_code=500, detail=f"[{type(exc).__name__}] {str(exc)[:600]}")
 
 
 @router.post("/{rfq_id}/proceed-to-rfq", response_model=RfqOut)
@@ -1395,7 +1412,7 @@ async def proceed_to_rfq(
     rfq_id: str,
     body: ProceedToFormalRequest | None = None,
     db: AsyncSession = Depends(get_db),
-    db3: AsyncSession = Depends(get_db3),
+    db3: AsyncSession | None = Depends(get_db3_optional),
     current_user: User = Depends(get_current_user),
 ):
     request_body = body or ProceedToFormalRequest()
@@ -1959,6 +1976,83 @@ async def submit_rfq_for_validation(
         current_user=current_user,
         send_email=True,
     )
+
+
+@router.post("/{rfq_id}/assign-validator")
+async def assign_rfq_validator(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Compute and save the validator email for an RFQ based on product line, delivery zone, and TO total."""
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    extracted_data = normalize_rfq_data_products(rfq.rfq_data or {})
+
+    acronym = (extracted_data.get("product_line_acronym") or "").strip()
+    if not acronym:
+        raise HTTPException(status_code=400, detail="Product line acronym is missing.")
+
+    # Compute PTE (to_total in kEUR)
+    to_total = float(extracted_data.get("to_total") or 0)
+    if to_total <= 0:
+        products = extracted_data.get("products") or []
+        for p in products:
+            try:
+                qty = sum(float(v) for v in (p.get("volumes") or {}).values() if v)
+                price = float(p.get("target_price") or 0)
+                to_total += (qty * price) / 1000
+            except (TypeError, ValueError):
+                pass
+
+    # Resolve product_line name from acronym
+    pl_context = await resolve_product_line_context(db, acronym=acronym)
+    if not pl_context:
+        raise HTTPException(status_code=400, detail=f"Unknown product line acronym: {acronym}")
+    product_line_name = pl_context["product_line"]
+
+    # Delivery zone: take the first volume's zone or top-level
+    delivery_zone = (extracted_data.get("delivery_zone") or "").strip()
+    if not delivery_zone:
+        volumes = extracted_data.get("volumes") or []
+        for vol in volumes:
+            dz = (vol.get("delivery_zone") or "").strip()
+            if dz:
+                delivery_zone = dz
+                break
+
+    commercial_email = rfq.created_by_email or ""
+
+    try:
+        validator_email = await assign_validator(
+            product_line=product_line_name,
+            pte=to_total,
+            commercial_email=commercial_email,
+            db=db,
+            delivery_zone=delivery_zone or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Determine validator_role label
+    from app.services.routing import N1_VP_EMAIL, N0_CEO_EMAIL
+    if validator_email == commercial_email:
+        validator_role = "KAM"
+    elif validator_email in (N1_VP_EMAIL,):
+        validator_role = "VP Sales"
+    elif validator_email == N0_CEO_EMAIL:
+        validator_role = "CEO"
+    else:
+        validator_role = "Zone Manager"
+
+    # Persist to rfq_data
+    updated_data = dict(extracted_data)
+    updated_data["zone_manager_email"] = validator_email
+    updated_data["validator_role"] = validator_role
+    rfq.rfq_data = updated_data
+    rfq.zone_manager_email = validator_email
+    await db.commit()
+
+    return {"zone_manager_email": validator_email, "validator_role": validator_role}
 
 
 @router.post("/{rfq_id}/unlock-chat", response_model=RfqOut)

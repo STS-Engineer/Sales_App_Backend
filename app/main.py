@@ -85,7 +85,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
         cors_headers["Access-Control-Allow-Credentials"] = "true"
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error"},
+        content={"detail": f"[{type(exc).__name__}] {str(exc)[:400]}"},
         headers=cors_headers,
     )
 

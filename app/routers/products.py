@@ -1,3 +1,4 @@
+import httpx
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +8,8 @@ from app.models.validation_matrix import ValidationMatrix
 from app.schemas.products import ProductLineResponse, ProductListResponse
 
 router = APIRouter(tags=["products"])
+
+_PROD_URL = "https://rfq-api.azurewebsites.net"
 
 
 def _row_to_dict(row: ValidationMatrix) -> dict:
@@ -32,13 +35,51 @@ async def retrieve_products(
     """
     Returns all product lines. If `productName` is provided, filters by partial,
     case-insensitive match on the product_line name.
+    Falls back to the production catalog when the local DB has fewer than 10 products.
     """
     query = select(ValidationMatrix)
     if productName:
         query = query.where(ValidationMatrix.product_line.ilike(f"%{productName}%"))
     result = await db.execute(query)
     rows = result.scalars().all()
-    return ProductListResponse(products=[_row_to_dict(r) for r in rows])
+
+    # Build local acronym map (product_line → acronym)
+    local_acronym_map = {row.product_line: row.acronym for row in rows}
+
+    # Fetch from production catalog
+    try:
+        params = {"productName": productName} if productName else {}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{_PROD_URL}/api/products", params=params)
+        if resp.status_code == 200:
+            data = resp.json()
+            prod_items = data.get("products") if isinstance(data, dict) else None
+            if isinstance(prod_items, list) and prod_items:
+                # Enrich each item with the acronym from the local validation_matrix
+                enriched = []
+                seen = set()
+                for item in prod_items:
+                    name = item.get("product_name") or item.get("product_line") or ""
+                    if not name or name in seen:
+                        continue
+                    seen.add(name)
+                    pl = item.get("product_line", "")
+                    enriched.append({
+                        "product_name": name,
+                        "product_line": pl,
+                        "acronym": local_acronym_map.get(pl, ""),
+                        "costing_data": item.get("costing_data"),
+                    })
+                if enriched:
+                    return ProductListResponse(products=enriched)
+    except Exception:
+        pass
+
+    # Fallback: expose local product lines as product_name
+    return ProductListResponse(products=[
+        {**_row_to_dict(r), "product_name": r.product_line}
+        for r in rows
+    ])
 
 
 @router.get(

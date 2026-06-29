@@ -208,6 +208,18 @@ def _coerce_int_or_none(value: Any) -> int | None:
         return None
 
 
+def _coerce_sop_or_none(value: Any) -> str | None:
+    """Store SOP as a string, preserving date strings like '01/01/2027' unchanged."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text
+
+
 def _normalize_volume_price_source(value: Any) -> str | None:
     if value is None:
         return None
@@ -325,7 +337,7 @@ def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
             ),
         )
     )
-    sop = _coerce_int_or_none(
+    sop = _coerce_sop_or_none(
         _pick_first(
             item,
             (
@@ -589,7 +601,7 @@ def normalize_rfq_data_products(
                         normalized.get("ppap_date") or normalized.get("ppapDate")
                     )
                 if product.get("sop") is None:
-                    product["sop"] = _coerce_int_or_none(
+                    product["sop"] = _coerce_sop_or_none(
                         normalized.get("sop_year")
                         or normalized.get("sop")
                         or normalized.get("sopYear")
