@@ -414,7 +414,8 @@ def _user_has_plm(current_user: User) -> bool:
 
 
 def _can_edit_rfq_phase(current_user: User, rfq: Rfq) -> bool:
-    if current_user.role == UserRole.OWNER:
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if UserRole.OWNER.value in all_roles:
         return True
     if _is_costing_specialist_role(current_user):
         return False
@@ -425,7 +426,8 @@ def _can_edit_rfq_phase(current_user: User, rfq: Rfq) -> bool:
 
 
 def _can_edit_offer_phase(current_user: User, rfq: Rfq) -> bool:
-    if current_user.role == UserRole.OWNER:
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if UserRole.OWNER.value in all_roles:
         return True
     if _is_costing_specialist_role(current_user):
         return False
@@ -449,7 +451,11 @@ def _assert_can_edit_base_rfq_data(current_user: User, rfq: Rfq) -> None:
     if rfq.phase == RfqPhase.OFFER:
         _assert_can_edit_offer_phase(current_user, rfq)
         return
-    if current_user.role == UserRole.OWNER:
+    # For post-Offer phases: allow OWNER (primary or secondary) and the RFQ creator.
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if UserRole.OWNER.value in all_roles:
+        return
+    if _is_rfq_creator(current_user, rfq):
         return
     raise HTTPException(
         status_code=403,
@@ -1475,10 +1481,12 @@ async def upload_rfq_file(
 
     try:
         await file.seek(0)
+        content = await file.read()
+        file_size = len(content)
         container_client = _get_rfq_files_container_client()
         blob_client = container_client.get_blob_client(blob_name)
         blob_client.upload_blob(
-            file.file,
+            content,
             overwrite=False,
             content_settings=ContentSettings(
                 content_type=file.content_type or "application/octet-stream"
@@ -1501,6 +1509,7 @@ async def upload_rfq_file(
         "blob_url": blob_client.url,
         "blob_name": blob_name,
         "content_type": file.content_type or "application/octet-stream",
+        "size": file_size,
         "uploaded_by": current_user.email,
         "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
