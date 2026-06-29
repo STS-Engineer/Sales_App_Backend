@@ -6,10 +6,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text as sa_text
 
 logger = logging.getLogger(__name__)
 
 from app.config import settings
+from app.database import engine
+from app.models.user import UserRoleAssignment
 from app.routers import (
     actions,
     auth,
@@ -32,6 +35,19 @@ app = FastAPI(
     version="1.0.0",
     description="Avocarbon RFQ chatbot backend - Phase 1",
 )
+
+@app.on_event("startup")
+async def _create_user_roles_table() -> None:
+    """Create user_roles table if it doesn't exist, then migrate existing primary roles."""
+    async with engine.begin() as conn:
+        await conn.run_sync(UserRoleAssignment.__table__.create, checkfirst=True)
+        # Idempotent migration: seed user_roles from each user's primary role column
+        await conn.execute(sa_text(
+            "INSERT INTO user_roles (user_email, role) "
+            "SELECT email, role::text FROM users WHERE role IS NOT NULL "
+            "ON CONFLICT (user_email, role) DO NOTHING"
+        ))
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_DIST_DIR = PROJECT_ROOT / "Frontend" / "dist"

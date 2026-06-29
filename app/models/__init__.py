@@ -2,6 +2,7 @@ from app.models.user import User, UserRole
 from app.models.contact import Contact
 from app.models.validation_matrix import ValidationMatrix
 from app.models.product_line_routing import ProductLineRouting, ProductLineRoutingRole
+from app.models.routing_setting_viewers import RoutingSettingViewer
 from app.models.rfq import (
     ALLOWED_TRANSITIONS,
     Rfq,
@@ -26,6 +27,7 @@ __all__ = [
     "ValidationMatrix",
     "ProductLineRouting",
     "ProductLineRoutingRole",
+    "RoutingSettingViewer",
     "Rfq",
     "Potential",
     "RfqDocumentType",

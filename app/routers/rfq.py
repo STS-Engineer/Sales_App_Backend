@@ -10,7 +10,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import set_committed_value
@@ -96,9 +96,11 @@ from app.services.offer_preparation_store import get_offer_preparation_data_snap
 from app.services.routing import (
     assign_validator,
     get_assigned_product_line_acronyms,
+    get_viewer_product_line_acronyms,
     resolve_product_line_context,
     resolve_product_line_role_assignments_multi,
     resolve_product_line_role_emails,
+    user_is_routing_viewer_for_rfq,
 )
 from app.utils import emails
 from app.utils.currency import get_eur_exchange_rate
@@ -369,8 +371,8 @@ async def _can_view_rfq(
         return await _is_assigned_costing_agent(db, current_user, rfq)
     if current_user.role == UserRole.RND:
         return rfq.phase == RfqPhase.COSTING and await _is_assigned_rnd(db, current_user, rfq)
-    if current_user.role == UserRole.PLM:
-        return await _is_assigned_plm(db, current_user, rfq)
+    if _user_has_plm(current_user):
+        return True
     if (
         rfq.created_by_email == current_user.email
         or rfq.zone_manager_email == current_user.email
@@ -379,6 +381,8 @@ async def _can_view_rfq(
     if current_user.role == UserRole.ZONE_MANAGER and db_kpi is not None:
         team_emails = await _get_zone_manager_team_emails(db_kpi, current_user.email)
         return (rfq.created_by_email or "").lower() in team_emails
+    if await user_is_routing_viewer_for_rfq(db, current_user.email, rfq):
+        return True
     return False
 
 
@@ -404,8 +408,15 @@ def _is_costing_specialist_role(current_user: User) -> bool:
     return current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}
 
 
+def _user_has_plm(current_user: User) -> bool:
+    """Return True if PLM is among the user's roles (primary or additional multi-role)."""
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    return "PLM" in all_roles
+
+
 def _can_edit_rfq_phase(current_user: User, rfq: Rfq) -> bool:
-    if current_user.role == UserRole.OWNER:
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if UserRole.OWNER.value in all_roles:
         return True
     if _is_costing_specialist_role(current_user):
         return False
@@ -416,7 +427,8 @@ def _can_edit_rfq_phase(current_user: User, rfq: Rfq) -> bool:
 
 
 def _can_edit_offer_phase(current_user: User, rfq: Rfq) -> bool:
-    if current_user.role == UserRole.OWNER:
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if UserRole.OWNER.value in all_roles:
         return True
     if _is_costing_specialist_role(current_user):
         return False
@@ -440,7 +452,11 @@ def _assert_can_edit_base_rfq_data(current_user: User, rfq: Rfq) -> None:
     if rfq.phase == RfqPhase.OFFER:
         _assert_can_edit_offer_phase(current_user, rfq)
         return
-    if current_user.role == UserRole.OWNER:
+    # For post-Offer phases: allow OWNER (primary or secondary) and the RFQ creator.
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if UserRole.OWNER.value in all_roles:
+        return
+    if _is_rfq_creator(current_user, rfq):
         return
     raise HTTPException(
         status_code=403,
@@ -1482,10 +1498,12 @@ async def upload_rfq_file(
 
     try:
         await file.seek(0)
+        content = await file.read()
+        file_size = len(content)
         container_client = _get_rfq_files_container_client()
         blob_client = container_client.get_blob_client(blob_name)
         blob_client.upload_blob(
-            file.file,
+            content,
             overwrite=False,
             content_settings=ContentSettings(
                 content_type=file.content_type or "application/octet-stream"
@@ -1508,6 +1526,7 @@ async def upload_rfq_file(
         "blob_url": blob_client.url,
         "blob_name": blob_name,
         "content_type": file.content_type or "application/octet-stream",
+        "size": file_size,
         "uploaded_by": current_user.email,
         "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
@@ -1654,28 +1673,39 @@ async def list_rfqs(
         query = query.where(Rfq.document_type.in_(document_type_filters))
  
     if current_user.role != UserRole.OWNER:
-        if current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}:
+        viewer_acronyms = await get_viewer_product_line_acronyms(db, email=current_user.email)
+
+        if _user_has_plm(current_user):
+            pass  # PLM has global visibility — no product line filter applied
+        elif current_user.role in {UserRole.COSTING_TEAM, UserRole.RND}:
             routing_role = {
                 UserRole.COSTING_TEAM: ProductLineRoutingRole.COSTING,
                 UserRole.RND: ProductLineRoutingRole.RND,
-                UserRole.PLM: ProductLineRoutingRole.PLM,
             }[current_user.role]
             assigned_acronyms = await get_assigned_product_line_acronyms(
                 db,
                 role=routing_role,
                 email=current_user.email,
             )
-            if not assigned_acronyms:
+            conditions = []
+            if assigned_acronyms:
+                leader_cond = Rfq.product_line_acronym.in_(assigned_acronyms)
+                if current_user.role == UserRole.RND:
+                    leader_cond = and_(leader_cond, Rfq.phase == RfqPhase.COSTING)
+                conditions.append(leader_cond)
+            if viewer_acronyms:
+                conditions.append(Rfq.product_line_acronym.in_(viewer_acronyms))
+            if not conditions:
                 query = query.where(Rfq.rfq_id == "__unassigned__")
             else:
-                query = query.where(Rfq.product_line_acronym.in_(assigned_acronyms))
-                if current_user.role == UserRole.RND:
-                    query = query.where(Rfq.phase == RfqPhase.COSTING)
+                query = query.where(or_(*conditions))
         else:
             visibility_filters = [
                 Rfq.created_by_email == current_user.email,
                 Rfq.zone_manager_email == current_user.email,
             ]
+            if viewer_acronyms:
+                visibility_filters.append(Rfq.product_line_acronym.in_(viewer_acronyms))
             query = query.where(or_(*visibility_filters))
  
     result = await db.execute(query)
@@ -1714,12 +1744,44 @@ async def get_rfq(
     if rfq.chat_history and _ensure_revision_greeting_in_history(rfq):
         await db.commit()
         await db.refresh(rfq)
-    emails = {e for e in (rfq.created_by_email, rfq.zone_manager_email) if e}
-    if emails:
-        users_result = await db.execute(select(User).where(User.email.in_(emails)))
+    name_emails = {e for e in (rfq.created_by_email, rfq.zone_manager_email) if e}
+    if name_emails:
+        users_result = await db.execute(select(User).where(User.email.in_(name_emails)))
         name_map = {u.email: u.full_name for u in users_result.scalars().all() if u.full_name}
         rfq.created_by_name = name_map.get(rfq.created_by_email)
         rfq.zone_manager_name = name_map.get(rfq.zone_manager_email or "")
+    is_viewer = await user_is_routing_viewer_for_rfq(db, current_user.email, rfq)
+    if is_viewer:
+        has_leader_access = (
+            current_user.role == UserRole.OWNER
+            or rfq.created_by_email == current_user.email
+            or rfq.zone_manager_email == current_user.email
+            or (current_user.role == UserRole.COSTING_TEAM and await _is_assigned_costing_agent(db, current_user, rfq))
+            or (current_user.role == UserRole.RND and await _is_assigned_rnd(db, current_user, rfq))
+            or (_user_has_plm(current_user) and await _is_assigned_plm(db, current_user, rfq))
+        )
+        if not has_leader_access:
+            rfq.permissions = {
+                "can_view": True,
+                "can_edit": False,
+                "can_validate": False,
+                "can_upload": False,
+                "is_viewer": True,
+            }
+    elif (
+        _user_has_plm(current_user)
+        and UserRole.OWNER.value not in current_user.__dict__.get("_all_roles", set())
+        and not await _is_assigned_plm(db, current_user, rfq)
+        and rfq.created_by_email != current_user.email
+        and rfq.zone_manager_email != current_user.email
+    ):
+        rfq.permissions = {
+            "can_view": True,
+            "can_edit": False,
+            "can_validate": False,
+            "can_upload": False,
+            "is_viewer": True,
+        }
     return rfq
  
 
@@ -1758,6 +1820,8 @@ async def create_rfq_discussion_message(
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
     await _assert_can_view_rfq(db, current_user, rfq)
+    if await user_is_routing_viewer_for_rfq(db, current_user.email, rfq):
+        raise HTTPException(status_code=403, detail="Viewers have read-only access.")
 
     message = DiscussionMessage(
         rfq_id=rfq_id,
@@ -2395,23 +2459,10 @@ async def validate_rfq(
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
 
-    logger.warning(
-        "DEBUG SHAREPOINT: approval reached — rfq_id=%s approved=%s",
-        rfq_id,
-        body.approved,
-    )
-
     if body.approved:
         _sp_rfq_name = str((refreshed_rfq.rfq_data or {}).get("systematic_rfq_id") or "")
         _sp_product_line = str(refreshed_rfq.product_line_acronym or "")
         _sp_files = list((refreshed_rfq.rfq_data or {}).get("rfq_files") or [])
-        logger.warning(
-            "DEBUG SHAREPOINT: scheduling sync — rfq_id=%s rfq_name='%s' product_line='%s' files_count=%d",
-            rfq_id,
-            _sp_rfq_name,
-            _sp_product_line,
-            len(_sp_files),
-        )
         background_tasks.add_task(
             sync_rfq_to_sharepoint,
             rfq_id=rfq_id,
@@ -2520,9 +2571,6 @@ async def costing_review(
  
         # Send Begin Feasibility email to R&D — only on first approval transition
         if not was_already_approved:
-            logger.debug(
-                "DEBUG FEASIBILITY EMAIL: approval detected for rfq_id=%s", rfq_id
-            )
             rnd_emails = await resolve_product_line_role_emails(
                 db,
                 role=ProductLineRoutingRole.RND,
@@ -2582,7 +2630,7 @@ async def submit_costing_file_action(
     action: str = Form(...),
     note: str = Form(""),
     feasibility_status: str = Form(...),
-    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] = File(default=[]),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.RND, UserRole.OWNER)),
 ):
@@ -2616,44 +2664,68 @@ async def submit_costing_file_action(
         )
 
     trimmed_note = str(note or "").strip()
-    if not trimmed_note:
-        raise HTTPException(status_code=400, detail="note is required.")
 
-    if normalized_action == COSTING_FILE_STATUS_UPLOADED and file is None:
+    if normalized_action == COSTING_FILE_STATUS_UPLOADED and not files:
         raise HTTPException(
             status_code=400,
-            detail="file is required when action is 'UPLOADED'.",
+            detail="At least one file is required when action is 'UPLOADED'.",
         )
-    if normalized_action == COSTING_FILE_STATUS_NA and file is not None:
+    if normalized_action == COSTING_FILE_STATUS_NA and files:
         raise HTTPException(
             status_code=400,
             detail="file must not be provided when action is 'NA'.",
         )
 
-    # Read file bytes before _upload_costing_action_file consumes the stream,
-    # so the same bytes can be forwarded to SharePoint via a background task.
-    sp_file_bytes: bytes | None = None
-    sp_filename: str | None = None
+    logger.debug(
+        "DEBUG FEASIBILITY UPLOAD: files_count=%d rfq_id=%s",
+        len(files),
+        rfq_id,
+    )
 
-    file_meta = None
-    if normalized_action == COSTING_FILE_STATUS_UPLOADED and file is not None:
-        sp_file_bytes = await file.read()
-        sp_filename = _safe_upload_filename(file.filename)
-        await file.seek(0)  # reset so _upload_costing_action_file reads from the start
+    last_file_meta = None
+    new_costing_entries: list[dict] = []
+
+    for upload_file in files:
+        sp_file_bytes = await upload_file.read()
+        sp_filename = _safe_upload_filename(upload_file.filename)
+        await upload_file.seek(0)
+
+        logger.debug(
+            "DEBUG FEASIBILITY UPLOAD: uploading filename='%s' rfq_id=%s",
+            sp_filename,
+            rfq_id,
+        )
 
         file_meta = await _upload_costing_action_file(
             rfq_id=rfq_id,
-            file=file,
+            file=upload_file,
             current_user_email=current_user.email,
         )
-        rfq.costing_files = list(rfq.costing_files or []) + [
+        new_costing_entries.append(
             _build_costing_file_entry(
                 file_meta,
                 file_role="FEASIBILITY",
                 phase=rfq.sub_status,
                 note=trimmed_note,
             )
-        ]
+        )
+        last_file_meta = file_meta
+
+        logger.warning(
+            "DEBUG SHAREPOINT FEASIBILITY: scheduling upload for RFQ %s — filename='%s' size=%d bytes",
+            rfq_id,
+            sp_filename,
+            len(sp_file_bytes),
+        )
+        background_tasks.add_task(
+            upload_feasibility_to_sharepoint,
+            rfq_id=rfq_id,
+            filename=sp_filename,
+            file_bytes=sp_file_bytes,
+        )
+
+    if new_costing_entries:
+        rfq.costing_files = list(rfq.costing_files or []) + new_costing_entries
 
     next_costing_file_state = dict(rfq.costing_file_state or {})
     next_costing_file_state.update(
@@ -2663,7 +2735,7 @@ async def submit_costing_file_action(
             "feasibility_status": normalized_feasibility_status,
             "action_by": current_user.email,
             "action_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "file": file_meta,
+            "file": last_file_meta,
         }
     )
     rfq.costing_file_state = next_costing_file_state
@@ -2671,7 +2743,7 @@ async def submit_costing_file_action(
     action_label = (
         "Not applicable noted"
         if normalized_action == COSTING_FILE_STATUS_NA
-        else "Costing file uploaded"
+        else f"Costing file(s) uploaded ({len(new_costing_entries)})"
     )
     await log_action(
         db,
@@ -2698,22 +2770,6 @@ async def submit_costing_file_action(
                 recipients=refreshed_rfq.created_by_email,
                 email_type=EMAIL_FEASIBILITY_RESULT,
             )
-
-    # Upload the feasibility file to SharePoint 08-Costing Output in background.
-    # Never blocks the response — Azure upload above already succeeded.
-    if sp_file_bytes and sp_filename:
-        logger.warning(
-            "DEBUG SHAREPOINT FEASIBILITY: scheduling upload for RFQ %s — filename='%s' size=%d bytes",
-            rfq_id,
-            sp_filename,
-            len(sp_file_bytes),
-        )
-        background_tasks.add_task(
-            upload_feasibility_to_sharepoint,
-            rfq_id=rfq_id,
-            filename=sp_filename,
-            file_bytes=sp_file_bytes,
-        )
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
@@ -2817,8 +2873,8 @@ async def upload_pricing_bom_file(
 async def upload_pricing_final_price_file(
     rfq_id: str,
     background_tasks: BackgroundTasks,
-    note: str = Form(...),
-    file: UploadFile = File(...),
+    note: str = Form(""),
+    files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
 ):
@@ -2847,7 +2903,7 @@ async def upload_pricing_final_price_file(
     #             "Final price uploads are only allowed after the BOM upload or after a rejection."
     #         ),
     #     )
- 
+
     # has_pricing_bom_file = isinstance(pricing_workflow_state.get("bom_file"), dict)
     # if not has_pricing_bom_file:
     #     raise HTTPException(
@@ -2856,36 +2912,72 @@ async def upload_pricing_final_price_file(
     #             "Upload the costing file with BOM data before adding the final price file."
     #         ),
     #     )
+
     trimmed_note = str(note or "").strip()
-    if not trimmed_note:
-        raise HTTPException(status_code=400, detail="note is required.")
 
-    # Read bytes before _upload_costing_action_file consumes the stream
-    sp_file_bytes = await file.read()
-    sp_filename = _safe_upload_filename(file.filename)
-    await file.seek(0)
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required.")
 
-    file_meta = await _upload_costing_action_file(
-        rfq_id=rfq_id,
-        file=file,
-        current_user_email=current_user.email,
-        folder_name="pricing-final-price",
-    )
-    costing_file_entry = _build_costing_file_entry(
-        file_meta,
-        file_role="PRICING_FINAL_PRICE",
-        phase=RfqSubStatus.PRICING,
-        note=trimmed_note,
+    logger.debug(
+        "DEBUG FINAL PRICING UPLOAD: files_count=%d rfq_id=%s",
+        len(files),
+        rfq_id,
     )
 
     rfq_data = dict(rfq.rfq_data or {})
     rfq_data.pop("pricing_final_price_upload", None)
     rfq.rfq_data = rfq_data
-    rfq.costing_files = list(rfq.costing_files or []) + [costing_file_entry]
+
+    new_entries: list[dict] = []
+    last_entry = None
+
+    for upload_file in files:
+        # Read bytes before _upload_costing_action_file consumes the stream
+        sp_file_bytes = await upload_file.read()
+        sp_filename = _safe_upload_filename(upload_file.filename)
+        await upload_file.seek(0)
+
+        logger.debug(
+            "DEBUG FINAL PRICING UPLOAD: uploading filename='%s' rfq_id=%s",
+            sp_filename,
+            rfq_id,
+        )
+
+        file_meta = await _upload_costing_action_file(
+            rfq_id=rfq_id,
+            file=upload_file,
+            current_user_email=current_user.email,
+            folder_name="pricing-final-price",
+        )
+        costing_file_entry = _build_costing_file_entry(
+            file_meta,
+            file_role="PRICING_FINAL_PRICE",
+            phase=RfqSubStatus.PRICING,
+            note=trimmed_note,
+        )
+        new_entries.append(costing_file_entry)
+        last_entry = costing_file_entry
+
+        # Schedule SharePoint upload per file — 08-Costing Output, never blocks the response
+        logger.warning(
+            "DEBUG SHAREPOINT PRICING: scheduling upload for RFQ %s — filename='%s' size=%d bytes",
+            rfq_id,
+            sp_filename,
+            len(sp_file_bytes),
+        )
+        background_tasks.add_task(
+            upload_feasibility_to_sharepoint,
+            rfq_id=rfq_id,
+            filename=sp_filename,
+            file_bytes=sp_file_bytes,
+            file_label="PRICING",
+        )
+
+    rfq.costing_files = list(rfq.costing_files or []) + new_entries
     _set_pricing_workflow_state(
         rfq,
         workflow_state=PRICING_WORKFLOW_STATE_PRICING_UPLOADED,
-        pricing_file=costing_file_entry,
+        pricing_file=last_entry,
         validation_by=None,
         validation_at=None,
         rejection_reason=None,
@@ -2894,7 +2986,7 @@ async def upload_pricing_final_price_file(
     await log_action(
         db,
         rfq_id,
-        f"Pricing final price file uploaded: {trimmed_note}",
+        f"Pricing final price file(s) uploaded ({len(new_entries)}): {trimmed_note}",
         current_user.email,
     )
     await db.commit()
@@ -2921,23 +3013,74 @@ async def upload_pricing_final_price_file(
             email_type=EMAIL_PRICING_READY,
         )
 
-    # Upload to SharePoint 08-Costing Output in background — never blocks the response
-    logger.warning(
-        "DEBUG SHAREPOINT PRICING: scheduling upload for RFQ %s — filename='%s' size=%d bytes",
-        rfq_id,
-        sp_filename,
-        len(sp_file_bytes),
-    )
-    background_tasks.add_task(
-        upload_feasibility_to_sharepoint,
-        rfq_id=rfq_id,
-        filename=sp_filename,
-        file_bytes=sp_file_bytes,
-        file_label="PRICING",
-    )
-
     await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
+
+
+@router.delete("/{rfq_id}/costing-file/{entry_id}", response_model=RfqOut)
+async def delete_costing_file_entry(
+    rfq_id: str,
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    costing_files = list(rfq.costing_files or [])
+    entry_to_delete = None
+    remaining = []
+    for entry in costing_files:
+        if str(entry.get("id") or "").strip() == entry_id.strip():
+            entry_to_delete = entry
+        else:
+            remaining.append(entry)
+
+    if entry_to_delete is None:
+        raise HTTPException(status_code=404, detail="Costing file entry not found.")
+
+    rfq.costing_files = remaining
+
+    # Update costing_file_state pointers if the deleted entry was the current one
+    file_role = str(entry_to_delete.get("file_role") or "").strip().upper()
+    state = dict(rfq.costing_file_state or {})
+
+    if file_role == "FEASIBILITY":
+        current_file = state.get("file") or {}
+        if str(current_file.get("id") or "").strip() == entry_id.strip():
+            remaining_feas = [
+                e for e in remaining
+                if str(e.get("file_role") or "").strip().upper() == "FEASIBILITY"
+            ]
+            state["file"] = remaining_feas[-1] if remaining_feas else None
+            rfq.costing_file_state = state
+
+    elif file_role == "PRICING_FINAL_PRICE":
+        current_pricing = state.get("pricing_file") or {}
+        if str(current_pricing.get("id") or "").strip() == entry_id.strip():
+            remaining_pricing = [
+                e for e in remaining
+                if str(e.get("file_role") or "").strip().upper() == "PRICING_FINAL_PRICE"
+            ]
+            new_pricing_file = remaining_pricing[-1] if remaining_pricing else None
+            state["pricing_file"] = new_pricing_file
+            if new_pricing_file is None:
+                has_bom = isinstance(state.get("bom_file"), dict)
+                state["workflow_state"] = (
+                    PRICING_WORKFLOW_STATE_BOM_UPLOADED if has_bom
+                    else PRICING_WORKFLOW_STATE_WAITING_BOM
+                )
+            rfq.costing_file_state = state
+
+    _delete_azure_blob(entry_to_delete)
+
+    file_label = str(
+        entry_to_delete.get("filename") or entry_to_delete.get("name") or entry_id
+    )
+    await log_action(db, rfq_id, f"Costing file deleted: {file_label}", current_user.email)
+    await db.commit()
+    refreshed = await _get_rfq_or_404(db, rfq_id)
+    await _refresh_rfq_response_state(db, refreshed)
+    return refreshed
 
 
 @router.post("/{rfq_id}/costing_validation", response_model=RfqOut)

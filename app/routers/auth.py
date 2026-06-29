@@ -255,4 +255,15 @@ async def refresh_token(body: RefreshTokenRequest, db: AsyncSession = Depends(ge
 
 @router.get("/me", response_model=UserOut)
 async def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+    all_roles = sorted(
+        current_user.__dict__.get("_all_roles", {current_user.role.value})
+    )
+    return UserOut(
+        user_id=current_user.user_id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        role=current_user.role.value,
+        roles=all_roles,
+        is_approved=current_user.is_approved,
+        region=current_user.region,
+    )

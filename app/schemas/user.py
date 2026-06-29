@@ -10,6 +10,7 @@ class UserOut(BaseModel):
     email: EmailStr
     full_name: str | None = None
     role: UserRole
+    roles: list[str] = []
     is_approved: bool = False
     region: str | None = None
     created_at: datetime
@@ -19,4 +20,5 @@ class UserOut(BaseModel):
 
 class RoleUpdateRequest(BaseModel):
     role: UserRole
+    roles: list[UserRole] | None = None
     is_approved: bool | None = None

@@ -36,6 +36,7 @@ class RfqOut(BaseModel):
     follow_up_count: int = 0
     created_at: datetime
     updated_at: datetime
+    permissions: dict | None = None
 
     model_config = {"from_attributes": True}
 

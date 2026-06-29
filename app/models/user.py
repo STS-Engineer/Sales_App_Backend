@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum as SAEnum, String, func
+from sqlalchemy import Boolean, DateTime, Enum as SAEnum, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -17,6 +17,21 @@ class UserRole(str, enum.Enum):
     RND = "RND"
     PLANT_MANAGER = "PLANT_MANAGER"
     PLM = "PLM"
+
+
+class UserRoleAssignment(Base):
+    """Additional role assignments enabling multi-role support per user."""
+
+    __tablename__ = "user_roles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("user_email", "role", name="uq_user_roles_email_role"),
+    )
 
 
 class User(Base):

@@ -92,19 +92,11 @@ async def get_graph_token() -> str:
     """Obtain a Microsoft Graph access token via client credentials (with in-process cache)."""
     now = time.monotonic()
     if _token_cache.get("token") and _token_cache.get("expires_at", 0) > now + 60:
-        logger.debug("DEBUG SHAREPOINT: using cached Graph token")
         return str(_token_cache["token"])
 
     tenant_id = settings.azure_tenant_id
     client_id = settings.azure_client_id
     client_secret = settings.azure_client_secret
-
-    logger.warning(
-        "DEBUG SHAREPOINT: get_graph_token — tenant_id present=%s, client_id present=%s, client_secret present=%s",
-        bool(tenant_id),
-        bool(client_id),
-        bool(client_secret),
-    )
 
     if not tenant_id or not client_id or not client_secret:
         raise ValueError(
@@ -130,7 +122,6 @@ async def get_graph_token() -> str:
     expires_in: int = int(data.get("expires_in", 3600))
     _token_cache["token"] = token
     _token_cache["expires_at"] = now + expires_in
-    logger.warning("DEBUG SHAREPOINT: Microsoft Graph token acquired successfully")
     return token
 
 

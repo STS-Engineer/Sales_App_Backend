@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import jwt
 
 from app.database import get_db
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, UserRoleAssignment
 from app.security import decode_token
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -34,25 +34,32 @@ async def get_current_user(
     user = result.scalar_one_or_none()
     if user is None:
         raise credentials_exception
+
+    # Load all roles from user_roles table (populated at startup for existing users)
+    roles_result = await db.execute(
+        select(UserRoleAssignment.role).where(UserRoleAssignment.user_email == user.email)
+    )
+    stored_roles = set(roles_result.scalars().all())
+    # Always include primary role for backward compatibility with unregistered entries
+    user.__dict__["_all_roles"] = stored_roles | {user.role.value}
     return user
 
 
 def require_role(*roles: UserRole):
     """
-    Returns a FastAPI dependency function that enforces role-based access.
-
-    Usage:
-        @router.get("/...", dependencies=[Depends(require_role(UserRole.OWNER))])
-    or as a typed dependency:
-        current_user: User = Depends(require_role(UserRole.OWNER, UserRole.ZONE_MANAGER))
+    Returns a FastAPI dependency that enforces role-based access.
+    Checks the user's primary role and any additional roles from user_roles table.
     """
-
     async def _checker(current_user: User = Depends(get_current_user)) -> User:
-        if current_user.role not in roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied. Required roles: {[r.value for r in roles]}",
-            )
-        return current_user
+        required_values = {r.value for r in roles}
+        all_user_roles: set[str] = current_user.__dict__.get(
+            "_all_roles", {current_user.role.value}
+        )
+        if all_user_roles & required_values:
+            return current_user
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied. Required roles: {[r.value for r in roles]}",
+        )
 
     return _checker
