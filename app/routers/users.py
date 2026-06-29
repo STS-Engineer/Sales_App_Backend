@@ -4,11 +4,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.middleware.auth import require_role
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, UserRoleAssignment
 from app.schemas.user import RoleUpdateRequest, UserOut
 from app.services.user_admin import apply_user_role_update, delete_user_account
 
 router = APIRouter(prefix="/api/users", tags=["users"])
+
+
+async def _load_user_roles(db: AsyncSession, email: str) -> list[str]:
+    """Return sorted list of all roles assigned to a user."""
+    result = await db.execute(
+        select(UserRoleAssignment.role).where(UserRoleAssignment.user_email == email)
+    )
+    return sorted(result.scalars().all())
 
 
 @router.get("/pending", response_model=list[UserOut])
@@ -20,7 +28,33 @@ async def list_pending_users(
     result = await db.execute(
         select(User).where(User.is_approved.is_(False)).order_by(User.created_at.desc())
     )
-    return result.scalars().all()
+    users = result.scalars().all()
+    if not users:
+        return []
+
+    user_emails = [u.email for u in users]
+    rows = await db.execute(
+        select(UserRoleAssignment.user_email, UserRoleAssignment.role).where(
+            UserRoleAssignment.user_email.in_(user_emails)
+        )
+    )
+    role_map: dict[str, list[str]] = {}
+    for row in rows:
+        role_map.setdefault(row[0], []).append(row[1])
+
+    return [
+        {
+            "user_id": u.user_id,
+            "email": u.email,
+            "full_name": u.full_name,
+            "role": u.role,
+            "roles": sorted(role_map.get(u.email, [u.role.value])),
+            "is_approved": u.is_approved,
+            "region": u.region,
+            "created_at": u.created_at,
+        }
+        for u in users
+    ]
 
 
 @router.put("/{user_id}/role", response_model=UserOut)
@@ -35,12 +69,24 @@ async def update_user_role(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    return await apply_user_role_update(
+
+    updated = await apply_user_role_update(
         user,
         body.role,
         db,
         is_approved=body.is_approved,
+        extra_roles=body.roles,
     )
+    return {
+        "user_id": updated.user_id,
+        "email": updated.email,
+        "full_name": updated.full_name,
+        "role": updated.role,
+        "roles": await _load_user_roles(db, updated.email),
+        "is_approved": updated.is_approved,
+        "region": updated.region,
+        "created_at": updated.created_at,
+    }
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

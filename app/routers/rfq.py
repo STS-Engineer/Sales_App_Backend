@@ -370,8 +370,8 @@ async def _can_view_rfq(
         return await _is_assigned_costing_agent(db, current_user, rfq)
     if current_user.role == UserRole.RND:
         return rfq.phase == RfqPhase.COSTING and await _is_assigned_rnd(db, current_user, rfq)
-    if current_user.role == UserRole.PLM:
-        return await _is_assigned_plm(db, current_user, rfq)
+    if _user_has_plm(current_user):
+        return True
     if (
         rfq.created_by_email == current_user.email
         or rfq.zone_manager_email == current_user.email
@@ -405,6 +405,12 @@ def _is_assigned_validator(current_user: User, rfq: Rfq) -> bool:
 
 def _is_costing_specialist_role(current_user: User) -> bool:
     return current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}
+
+
+def _user_has_plm(current_user: User) -> bool:
+    """Return True if PLM is among the user's roles (primary or additional multi-role)."""
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    return "PLM" in all_roles
 
 
 def _can_edit_rfq_phase(current_user: User, rfq: Rfq) -> bool:
@@ -1643,11 +1649,12 @@ async def list_rfqs(
     if current_user.role != UserRole.OWNER:
         viewer_acronyms = await get_viewer_product_line_acronyms(db, email=current_user.email)
 
-        if current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}:
+        if _user_has_plm(current_user):
+            pass  # PLM has global visibility — no product line filter applied
+        elif current_user.role in {UserRole.COSTING_TEAM, UserRole.RND}:
             routing_role = {
                 UserRole.COSTING_TEAM: ProductLineRoutingRole.COSTING,
                 UserRole.RND: ProductLineRoutingRole.RND,
-                UserRole.PLM: ProductLineRoutingRole.PLM,
             }[current_user.role]
             assigned_acronyms = await get_assigned_product_line_acronyms(
                 db,
@@ -1725,7 +1732,7 @@ async def get_rfq(
             or rfq.zone_manager_email == current_user.email
             or (current_user.role == UserRole.COSTING_TEAM and await _is_assigned_costing_agent(db, current_user, rfq))
             or (current_user.role == UserRole.RND and await _is_assigned_rnd(db, current_user, rfq))
-            or (current_user.role == UserRole.PLM and await _is_assigned_plm(db, current_user, rfq))
+            or (_user_has_plm(current_user) and await _is_assigned_plm(db, current_user, rfq))
         )
         if not has_leader_access:
             rfq.permissions = {
@@ -1735,6 +1742,20 @@ async def get_rfq(
                 "can_upload": False,
                 "is_viewer": True,
             }
+    elif (
+        _user_has_plm(current_user)
+        and UserRole.OWNER.value not in current_user.__dict__.get("_all_roles", set())
+        and not await _is_assigned_plm(db, current_user, rfq)
+        and rfq.created_by_email != current_user.email
+        and rfq.zone_manager_email != current_user.email
+    ):
+        rfq.permissions = {
+            "can_view": True,
+            "can_edit": False,
+            "can_validate": False,
+            "can_upload": False,
+            "is_viewer": True,
+        }
     return rfq
  
 
@@ -2335,23 +2356,10 @@ async def validate_rfq(
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
 
-    logger.warning(
-        "DEBUG SHAREPOINT: approval reached — rfq_id=%s approved=%s",
-        rfq_id,
-        body.approved,
-    )
-
     if body.approved:
         _sp_rfq_name = str((refreshed_rfq.rfq_data or {}).get("systematic_rfq_id") or "")
         _sp_product_line = str(refreshed_rfq.product_line_acronym or "")
         _sp_files = list((refreshed_rfq.rfq_data or {}).get("rfq_files") or [])
-        logger.warning(
-            "DEBUG SHAREPOINT: scheduling sync — rfq_id=%s rfq_name='%s' product_line='%s' files_count=%d",
-            rfq_id,
-            _sp_rfq_name,
-            _sp_product_line,
-            len(_sp_files),
-        )
         background_tasks.add_task(
             sync_rfq_to_sharepoint,
             rfq_id=rfq_id,
@@ -2460,9 +2468,6 @@ async def costing_review(
  
         # Send Begin Feasibility email to R&D — only on first approval transition
         if not was_already_approved:
-            logger.debug(
-                "DEBUG FEASIBILITY EMAIL: approval detected for rfq_id=%s", rfq_id
-            )
             rnd_emails = await resolve_product_line_role_emails(
                 db,
                 role=ProductLineRoutingRole.RND,
@@ -2907,6 +2912,72 @@ async def upload_pricing_final_price_file(
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
     return refreshed_rfq
+
+
+@router.delete("/{rfq_id}/costing-file/{entry_id}", response_model=RfqOut)
+async def delete_costing_file_entry(
+    rfq_id: str,
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+
+    costing_files = list(rfq.costing_files or [])
+    entry_to_delete = None
+    remaining = []
+    for entry in costing_files:
+        if str(entry.get("id") or "").strip() == entry_id.strip():
+            entry_to_delete = entry
+        else:
+            remaining.append(entry)
+
+    if entry_to_delete is None:
+        raise HTTPException(status_code=404, detail="Costing file entry not found.")
+
+    rfq.costing_files = remaining
+
+    # Update costing_file_state pointers if the deleted entry was the current one
+    file_role = str(entry_to_delete.get("file_role") or "").strip().upper()
+    state = dict(rfq.costing_file_state or {})
+
+    if file_role == "FEASIBILITY":
+        current_file = state.get("file") or {}
+        if str(current_file.get("id") or "").strip() == entry_id.strip():
+            remaining_feas = [
+                e for e in remaining
+                if str(e.get("file_role") or "").strip().upper() == "FEASIBILITY"
+            ]
+            state["file"] = remaining_feas[-1] if remaining_feas else None
+            rfq.costing_file_state = state
+
+    elif file_role == "PRICING_FINAL_PRICE":
+        current_pricing = state.get("pricing_file") or {}
+        if str(current_pricing.get("id") or "").strip() == entry_id.strip():
+            remaining_pricing = [
+                e for e in remaining
+                if str(e.get("file_role") or "").strip().upper() == "PRICING_FINAL_PRICE"
+            ]
+            new_pricing_file = remaining_pricing[-1] if remaining_pricing else None
+            state["pricing_file"] = new_pricing_file
+            if new_pricing_file is None:
+                has_bom = isinstance(state.get("bom_file"), dict)
+                state["workflow_state"] = (
+                    PRICING_WORKFLOW_STATE_BOM_UPLOADED if has_bom
+                    else PRICING_WORKFLOW_STATE_WAITING_BOM
+                )
+            rfq.costing_file_state = state
+
+    _delete_azure_blob(entry_to_delete)
+
+    file_label = str(
+        entry_to_delete.get("filename") or entry_to_delete.get("name") or entry_id
+    )
+    await log_action(db, rfq_id, f"Costing file deleted: {file_label}", current_user.email)
+    await db.commit()
+    refreshed = await _get_rfq_or_404(db, rfq_id)
+    await _refresh_rfq_response_state(db, refreshed)
+    return refreshed
 
 
 @router.post("/{rfq_id}/costing_validation", response_model=RfqOut)

@@ -48,6 +48,7 @@ class UserOut(BaseModel):
     email: str
     full_name: str | None = None
     role: str
+    roles: list[str] = []
     is_approved: bool = False
     region: Optional[str] = None
 
@@ -57,4 +58,5 @@ class UserOut(BaseModel):
 class ApproveUserRequest(BaseModel):
     """Owner approves a user and assigns their role."""
     role: UserRole
+    roles: list[UserRole] | None = None
     region: str | None = None
