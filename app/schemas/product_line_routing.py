@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 
 from app.models.product_line_routing import ProductLineRoutingRole
 
@@ -8,7 +8,7 @@ from app.models.product_line_routing import ProductLineRoutingRole
 class ProductLineRoutingBase(BaseModel):
     product_line: str
     role: ProductLineRoutingRole
-    email: EmailStr
+    email: str
 
 
 class ProductLineRoutingCreate(ProductLineRoutingBase):
@@ -30,4 +30,21 @@ class RoutingAssignRequest(BaseModel):
     """Replace the full list of email assignments for a (product_line, role) pair."""
     product_line: str
     role: ProductLineRoutingRole
-    emails: list[EmailStr]
+    emails: list[str]
+
+
+class RoutingViewerOut(BaseModel):
+    id: int
+    product_line: str
+    role: ProductLineRoutingRole
+    user_email: str
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RoutingViewerAssignRequest(BaseModel):
+    """Replace the full list of viewers for a (product_line, role) pair."""
+    product_line: str
+    role: ProductLineRoutingRole
+    viewer_emails: list[str]

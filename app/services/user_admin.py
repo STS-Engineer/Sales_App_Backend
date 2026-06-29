@@ -56,11 +56,13 @@ async def apply_user_role_update(
     await db.refresh(user)
 
     if not was_approved and user.is_approved:
+        # Disabled as requested: do not send signup approval email after Owner approval
         emails.send_approval_email(
             user.email,
             format_role_label(role),
             settings.frontend_url,
         )
+        pass
 
     return user
 

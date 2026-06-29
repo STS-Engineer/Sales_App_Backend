@@ -4,6 +4,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.product_line_routing import ProductLineRouting, ProductLineRoutingRole
+from app.models.routing_setting_viewers import RoutingSettingViewer
 from app.models.validation_matrix import ValidationMatrix
 
 # Fixed escalation emails
@@ -231,6 +232,53 @@ async def get_assigned_product_line_acronyms(
         .order_by(ValidationMatrix.acronym.asc())
     )
     return [str(value or "").strip().upper() for value in result.scalars().all() if value]
+
+
+async def get_viewer_product_line_acronyms(
+    db: AsyncSession,
+    *,
+    email: str | None,
+) -> list[str]:
+    """Return product line acronyms for which the given email is a Viewer."""
+    normalized_email = _normalize_email(email)
+    if not normalized_email:
+        return []
+
+    result = await db.execute(
+        select(ValidationMatrix.acronym)
+        .join(
+            RoutingSettingViewer,
+            RoutingSettingViewer.product_line == ValidationMatrix.product_line,
+        )
+        .where(func.lower(RoutingSettingViewer.user_email) == normalized_email)
+        .order_by(ValidationMatrix.acronym.asc())
+    )
+    return [str(v or "").strip().upper() for v in result.scalars().all() if v]
+
+
+async def user_is_routing_viewer_for_rfq(
+    db: AsyncSession,
+    user_email: str | None,
+    rfq,
+) -> bool:
+    """Return True if user_email is a Viewer for the RFQ's product line."""
+    normalized_email = _normalize_email(user_email)
+    if not normalized_email or not rfq.product_line_acronym:
+        return False
+
+    context = await resolve_product_line_context(db, acronym=rfq.product_line_acronym)
+    if context is None:
+        return False
+
+    result = await db.execute(
+        select(RoutingSettingViewer)
+        .where(
+            RoutingSettingViewer.product_line == context["product_line"],
+            func.lower(RoutingSettingViewer.user_email) == normalized_email,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 def calculate_pte(target_price: float, qty_per_year: int) -> float:

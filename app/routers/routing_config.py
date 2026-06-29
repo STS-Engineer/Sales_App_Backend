@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.middleware.auth import require_role
 from app.models.product_line_routing import ProductLineRouting
+from app.models.routing_setting_viewers import RoutingSettingViewer
 from app.models.user import User, UserRole
 from app.models.validation_matrix import ValidationMatrix
 from app.schemas.product_line_routing import (
@@ -14,6 +15,8 @@ from app.schemas.product_line_routing import (
     ProductLineRoutingOut,
     ProductLineRoutingUpdate,
     RoutingAssignRequest,
+    RoutingViewerAssignRequest,
+    RoutingViewerOut,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,10 @@ async def _ensure_product_line_exists(db: AsyncSession, product_line: str) -> st
     return matrix.product_line
 
 
+# ---------------------------------------------------------------------------
+# Leader endpoints  (static paths first — must come before /{routing_id})
+# ---------------------------------------------------------------------------
+
 @router.get("", response_model=list[ProductLineRoutingOut])
 async def list_product_line_routing(
     product_line: str | None = Query(default=None),
@@ -49,6 +56,37 @@ async def list_product_line_routing(
 
     result = await db.execute(query)
     return result.scalars().all()
+
+
+@router.post("", response_model=ProductLineRoutingOut, status_code=status.HTTP_201_CREATED)
+async def create_product_line_routing(
+    body: ProductLineRoutingCreate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(UserRole.OWNER)),
+):
+    product_line = await _ensure_product_line_exists(db, body.product_line)
+    existing = await db.execute(
+        select(ProductLineRouting).where(
+            ProductLineRouting.product_line == product_line,
+            ProductLineRouting.role == body.role,
+            ProductLineRouting.email == str(body.email).strip(),
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This email is already assigned to this product line and role.",
+        )
+
+    entry = ProductLineRouting(
+        product_line=product_line,
+        role=body.role,
+        email=str(body.email).strip(),
+    )
+    db.add(entry)
+    await db.commit()
+    await db.refresh(entry)
+    return entry
 
 
 @router.put("/assign", response_model=list[ProductLineRoutingOut])
@@ -117,36 +155,113 @@ async def assign_product_line_routing(
     return saved
 
 
-@router.post("", response_model=ProductLineRoutingOut, status_code=status.HTTP_201_CREATED)
-async def create_product_line_routing(
-    body: ProductLineRoutingCreate,
+# ---------------------------------------------------------------------------
+# Viewer endpoints  (static paths — must stay before /{routing_id})
+# ---------------------------------------------------------------------------
+
+@router.get("/viewers", response_model=list[RoutingViewerOut])
+async def list_viewers(
+    product_line: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_role(UserRole.OWNER)),
 ):
+    """List all viewer assignments, optionally filtered by product_line."""
+    query = select(RoutingSettingViewer).order_by(
+        RoutingSettingViewer.product_line.asc(),
+        RoutingSettingViewer.role.asc(),
+        RoutingSettingViewer.id.asc(),
+    )
+    normalized_product_line = str(product_line or "").strip()
+    if normalized_product_line:
+        query = query.where(RoutingSettingViewer.product_line == normalized_product_line)
+
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+@router.put("/assign-viewers", response_model=list[RoutingViewerOut])
+async def assign_viewers(
+    body: RoutingViewerAssignRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(UserRole.OWNER)),
+):
+    """Replace all viewer assignments for a (product_line, role) pair atomically.
+
+    Only viewers for the given product_line + role are touched; all other
+    product lines and roles remain unchanged.
+    """
     product_line = await _ensure_product_line_exists(db, body.product_line)
-    existing = await db.execute(
-        select(ProductLineRouting).where(
-            ProductLineRouting.product_line == product_line,
-            ProductLineRouting.role == body.role,
-            ProductLineRouting.email == str(body.email).strip(),
-        )
-    )
-    if existing.scalar_one_or_none() is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="This email is already assigned to this product line and role.",
-        )
 
-    entry = ProductLineRouting(
-        product_line=product_line,
-        role=body.role,
-        email=str(body.email).strip(),
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_email in body.viewer_emails:
+        email = str(raw_email).strip()
+        key = email.lower()
+        if email and key not in seen:
+            seen.add(key)
+            normalized.append(email)
+
+    logger.debug(
+        "ROUTING VIEWERS: assigning product_line=%r role=%r viewers_count=%d",
+        product_line,
+        body.role.value,
+        len(normalized),
     )
-    db.add(entry)
+
+    await db.execute(
+        sa_delete(RoutingSettingViewer).where(
+            RoutingSettingViewer.product_line == product_line,
+            RoutingSettingViewer.role == body.role,
+        )
+    )
+
+    for email in normalized:
+        db.add(RoutingSettingViewer(
+            product_line=product_line,
+            role=body.role,
+            user_email=email,
+        ))
+
     await db.commit()
-    await db.refresh(entry)
-    return entry
 
+    result = await db.execute(
+        select(RoutingSettingViewer)
+        .where(
+            RoutingSettingViewer.product_line == product_line,
+            RoutingSettingViewer.role == body.role,
+        )
+        .order_by(RoutingSettingViewer.id.asc())
+    )
+    saved = result.scalars().all()
+
+    logger.debug(
+        "ROUTING VIEWERS: saved successfully — saved_count=%d",
+        len(saved),
+    )
+    return saved
+
+
+@router.delete("/viewers/{viewer_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_viewer(
+    viewer_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(UserRole.OWNER)),
+):
+    result = await db.execute(
+        select(RoutingSettingViewer).where(RoutingSettingViewer.id == viewer_id)
+    )
+    entry = result.scalar_one_or_none()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Viewer entry not found.")
+
+    await db.delete(entry)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Parameterized leader routes  (must come AFTER all static paths)
+# ---------------------------------------------------------------------------
 
 @router.put("/{routing_id}", response_model=ProductLineRoutingOut)
 async def update_product_line_routing(
