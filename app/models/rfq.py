@@ -57,6 +57,8 @@ class RfqSubStatus(str, enum.Enum):
     # Terminal positive (under CLOSED phase)
     PO_SECURED = "PO_SECURED"
     RFI_COMPLETED = "RFI_COMPLETED"
+    # AI-generated approval status (stored in DB)
+    AI_APPROVED = "AI_APPROVED"
 
 
 # ── Terminal sub-statuses that can occur in any phase ────────────────

@@ -2,6 +2,7 @@ import datetime
 import httpx
 import logging
 import os
+import re
 import uuid
 from functools import lru_cache
 
@@ -1003,6 +1004,20 @@ async def _generate_systematic_rfq_id(
     return f"{yy}{sequence}-{acronym}-{revision}"
 
 
+def _increment_rfq_reference_index(rfq_reference: str) -> str:
+    match = re.match(r"^(.*)-(\d+)$", rfq_reference or "")
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail="RFQ reference does not contain a valid numeric index to increment.",
+        )
+    prefix = match.group(1)
+    current_index = match.group(2)
+    next_number = int(current_index) + 1
+    next_index = str(next_number).zfill(len(current_index))
+    return f"{prefix}-{next_index}"
+
+
 async def _resolve_validation_matrix_product(
     db: AsyncSession,
     product_name: str | None,
@@ -1350,7 +1365,7 @@ async def _submit_rfq_for_validation_internal(
             validator_role=validator_role,
         )
         if email_sent:
-            rfq.last_notification_sent_at = datetime.datetime.utcnow()
+            rfq.last_notification_sent_at = datetime.datetime.now(datetime.timezone.utc)
             await record_notification_sent(
                 db,
                 rfq_id=rfq.rfq_id,
@@ -1563,6 +1578,7 @@ async def proceed_to_rfq(
 async def upload_rfq_file(
     rfq_id: str,
     file: UploadFile = File(...),
+    update_type: str = Form("simple"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1617,7 +1633,39 @@ async def upload_rfq_file(
     existing_files.append(file_meta)
     extracted_data["rfq_files"] = existing_files
     extracted_data["rfq_file_path"] = file_meta["path"]
+
+    old_systematic_id: str | None = None
+    new_systematic_id: str | None = None
+    if update_type == "change_index":
+        old_systematic_id = extracted_data.get("systematic_rfq_id") or ""
+        if not old_systematic_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot increment RFQ index: RFQ reference has not been assigned yet.",
+            )
+        new_systematic_id = _increment_rfq_reference_index(old_systematic_id)
+        dup_result = await db.execute(
+            select(func.count()).select_from(Rfq).where(
+                Rfq.rfq_data["systematic_rfq_id"].astext == new_systematic_id,
+                Rfq.rfq_id != rfq_id,
+            )
+        )
+        if dup_result.scalar_one() > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"RFQ reference {new_systematic_id} already exists.",
+            )
+        extracted_data["systematic_rfq_id"] = new_systematic_id
+
     rfq.rfq_data = extracted_data
+
+    if update_type == "change_index" and old_systematic_id and new_systematic_id:
+        await log_action(
+            db,
+            rfq_id,
+            f"RFQ index changed from {old_systematic_id} to {new_systematic_id}",
+            current_user.email,
+        )
 
     await db.commit()
     await db.refresh(rfq)
@@ -1735,6 +1783,66 @@ async def download_file(filename: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(file_path)
+
+
+@router.get("/{rfq_id}/costing-file/{file_id}/download")
+async def download_costing_file(
+    rfq_id: str,
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Proxy-download a costing file (Feasibility or Pricing) from Azure Blob Storage.
+
+    The browser cannot fetch Azure SAS URLs directly due to CORS restrictions,
+    so the backend fetches the blob and streams it back as an attachment.
+    """
+    result = await db.execute(select(Rfq).where(Rfq.rfq_id == rfq_id))
+    rfq = result.scalar_one_or_none()
+    if not rfq:
+        raise HTTPException(status_code=404, detail="RFQ not found.")
+
+    costing_files = list(rfq.costing_files or [])
+    file_entry = next(
+        (
+            e for e in costing_files
+            if str(e.get("id") or e.get("file_id") or e.get("uuid") or "") == file_id
+        ),
+        None,
+    )
+    if not file_entry:
+        raise HTTPException(status_code=404, detail="File not found in this RFQ.")
+
+    blob_name = str(file_entry.get("blob_name") or "").strip()
+    if not blob_name or not settings.azure_connection_string:
+        raise HTTPException(status_code=404, detail="File storage location unavailable.")
+
+    original_name = str(
+        file_entry.get("name") or
+        file_entry.get("original_name") or
+        file_entry.get("filename") or
+        os.path.basename(blob_name)
+    )
+
+    try:
+        blob_client = _get_rfq_files_container_client().get_blob_client(blob_name)
+        download_stream = blob_client.download_blob()
+        content = download_stream.readall()
+        content_type = str(file_entry.get("content_type") or "application/octet-stream")
+    except ResourceNotFoundError:
+        raise HTTPException(status_code=404, detail="File no longer exists in storage.")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to download file: {exc}")
+
+    safe_filename = original_name.replace('"', '\\"')
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Content-Length": str(len(content)),
+        },
+    )
 
 
 @router.get("", response_model=list[RfqOut])
@@ -2532,7 +2640,7 @@ async def validate_rfq(
                 if sent:
                     notified_costing.append(recipient_email)
             if notified_costing:
-                refreshed_rfq.last_notification_sent_at = datetime.datetime.utcnow()
+                refreshed_rfq.last_notification_sent_at = datetime.datetime.now(datetime.timezone.utc)
                 await record_notification_sent(
                     db,
                     rfq_id=refreshed_rfq.rfq_id,
