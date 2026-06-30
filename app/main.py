@@ -2,6 +2,11 @@ import logging
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -22,6 +27,7 @@ from app.routers import (
     internal,
     kpi_data,
     kpi_settings,
+    mcp_router,
     owner,
     products,
     rfq,
@@ -117,6 +123,7 @@ app.include_router(chat_offer.router)
 app.include_router(chat_potential.router)
 app.include_router(team_view.router)
 app.include_router(internal.router)
+app.include_router(mcp_router.router)
 app.include_router(kpi_settings.router)
 app.include_router(kpi_data.router)
 

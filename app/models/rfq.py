@@ -34,6 +34,7 @@ class RfqDocumentType(str, enum.Enum):
 class RfqSubStatus(str, enum.Enum):
     # RFQ phase
     NEW_RFQ = "NEW_RFQ"
+    AI_APPROVED = "AI_APPROVED"          # AI pre-validation passed; awaiting human validator
     PENDING_FOR_VALIDATION = "PENDING_FOR_VALIDATION"
     REVISION_REQUESTED = "REVISION_REQUESTED"
     # COSTING phase
@@ -68,6 +69,7 @@ _TERMINAL_ANYWHERE: set[RfqSubStatus] = {
 VALID_PHASE_SUBSTATUS: dict[RfqPhase, set[RfqSubStatus]] = {
     RfqPhase.RFQ: {
         RfqSubStatus.NEW_RFQ,
+        RfqSubStatus.AI_APPROVED,
         RfqSubStatus.PENDING_FOR_VALIDATION,
         RfqSubStatus.REVISION_REQUESTED,
     } | _TERMINAL_ANYWHERE,
@@ -110,15 +112,23 @@ ALLOWED_TRANSITIONS: dict[
 ] = {
     # ── RFQ phase ────────────────────────────────────────────────────
     (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ): {
-        (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),
+        (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED),            # normal path via AI validation
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),  # fallback / legacy
+        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
+    },
+    (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED): {
+        (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),  # human validator approves
+        (RfqPhase.RFQ, RfqSubStatus.REVISION_REQUESTED),  # human validator requests revision
         (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION): {
-        (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),  # approved
+        (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY),  # human validator approves
+        (RfqPhase.RFQ, RfqSubStatus.REVISION_REQUESTED),  # human validator requests revision
         (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     (RfqPhase.RFQ, RfqSubStatus.REVISION_REQUESTED): {
-        (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),
+        (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED),            # resubmit via AI validation
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),  # fallback / legacy
         (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     # ── COSTING phase ────────────────────────────────────────────────

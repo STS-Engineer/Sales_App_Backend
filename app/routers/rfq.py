@@ -1,4 +1,5 @@
 import datetime
+import httpx
 import logging
 import os
 import uuid
@@ -41,6 +42,7 @@ from app.schemas.discussion import (
     DiscussionMessageOut,
 )
 from app.schemas.rfq import (
+    AiValidationStatusOut,
     AdvanceStatusRequest,
     AuditLogOut,
     CostingValidationRequest,
@@ -61,6 +63,13 @@ from app.schemas.rfq import (
     rfq_data_payload_to_dict,
 )
 from app.services.audit import log_action
+from app.services.ai_validation import (
+    AgentValidationResult,
+    build_ai_validation_record,
+    current_timestamp_iso,
+    extract_ai_validation_record,
+    validate_rfq_with_agent,
+)
 from app.services.sharepoint_service import sync_rfq_to_sharepoint, upload_feasibility_to_sharepoint
 from app.services.costing_template import (
     build_costing_template_filename,
@@ -1179,7 +1188,9 @@ async def _submit_rfq_for_validation_internal(
 
     is_resubmission = (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ)
 
-    if is_resubmission and rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+    if is_resubmission and rfq.sub_status in {
+        RfqSubStatus.PENDING_FOR_VALIDATION, RfqSubStatus.AI_APPROVED
+    }:
         raise HTTPException(
             status_code=400,
             detail="This RFQ is already pending validation.",
@@ -1239,20 +1250,86 @@ async def _submit_rfq_for_validation_internal(
         extracted_data.pop("is_resubmission", None)
         extracted_data.pop("resubmission_restore_phase", None)
         extracted_data.pop("resubmission_restore_sub_status", None)
+
+    # ── AI pre-validation ─────────────────────────────────────────────────────
+    # Call the Workspace Agent before committing any DB change or sending email.
+    # On network / service errors we log and fail open to avoid blocking submissions
+    # when the AI endpoint is temporarily unavailable.
+    try:
+        ai_result: AgentValidationResult = await validate_rfq_with_agent(extracted_data)
+    except httpx.HTTPStatusError as ai_exc:
+        logger.warning(
+            "AI validation skipped for RFQ %s due to Workspace Agent HTTP error: %s",
+            systematic_rfq_id,
+            ai_exc,
+        )
+        ai_result = AgentValidationResult(
+            approved=True,
+            message="AI validation skipped: Workspace Agent access is not configured correctly.",
+            discussion=str(ai_exc),
+            status="skipped",
+        )
+    except Exception as ai_exc:
+        import traceback as _tb
+        _error_detail = f"{type(ai_exc).__name__}: {ai_exc}\n\n{_tb.format_exc()}"
+        print(f"\n[AI VALIDATION ERROR] RFQ {systematic_rfq_id}\n{_error_detail}\n", flush=True)
+        logger.exception(
+            "AI validation skipped for RFQ %s due to unexpected error.",
+            systematic_rfq_id,
+        )
+        ai_result = AgentValidationResult(
+            approved=True,
+            message="AI validation skipped due to service unavailability.",
+            discussion=(
+                "AI validation service unavailable. "
+                "See backend logs for technical details."
+            ),
+            status="skipped",
+        )
+
+    # Persist the AI result in rfq_data regardless of outcome so the frontend
+    # can always display the agent's response — even after a page reload.
+    extracted_data["ai_validation"] = build_ai_validation_record(
+        approved=ai_result.approved,
+        status=ai_result.status or "completed",
+        message=ai_result.message or "",
+        discussion=ai_result.discussion or "",
+        conversation_url=ai_result.conversation_url or "",
+        fields_to_correct=ai_result.fields_to_correct,
+        checked_at=current_timestamp_iso(),
+        source="workspace_agent_trigger",
+    )
+
+    if not ai_result.approved:
+        # Save the rejection result to the DB (rfq_data only, no status change),
+        # then surface the detail to the frontend via 422.
+        rfq.rfq_data = {**(rfq.rfq_data or {}), "ai_validation": extracted_data["ai_validation"]}
+        await db.commit()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ai_blocked": True,
+                "message": ai_result.message
+                or "The AI agent blocked this RFQ. Please correct the indicated fields.",
+                "fields_to_correct": ai_result.fields_to_correct,
+            },
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     rfq.rfq_data = extracted_data
     rfq.zone_manager_email = zone_manager_email
     rfq.product_line_acronym = acronym
     rfq.approved_at = None
     rfq.rejected_at = None
-    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION)
+    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.AI_APPROVED)
 
     action_label = "re-submitted for validation" if is_resubmission else "submitted for validation"
     await log_action(
         db,
         rfq.rfq_id,
         (
-            f"RFQ {action_label} -> "
-            f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_FOR_VALIDATION.value}"
+            f"RFQ {action_label} (AI approved) -> "
+            f"{RfqPhase.RFQ.value}/{RfqSubStatus.AI_APPROVED.value}"
         ),
         current_user.email,
     )
@@ -1783,7 +1860,22 @@ async def get_rfq(
             "is_viewer": True,
         }
     return rfq
- 
+
+
+@router.get("/{rfq_id}/ai-validation-status", response_model=AiValidationStatusOut)
+async def get_rfq_ai_validation_status(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    db_kpi: AsyncSession | None = Depends(get_db4_optional),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    await _assert_can_view_rfq(db, current_user, rfq, db_kpi=db_kpi)
+    ai_validation = extract_ai_validation_record(rfq.rfq_data)
+    if ai_validation is None:
+        raise HTTPException(status_code=404, detail="AI validation status not found.")
+    return ai_validation
+
 
 @router.get("/{rfq_id}/discussion", response_model=list[DiscussionMessageOut])
 async def get_rfq_discussion(
@@ -2151,14 +2243,13 @@ async def request_revision(
             detail="You are not assigned as the Validator for this RFQ.",
         )
 
-    if (rfq.phase, rfq.sub_status) != (
-        RfqPhase.RFQ,
-        RfqSubStatus.PENDING_FOR_VALIDATION,
-    ):
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
+        RfqSubStatus.AI_APPROVED, RfqSubStatus.PENDING_FOR_VALIDATION
+    }:
         raise HTTPException(
             status_code=400,
             detail=(
-                "RFQ must be in RFQ/PENDING_FOR_VALIDATION before requesting a revision. "
+                "RFQ must be in RFQ/AI_APPROVED or RFQ/PENDING_FOR_VALIDATION before requesting a revision. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
@@ -2353,14 +2444,13 @@ async def validate_rfq(
             detail="A validation action has already been recorded for this RFQ.",
         )
 
-    if (rfq.phase, rfq.sub_status) != (
-        RfqPhase.RFQ,
-        RfqSubStatus.PENDING_FOR_VALIDATION,
-    ):
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
+        RfqSubStatus.AI_APPROVED, RfqSubStatus.PENDING_FOR_VALIDATION
+    }:
         raise HTTPException(
             status_code=400,
             detail=(
-                "RFQ must be in RFQ/PENDING_FOR_VALIDATION before it can be validated. "
+                "RFQ must be in RFQ/AI_APPROVED or RFQ/PENDING_FOR_VALIDATION before it can be validated. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )

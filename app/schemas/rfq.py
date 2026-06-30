@@ -3,7 +3,7 @@ import json
 import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.offer_preparation import OfferPreparationOut
 from app.models.rfq import RfqDocumentType, RfqPhase, RfqSubStatus
@@ -65,6 +65,40 @@ class RfqFxRateOut(BaseModel):
     currency_code: str
     eur_rate: float
     fallback_used: bool
+
+
+class AiValidationStatusOut(BaseModel):
+    approved: bool
+    status: str
+    message: str = ""
+    discussion: str = ""
+    fields_to_correct: list[str] = Field(default_factory=list)
+    conversation_url: str = ""
+    checked_at: str = ""
+    source: str = ""
+
+
+class AiValidationCallbackRequest(BaseModel):
+    rfq_id: str | None = None
+    systematic_rfq_id: str | None = None
+    approved: bool | None = None
+    status: str = "completed"
+    message: str = ""
+    discussion: str = ""
+    fields_to_correct: list[str] = Field(default_factory=list)
+    conversation_url: str | None = None
+    source: str = "workspace_agent_mcp"
+
+    @model_validator(mode="after")
+    def require_identifier(self) -> "AiValidationCallbackRequest":
+        if not (self.rfq_id or self.systematic_rfq_id):
+            raise ValueError("rfq_id or systematic_rfq_id is required")
+        return self
+
+
+class AiValidationCallbackResponse(AiValidationStatusOut):
+    rfq_id: str
+    systematic_rfq_id: str | None = None
 
 
 class ProductItem(BaseModel):
