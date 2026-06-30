@@ -69,6 +69,7 @@ from app.services.ai_validation import (
     build_ai_validation_record,
     current_timestamp_iso,
     extract_ai_validation_record,
+    prepare_rfq_files_for_agent,
     validate_rfq_with_agent,
 )
 from app.services.sharepoint_service import sync_rfq_to_sharepoint, upload_feasibility_to_sharepoint
@@ -1266,18 +1267,18 @@ async def _submit_rfq_for_validation_internal(
         extracted_data.pop("resubmission_restore_sub_status", None)
 
     # ── AI pre-validation ─────────────────────────────────────────────────────
-    # Inject proxy_url for any rfq_files entries that lack it so the agent can
-    # access drawings through the backend proxy regardless of upload date.
+    # Download each RFQ file from Azure and extract its text so the agent can
+    # read drawing content without making outbound requests from its sandbox.
     _agent_data = dict(extracted_data)
     _raw_files = _agent_data.get("rfq_files")
     if isinstance(_raw_files, list) and _raw_files:
-        _base = settings.backend_base_url
-        _agent_data["rfq_files"] = [
-            {**f, "proxy_url": f"{_base}/api/rfq/files/{f['id']}/proxy"}
-            if f.get("id") and not f.get("proxy_url")
-            else f
-            for f in _raw_files
-        ]
+        _agent_data["rfq_files"] = await prepare_rfq_files_for_agent(
+            _raw_files,
+            backend_base_url=settings.backend_base_url,
+            azure_connection_string=settings.azure_connection_string,
+            azure_container=settings.azure_rfq_files_container,
+            openai_api_key=settings.OPENAI_API_KEY,
+        )
 
     # Call the Workspace Agent before committing any DB change or sending email.
     # On network / service errors we log and fail open to avoid blocking submissions

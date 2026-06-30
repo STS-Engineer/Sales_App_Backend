@@ -11,6 +11,8 @@ Environment variables:
         Published API channel trigger ID in agtch_... format.
 """
 
+import asyncio
+import base64
 import datetime
 import json
 import logging
@@ -187,6 +189,185 @@ def extract_ai_validation_record(rfq_data: dict | None) -> dict[str, Any] | None
         checked_at=str(raw.get("checked_at") or ""),
         source=str(raw.get("source") or ""),
     )
+
+
+# ── PDF / file extraction for agent payload ───────────────────────────────────
+
+_MAX_FILE_TEXT_CHARS = 8_000  # Truncate to keep agent token budget sane
+_PDF_VISION_MAX_PAGES = 2     # Pages rendered for GPT-4 Vision fallback
+_BLOB_DOWNLOAD_TIMEOUT = 30   # Seconds per file for Azure download
+
+
+def _extract_text_from_pdf_bytes(content: bytes) -> str:
+    """Return selectable text from a PDF binary using PyMuPDF (fitz)."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return ""
+    text_parts: list[str] = []
+    try:
+        with fitz.open(stream=content, filetype="pdf") as doc:
+            for page_num, page in enumerate(doc):
+                if page_num >= 5:
+                    break
+                text = page.get_text()
+                if text.strip():
+                    text_parts.append(text.strip())
+    except Exception as exc:
+        logger.debug("PyMuPDF text extraction failed: %s", exc)
+    return "\n\n".join(text_parts)
+
+
+async def _analyze_pdf_with_vision(
+    content: bytes, openai_api_key: str, filename: str = ""
+) -> str:
+    """Render the first PDF pages as PNG and describe with GPT-4 Vision."""
+    try:
+        import fitz
+        from openai import AsyncOpenAI
+    except ImportError:
+        return ""
+
+    images_b64: list[str] = []
+    try:
+        with fitz.open(stream=content, filetype="pdf") as doc:
+            for page_num, page in enumerate(doc):
+                if page_num >= _PDF_VISION_MAX_PAGES:
+                    break
+                mat = fitz.Matrix(2.0, 2.0)  # ~144 DPI
+                pix = page.get_pixmap(matrix=mat)
+                images_b64.append(base64.b64encode(pix.tobytes("png")).decode())
+    except Exception as exc:
+        logger.debug("PDF→image render failed for %s: %s", filename, exc)
+        return ""
+
+    if not images_b64:
+        return ""
+
+    content_parts: list[dict] = [
+        {
+            "type": "text",
+            "text": (
+                f"Technical drawing file: {filename}\n"
+                "Extract all visible data: dimensions, tolerances, materials, "
+                "surface treatments, part numbers, notes, title block. "
+                "Return a structured summary."
+            ),
+        }
+    ]
+    for img_b64 in images_b64:
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"},
+        })
+
+    try:
+        client = AsyncOpenAI(api_key=openai_api_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": content_parts}],
+            max_tokens=2000,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception as exc:
+        logger.warning("GPT-4o Vision analysis failed for %s: %s", filename, exc)
+        return ""
+
+
+def _download_blob_sync(
+    connection_string: str, container: str, blob_name: str
+) -> bytes:
+    from azure.storage.blob import BlobServiceClient
+    service = BlobServiceClient.from_connection_string(connection_string)
+    blob_client = service.get_container_client(container).get_blob_client(blob_name)
+    return blob_client.download_blob().readall()
+
+
+async def prepare_rfq_files_for_agent(
+    rfq_files: list[dict],
+    *,
+    backend_base_url: str,
+    azure_connection_string: str,
+    azure_container: str,
+    openai_api_key: str | None = None,
+) -> list[dict]:
+    """Enrich rfq_files with agent_file_text / agent_file_text_status before sending to agent.
+
+    Status values the agent preface interprets:
+      ok_text           — text layer extracted successfully by PyMuPDF
+      ok_vision         — image PDF described by GPT-4 Vision
+      vision_unavailable — image PDF, no OpenAI key configured
+      vision_failed     — Vision API returned nothing useful
+      download_failed   — blob unreachable (the only status that should block)
+    """
+    if not rfq_files or not azure_connection_string:
+        return rfq_files
+
+    enriched: list[dict] = []
+    for file_entry in rfq_files:
+        f = dict(file_entry)
+        file_id = str(f.get("id") or "").strip()
+        blob_name = str(f.get("blob_name") or "").strip()
+        filename = str(f.get("filename") or f.get("name") or blob_name)
+        content_type = str(f.get("content_type") or "application/octet-stream")
+
+        # Always expose the proxy URL as the reference the agent sees.
+        if file_id and not f.get("proxy_url"):
+            f["proxy_url"] = f"{backend_base_url}/api/rfq/files/{file_id}/proxy"
+        f["agent_file_url"] = f.get("proxy_url") or f.get("url") or ""
+
+        if not blob_name:
+            f["agent_file_text_status"] = "download_failed"
+            enriched.append(f)
+            continue
+
+        try:
+            content = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    _download_blob_sync,
+                    azure_connection_string,
+                    azure_container,
+                    blob_name,
+                ),
+                timeout=_BLOB_DOWNLOAD_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("Blob download failed for agent (%s): %s", blob_name, exc)
+            f["agent_file_text_status"] = "download_failed"
+            enriched.append(f)
+            continue
+
+        is_pdf = "pdf" in content_type.lower() or filename.lower().endswith(".pdf")
+
+        if is_pdf:
+            text = await asyncio.get_event_loop().run_in_executor(
+                None, _extract_text_from_pdf_bytes, content
+            )
+            if text.strip():
+                f["agent_file_text"] = text[:_MAX_FILE_TEXT_CHARS]
+                f["agent_file_text_status"] = "ok_text"
+            elif openai_api_key and len(content) < 20 * 1024 * 1024:
+                vision_text = await _analyze_pdf_with_vision(content, openai_api_key, filename)
+                if vision_text.strip():
+                    f["agent_file_text"] = vision_text[:_MAX_FILE_TEXT_CHARS]
+                    f["agent_file_text_status"] = "ok_vision"
+                else:
+                    f["agent_file_text_status"] = "vision_failed"
+            else:
+                f["agent_file_text_status"] = "vision_unavailable"
+        else:
+            try:
+                f["agent_file_text"] = content.decode("utf-8", errors="replace")[:_MAX_FILE_TEXT_CHARS]
+                f["agent_file_text_status"] = "ok_text"
+            except Exception:
+                f["agent_file_text_status"] = "vision_unavailable"
+
+        enriched.append(f)
+
+    return enriched
+
+
 def _parse_agent_response(raw: dict, _raw_text: str = "") -> AgentValidationResult:
     """Recursively parse the agent API response into an AgentValidationResult."""
     if "approved" in raw:
