@@ -1,27 +1,19 @@
-"""Minimal MCP (Model Context Protocol) SSE server.
+"""MCP server — Streamable HTTP transport (spec 2025-03-26).
 
-Exposes a single tool — save_ai_validation_result — so that a ChatGPT
-Workspace Agent can call back directly via the MCP protocol instead of
-the plain REST endpoint at /api/internal/ai-validation.
-
-Configure in ChatGPT Workspace > Nouvelle application:
-  URL  : https://<your-backend>/api/mcp/sse
+ChatGPT Workspace > Nouvelle application:
+  URL  : https://<your-backend>/api/mcp
   Auth : Aucune
 
-MCP SSE transport (https://spec.modelcontextprotocol.io):
-  1. Client GETs /api/mcp/sse  → server keeps the connection open and
-     immediately sends:  event: endpoint\ndata: /api/mcp/messages?session=<id>
-  2. Client POSTs JSON-RPC 2.0 messages to /api/mcp/messages?session=<id>
-  3. Server returns HTTP 202 and pushes the JSON-RPC response onto the SSE stream.
+Protocol flow (Streamable HTTP):
+  1. Client POSTs JSON-RPC to POST /api/mcp
+  2. Server responds directly with JSON-RPC in the HTTP 200 body
+  3. No shared sessions, no SSE required — works with multiple workers
 """
 
-import asyncio
 import json
-import uuid
-from typing import AsyncGenerator
 
 from fastapi import APIRouter, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 from sqlalchemy import select
 
 from app.database import async_session_maker
@@ -36,18 +28,15 @@ from app.services.ai_validation import (
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 
-# session_id → asyncio.Queue that feeds the SSE stream for that session
-_sessions: dict[str, asyncio.Queue] = {}
-
-# ── Tool definition (returned for tools/list) ────────────────────────────────
+# ── Tool definition ───────────────────────────────────────────────────────────
 
 _TOOL = {
     "name": "save_ai_validation_result",
     "description": (
         "Save the AI triage decision for an RFQ to the Sales App backend database. "
         "Call this tool at the end of every RFQ analysis with the full discussion text. "
-        "The backend will automatically detect the triage outcome (Bloqué / Libéré) "
-        "from the discussion if `approved` is not supplied."
+        "The backend automatically detects Bloqué / Libéré from the discussion text "
+        "if `approved` is not supplied."
     ),
     "inputSchema": {
         "type": "object",
@@ -62,7 +51,7 @@ _TOOL = {
             },
             "approved": {
                 "type": "boolean",
-                "description": "True = RFQ can proceed, False = blocked. Omit to auto-detect from discussion.",
+                "description": "True = can proceed, False = blocked. Omit to auto-detect.",
             },
             "message": {
                 "type": "string",
@@ -71,7 +60,7 @@ _TOOL = {
             "fields_to_correct": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Field names that need correction (for rejected RFQs).",
+                "description": "Field names that need correction (blocked RFQs).",
             },
             "conversation_url": {
                 "type": "string",
@@ -91,18 +80,16 @@ async def _run_save_tool(arguments: dict) -> dict:
     conversation_url = str(arguments.get("conversation_url") or "").strip()
     message = str(arguments.get("message") or "").strip()
     fields_to_correct = [str(f) for f in (arguments.get("fields_to_correct") or []) if f]
-    approved_raw = arguments.get("approved")  # may be bool, None, or absent
+    approved_raw = arguments.get("approved")
 
     if not systematic_rfq_id:
         return {"error": "systematic_rfq_id is required"}
     if not discussion:
         return {"error": "discussion is required"}
 
-    # Coerce approved_raw to bool | None
     if approved_raw is not None:
         approved_raw = bool(approved_raw)
 
-    # Infer approval from French discussion text when not explicit
     effective_approved = approved_raw
     if effective_approved is None:
         effective_approved = infer_approved_from_discussion(discussion)
@@ -122,6 +109,7 @@ async def _run_save_tool(arguments: dict) -> dict:
         if rfq is None:
             return {"error": f"RFQ not found: {systematic_rfq_id}"}
 
+        rfq_id = rfq.rfq_id
         rfq_data = dict(rfq.rfq_data or {})
         rfq_data["ai_validation"] = build_ai_validation_record(
             approved=resolved_approved,
@@ -138,7 +126,7 @@ async def _run_save_tool(arguments: dict) -> dict:
 
     return {
         "success": True,
-        "rfq_id": rfq.rfq_id,
+        "rfq_id": rfq_id,
         "systematic_rfq_id": systematic_rfq_id,
         "approved": resolved_approved,
         "status": normalized_status,
@@ -153,7 +141,6 @@ async def _dispatch(message: dict) -> dict | None:
     method = message.get("method", "")
     msg_id = message.get("id")
 
-    # Notifications have no id and need no response.
     if method.startswith("notifications/"):
         return None
 
@@ -165,7 +152,7 @@ async def _dispatch(message: dict) -> dict | None:
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "rfq-ai-validation", "version": "1.0.0"},
             },
@@ -192,13 +179,12 @@ async def _dispatch(message: dict) -> dict | None:
 
         try:
             result = await _run_save_tool(arguments)
-            is_error = "error" in result
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
                     "content": [{"type": "text", "text": json.dumps(result)}],
-                    "isError": is_error,
+                    "isError": "error" in result,
                 },
             }
         except Exception as exc:
@@ -220,52 +206,15 @@ async def _dispatch(message: dict) -> dict | None:
     return None
 
 
-# ── SSE endpoint ──────────────────────────────────────────────────────────────
+# ── Streamable HTTP endpoint (MCP 2025-03-26) ─────────────────────────────────
 
 
-@router.get("/sse")
-async def sse_endpoint(request: Request) -> StreamingResponse:
-    """SSE connection endpoint — keeps the MCP session alive."""
-    session_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue()
-    _sessions[session_id] = queue
+@router.post("")
+async def mcp_post(request: Request) -> Response:
+    """Main MCP endpoint — Streamable HTTP transport.
 
-    base = str(request.base_url).rstrip("/")
-    messages_url = f"{base}/api/mcp/messages?session={session_id}"
-
-    async def event_stream() -> AsyncGenerator[str, None]:
-        # MCP spec: first event MUST be 'endpoint' with the absolute messages URL.
-        yield f"event: endpoint\ndata: {messages_url}\n\n"
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    payload = await asyncio.wait_for(queue.get(), timeout=25.0)
-                    yield f"data: {json.dumps(payload)}\n\n"
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-        finally:
-            _sessions.pop(session_id, None)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-# ── Messages endpoint ─────────────────────────────────────────────────────────
-
-
-@router.post("/messages")
-async def messages_endpoint(request: Request) -> Response:
-    """Receives JSON-RPC 2.0 messages from the MCP client.
-
-    Returns the JSON-RPC response directly in the HTTP body (Streamable HTTP
-    transport) so the endpoint works even when the SSE connection lands on a
-    different worker process.  The response is also pushed onto the SSE queue
-    when a matching session exists (classic SSE transport).
+    ChatGPT POSTs JSON-RPC here and receives the response directly in the
+    HTTP body.  No shared in-memory sessions needed.
     """
     try:
         body = await request.json()
@@ -274,17 +223,25 @@ async def messages_endpoint(request: Request) -> Response:
 
     response = await _dispatch(body)
 
-    # Also forward via SSE if the session is alive on this worker.
-    session_id = request.query_params.get("session", "").strip()
-    if session_id and response is not None:
-        queue = _sessions.get(session_id)
-        if queue is not None:
-            await queue.put(response)
-
     if response is not None:
         return Response(
             content=json.dumps(response),
             status_code=200,
             media_type="application/json",
+            headers={"MCP-Protocol-Version": "2025-03-26"},
         )
     return Response(status_code=202)
+
+
+@router.get("")
+async def mcp_get() -> Response:
+    """Health-check / capability probe for the MCP endpoint."""
+    return Response(
+        content=json.dumps({
+            "server": "rfq-ai-validation",
+            "protocolVersion": "2025-03-26",
+            "transport": "streamable-http",
+        }),
+        status_code=200,
+        media_type="application/json",
+    )
