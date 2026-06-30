@@ -43,7 +43,7 @@ async def _get_rfq_for_ai_validation_callback(
     result = await db.execute(
         select(Rfq).where(
             Rfq.rfq_data["systematic_rfq_id"].astext == normalized_systematic_id
-        )
+        ).limit(1)
     )
     return result.scalar_one_or_none()
 

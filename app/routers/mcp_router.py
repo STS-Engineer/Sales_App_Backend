@@ -103,7 +103,7 @@ async def _run_save_tool(arguments: dict) -> dict:
         result = await db.execute(
             select(Rfq).where(
                 Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
-            )
+            ).limit(1)
         )
         rfq = result.scalar_one_or_none()
         if rfq is None:
