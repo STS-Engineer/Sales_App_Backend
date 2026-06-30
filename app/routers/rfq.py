@@ -1,6 +1,5 @@
 import datetime
 import httpx
-import json
 import logging
 import os
 import re
@@ -1870,9 +1869,7 @@ async def proxy_rfq_file(
     """
     result = await db.execute(
         select(Rfq).where(
-            text("rfq_data->'rfq_files' @> :search_val::jsonb").bindparams(
-                search_val=json.dumps([{"id": file_id}])
-            )
+            Rfq.rfq_data["rfq_files"].contains([{"id": file_id}])
         ).limit(1)
     )
     rfq = result.scalar_one_or_none()
