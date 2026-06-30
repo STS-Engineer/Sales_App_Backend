@@ -230,10 +230,11 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
     queue: asyncio.Queue = asyncio.Queue()
     _sessions[session_id] = queue
 
-    messages_url = f"/api/mcp/messages?session={session_id}"
+    base = str(request.base_url).rstrip("/")
+    messages_url = f"{base}/api/mcp/messages?session={session_id}"
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        # MCP spec: first event MUST be 'endpoint' with the messages URL.
+        # MCP spec: first event MUST be 'endpoint' with the absolute messages URL.
         yield f"event: endpoint\ndata: {messages_url}\n\n"
         try:
             while True:
