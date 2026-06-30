@@ -1270,6 +1270,7 @@ async def _submit_rfq_for_validation_internal(
     # Download each RFQ file from Azure and extract its text so the agent can
     # read drawing content without making outbound requests from its sandbox.
     _agent_data = dict(extracted_data)
+    _agent_data["kam_email"] = rfq.created_by_email
     _raw_files = _agent_data.get("rfq_files")
     if isinstance(_raw_files, list) and _raw_files:
         _agent_data["rfq_files"] = await prepare_rfq_files_for_agent(
