@@ -413,12 +413,14 @@ def _normalize_product_item(raw_item: Any) -> dict[str, Any] | None:
         )
     )
 
+    components = _clean_text(item.get("components"))
     normalized = {
         "product": product,
         "application": application,
         "part_number": part_number,
         "product_line": product_line,
         "costing_data": costing_data,
+        "components": components,
         "po_date": po_date,
         "ppap_date": ppap_date,
         "sop": sop,
@@ -818,6 +820,7 @@ class ProceedToFormalRequest(BaseModel):
 
 class RfqDataUpdateRequest(BaseModel):
     rfq_data: RfqDataPayload
+    update_type: str = "simple"
 
 
 class PhaseStatusUpdateRequest(BaseModel):

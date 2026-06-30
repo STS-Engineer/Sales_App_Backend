@@ -22,6 +22,7 @@ from app.routers import (
     internal,
     kpi_data,
     kpi_settings,
+    old_rfqs,
     owner,
     products,
     rfq,
@@ -119,6 +120,7 @@ app.include_router(team_view.router)
 app.include_router(internal.router)
 app.include_router(kpi_settings.router)
 app.include_router(kpi_data.router)
+app.include_router(old_rfqs.router)
 
 
 @app.get("/health", tags=["system"])

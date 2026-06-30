@@ -11,10 +11,10 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, delete as sa_delete, func, or_, select, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.attributes import flag_modified, set_committed_value
 
 from app.config import settings
 from app.database_assembly import sync_rfq_to_assembly
@@ -1425,6 +1425,91 @@ async def update_rfq_data(
 
         rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, next_data)
 
+        update_type = (body.update_type or "simple").strip()
+        if update_type in ("owner_update", "change_index"):
+            all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+            if UserRole.OWNER.value not in all_roles and not _is_rfq_creator(current_user, rfq):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only the RFQ creator or an Owner can perform this action.",
+                )
+        if update_type == "owner_update":
+            # Clear resubmission markers from rfq_data so next validation is treated as fresh.
+            _cleaned = dict(rfq.rfq_data or {})
+            _cleaned.pop("is_resubmission", None)
+            _cleaned.pop("resubmission_restore_phase", None)
+            _cleaned.pop("resubmission_restore_sub_status", None)
+            rfq.rfq_data = _cleaned
+            flag_modified(rfq, "rfq_data")
+            # Emit an explicit Core UPDATE for the phase-reset fields.
+            # This bypasses ORM dirty-tracking (which can be unreliable for SAEnum columns
+            # after multiple in-session mutations) and guarantees the SQL reaches the DB.
+            # SQLAlchemy autoflushes pending ORM changes (rfq_data, etc.) before this executes.
+            await db.execute(
+                sa_update(Rfq)
+                .where(Rfq.rfq_id == rfq_id)
+                .values(
+                    phase=RfqPhase.RFQ,
+                    sub_status=RfqSubStatus.PENDING_FOR_VALIDATION,
+                    costing_files=None,
+                    costing_file_state=None,
+                    approved_at=None,
+                    rejected_at=None,
+                    last_notification_sent_at=None,
+                )
+            )
+            if rfq.offer_preparation is not None:
+                await db.delete(rfq.offer_preparation)
+            # Remove costing-cycle audit log entries so the next cycle starts clean.
+            # Only targets the three action types that drive the frontend costing displays:
+            #   - Reception audit "Approved/Rejected" card (extractCostingReviewAudit)
+            #   - Feasibility handoff card (extractFeasibilitySaveAudit)
+            # Filtered strictly by rfq_id — no other RFQ is affected.
+            await db.execute(
+                sa_delete(AuditLog).where(
+                    AuditLog.rfq_id == rfq_id,
+                    or_(
+                        AuditLog.action == "Costing review approved",
+                        AuditLog.action.like("Costing review rejected%"),
+                        AuditLog.action.like("Status advanced to COSTING/PRICING%"),
+                    ),
+                )
+            )
+            await log_action(
+                db,
+                rfq_id,
+                "RFQ updated by creator — reset to pending validation, costing data cleared.",
+                current_user.email,
+            )
+        if update_type == "change_index":
+            final_data = dict(rfq.rfq_data or {})
+            old_systematic_id = final_data.get("systematic_rfq_id") or ""
+            if not old_systematic_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot increment RFQ index: RFQ reference has not been assigned yet.",
+                )
+            new_systematic_id = _increment_rfq_reference_index(old_systematic_id)
+            dup_result = await db.execute(
+                select(func.count()).select_from(Rfq).where(
+                    Rfq.rfq_data["systematic_rfq_id"].astext == new_systematic_id,
+                    Rfq.rfq_id != rfq_id,
+                )
+            )
+            if dup_result.scalar_one() > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"RFQ reference {new_systematic_id} already exists.",
+                )
+            final_data["systematic_rfq_id"] = new_systematic_id
+            rfq.rfq_data = final_data
+            await log_action(
+                db,
+                rfq_id,
+                f"RFQ index changed from {old_systematic_id} to {new_systematic_id}",
+                current_user.email,
+            )
+
         await db.commit()
         rfq_result = await _get_rfq_or_404(db, rfq_id)
         # Validate inside try/except so any MissingGreenlet / ResponseValidationError
@@ -2455,12 +2540,6 @@ async def validate_rfq(
             detail="You are not assigned as the Validator for this RFQ.",
         )
 
-    if _validation_action_timestamp(rfq):
-        raise HTTPException(
-            status_code=400,
-            detail="A validation action has already been recorded for this RFQ.",
-        )
-
     if (rfq.phase, rfq.sub_status) != (
         RfqPhase.RFQ,
         RfqSubStatus.PENDING_FOR_VALIDATION,
@@ -2472,6 +2551,13 @@ async def validate_rfq(
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
+
+    # Stale timestamps can remain if a previous validation response failed after commit
+    # (MissingGreenlet) while the RFQ was later reset to PENDING_FOR_VALIDATION.
+    # Clear them so re-validation is not blocked.
+    if _validation_action_timestamp(rfq):
+        rfq.approved_at = None
+        rfq.rejected_at = None
 
     if body.approved:
         _pre_commit_data = dict(rfq.rfq_data or {})
@@ -2557,6 +2643,9 @@ async def validate_rfq(
                     recipients=notified_costing,
                     email_type=EMAIL_COSTING_ENTRY,
                 )
+                # record_notification_sent commits internally — reload to avoid
+                # accessing expired attributes on the next read.
+                refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
             if is_resubmission_approval:
                 next_data = dict(refreshed_rfq.rfq_data or {})
                 next_data.pop("is_resubmission", None)
@@ -2564,6 +2653,7 @@ async def validate_rfq(
                 next_data.pop("resubmission_restore_sub_status", None)
                 refreshed_rfq.rfq_data = next_data
                 await db.commit()
+                refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
 

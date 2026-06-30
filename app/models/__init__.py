@@ -19,6 +19,7 @@ from app.models.potential import Potential
 from app.models.kpi_annual_target import KpiAnnualTarget
 from app.models.kpi_opportunity import KpiOpportunity
 from app.models.kpi_new_business import KpiNewBusiness
+from app.models.old_rfq_raw import OldRfqRaw
 
 __all__ = [
     "User",
@@ -42,4 +43,5 @@ __all__ = [
     "KpiAnnualTarget",
     "KpiOpportunity",
     "KpiNewBusiness",
+    "OldRfqRaw",
 ]
