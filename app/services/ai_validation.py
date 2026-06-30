@@ -363,6 +363,12 @@ async def prepare_rfq_files_for_agent(
             except Exception:
                 f["agent_file_text_status"] = "vision_unavailable"
 
+        logger.info(
+            "[file-prep] %s → status=%s chars=%s",
+            filename,
+            f.get("agent_file_text_status"),
+            len(f.get("agent_file_text") or ""),
+        )
         enriched.append(f)
 
     return enriched
