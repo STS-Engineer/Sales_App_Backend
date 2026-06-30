@@ -304,6 +304,7 @@ def _build_blob_access_url(blob_name: str) -> str:
     return f"{blob_client.url}?{sas_token}" if sas_token else blob_client.url
 
 
+
 def _safe_upload_filename(filename: str | None) -> str:
     return os.path.basename(filename or "attachment") or "attachment"
 
@@ -1265,53 +1266,18 @@ async def _submit_rfq_for_validation_internal(
         extracted_data.pop("resubmission_restore_sub_status", None)
 
     # ── AI pre-validation ─────────────────────────────────────────────────────
-    # Build a simplified attachment payload for the agent. Keep only one
-    # canonical access URL so the model does not pick the raw private blob URL.
+    # Inject proxy_url for any rfq_files entries that lack it so the agent can
+    # access drawings through the backend proxy regardless of upload date.
     _agent_data = dict(extracted_data)
     _raw_files = _agent_data.get("rfq_files")
     if isinstance(_raw_files, list) and _raw_files:
         _base = settings.backend_base_url
-        _agent_files = []
-        for file_meta in _raw_files:
-            if not isinstance(file_meta, dict):
-                continue
-            proxy_url = str(file_meta.get("proxy_url") or "").strip()
-            if not proxy_url and file_meta.get("id"):
-                proxy_url = f"{_base}/api/rfq/files/{file_meta['id']}/proxy"
-            agent_file_url = proxy_url or str(
-                file_meta.get("download_url")
-                or file_meta.get("url")
-                or file_meta.get("path")
-                or ""
-            ).strip()
-            agent_file = {
-                "id": str(file_meta.get("id") or "").strip(),
-                "name": str(
-                    file_meta.get("name")
-                    or file_meta.get("filename")
-                    or "attachment"
-                ).strip(),
-                "filename": str(
-                    file_meta.get("filename")
-                    or file_meta.get("name")
-                    or "attachment"
-                ).strip(),
-                "content_type": str(file_meta.get("content_type") or "").strip(),
-                "size": file_meta.get("size"),
-                "agent_file_url": agent_file_url,
-            }
-            _agent_files.append(
-                {
-                    key: value
-                    for key, value in agent_file.items()
-                    if value not in ("", None, [])
-                }
-            )
-        _agent_data["rfq_files"] = _agent_files
-        if _agent_files:
-            _primary_file_url = str(_agent_files[0].get("agent_file_url") or "").strip()
-            if _primary_file_url:
-                _agent_data["rfq_file_path"] = _primary_file_url
+        _agent_data["rfq_files"] = [
+            {**f, "proxy_url": f"{_base}/api/rfq/files/{f['id']}/proxy"}
+            if f.get("id") and not f.get("proxy_url")
+            else f
+            for f in _raw_files
+        ]
 
     # Call the Workspace Agent before committing any DB change or sending email.
     # On network / service errors we log and fail open to avoid blocking submissions

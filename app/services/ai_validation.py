@@ -187,21 +187,6 @@ def extract_ai_validation_record(rfq_data: dict | None) -> dict[str, Any] | None
         checked_at=str(raw.get("checked_at") or ""),
         source=str(raw.get("source") or ""),
     )
-
-
-def _build_agent_trigger_input(rfq_data: dict[str, Any]) -> str:
-    """Build the text payload sent to the Workspace Agent trigger API."""
-
-    preface = (
-        "Analyze the RFQ JSON below.\n"
-        "If `rfq_files` is present, use only `rfq_files[].agent_file_url` to open "
-        "attachments.\n"
-        "Do not reconstruct file links and do not use `blob_url`.\n"
-        "The JSON starts below.\n\n"
-    )
-    return preface + json.dumps(rfq_data, ensure_ascii=False, default=str)
-
-
 def _parse_agent_response(raw: dict, _raw_text: str = "") -> AgentValidationResult:
     """Recursively parse the agent API response into an AgentValidationResult."""
     if "approved" in raw:
@@ -323,7 +308,7 @@ async def validate_rfq_with_agent(rfq_data: dict) -> AgentValidationResult:
         access_token[:8] + "..." if len(access_token) > 8 else "(short)",
     )
 
-    payload = {"input": _build_agent_trigger_input(rfq_data)}
+    payload = {"input": json.dumps(rfq_data, ensure_ascii=False, default=str)}
     conversation_key = str(
         rfq_data.get("systematic_rfq_id") or rfq_data.get("rfq_id") or ""
     ).strip()

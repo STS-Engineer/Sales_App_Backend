@@ -11,11 +11,19 @@ Protocol flow (Streamable HTTP):
 """
 
 import json
+import os
+from functools import lru_cache
+
+import fitz
+import httpx
+from azure.core.exceptions import ResourceNotFoundError
+from azure.storage.blob import BlobServiceClient
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from sqlalchemy import select
 
+from app.config import settings
 from app.database import async_session_maker
 from app.models.rfq import Rfq
 from app.services.ai_validation import (
@@ -28,9 +36,13 @@ from app.services.ai_validation import (
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 
+RFQ_FILES_CONTAINER = settings.azure_rfq_files_container or "rfq-files"
+PDF_TEXT_MAX_PAGES = 8
+PDF_TEXT_MAX_CHARS = 20000
+
 # ── Tool definition ───────────────────────────────────────────────────────────
 
-_TOOL = {
+_SAVE_TOOL = {
     "name": "save_ai_validation_result",
     "description": (
         "Save the AI triage decision for an RFQ to the Sales App backend database. "
@@ -70,6 +82,161 @@ _TOOL = {
         "required": ["systematic_rfq_id", "discussion"],
     },
 }
+
+_READ_ATTACHMENT_TOOL = {
+    "name": "read_rfq_attachment_text",
+    "description": (
+        "Read one RFQ attachment from Sales App storage and return deterministic text "
+        "extracted from the file. Prefer this tool over opening raw attachment URLs. "
+        "Use it before deciding that a PDF plan is inaccessible. For readable PDFs it "
+        "returns extracted text; for image-only or unreadable PDFs it returns an "
+        "explicit status instead of guessing."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "systematic_rfq_id": {
+                "type": "string",
+                "description": "RFQ identifier, e.g. 26511-ASS-00.",
+            },
+            "file_id": {
+                "type": "string",
+                "description": "Optional RFQ file identifier from rfq_files[].id.",
+            },
+            "filename_contains": {
+                "type": "string",
+                "description": "Optional case-insensitive filename fragment if file_id is unknown.",
+            },
+        },
+        "required": ["systematic_rfq_id"],
+    },
+}
+
+_TOOLS = [_SAVE_TOOL, _READ_ATTACHMENT_TOOL]
+
+
+@lru_cache(maxsize=1)
+def _get_blob_service_client() -> BlobServiceClient:
+    if not settings.azure_connection_string:
+        raise RuntimeError("AZURE_CONNECTION_STRING is not configured.")
+    return BlobServiceClient.from_connection_string(settings.azure_connection_string)
+
+
+def _get_rfq_files_container_client():
+    return _get_blob_service_client().get_container_client(RFQ_FILES_CONTAINER)
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    if not content:
+        return ""
+    try:
+        with fitz.open(stream=content, filetype="pdf") as pdf_document:
+            chunks: list[str] = []
+            max_pages = min(pdf_document.page_count, PDF_TEXT_MAX_PAGES)
+            for page_index in range(max_pages):
+                page = pdf_document.load_page(page_index)
+                page_text = (page.get_text("text") or "").strip()
+                if not page_text:
+                    continue
+                chunks.append(f"[Page {page_index + 1}]\n{page_text}")
+                joined = "\n\n".join(chunks)
+                if len(joined) >= PDF_TEXT_MAX_CHARS:
+                    return joined[:PDF_TEXT_MAX_CHARS].rstrip() + "\n\n[Truncated]"
+            return "\n\n".join(chunks).strip()
+    except Exception:
+        return ""
+
+
+def _extract_attachment_text(content: bytes, content_type: str, filename: str) -> str:
+    normalized_type = str(content_type or "").strip().lower()
+    extension = os.path.splitext(str(filename or "").strip().lower())[1]
+
+    if normalized_type == "application/pdf" or extension == ".pdf":
+        return _extract_pdf_text(content)
+
+    if normalized_type.startswith("text/") or extension in {".txt", ".csv", ".json", ".xml"}:
+        try:
+            return content.decode("utf-8", errors="ignore").strip()[:PDF_TEXT_MAX_CHARS]
+        except Exception:
+            return ""
+
+    return ""
+
+
+def _pick_rfq_file_entry(
+    rfq_files: list[dict],
+    *,
+    file_id: str = "",
+    filename_contains: str = "",
+) -> dict | None:
+    normalized_file_id = file_id.strip()
+    if normalized_file_id:
+        return next(
+            (
+                entry
+                for entry in rfq_files
+                if str(entry.get("id") or entry.get("file_id") or "").strip()
+                == normalized_file_id
+            ),
+            None,
+        )
+
+    normalized_filename = filename_contains.strip().lower()
+    if normalized_filename:
+        return next(
+            (
+                entry
+                for entry in rfq_files
+                if normalized_filename in str(
+                    entry.get("filename") or entry.get("name") or ""
+                )
+                .strip()
+                .lower()
+            ),
+            None,
+        )
+
+    return rfq_files[0] if rfq_files else None
+
+
+async def _download_attachment_bytes(file_entry: dict) -> tuple[bytes | None, str]:
+    candidate_urls = [
+        str(file_entry.get("download_url") or "").strip(),
+        str(file_entry.get("url") or "").strip(),
+        str(file_entry.get("path") or "").strip(),
+        str(file_entry.get("proxy_url") or "").strip(),
+    ]
+    candidate_urls = [url for url in candidate_urls if url]
+
+    for candidate_url in candidate_urls:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0),
+                follow_redirects=True,
+                trust_env=False,
+            ) as client:
+                response = await client.get(candidate_url)
+            if response.status_code == 200 and response.content:
+                return response.content, str(
+                    response.headers.get("content-type")
+                    or file_entry.get("content_type")
+                    or "application/octet-stream"
+                ).strip()
+        except Exception:
+            continue
+
+    blob_name = str(file_entry.get("blob_name") or "").strip()
+    if not blob_name or not settings.azure_connection_string:
+        return None, ""
+
+    try:
+        blob_client = _get_rfq_files_container_client().get_blob_client(blob_name)
+        content = blob_client.download_blob().readall()
+        return content, str(file_entry.get("content_type") or "application/octet-stream").strip()
+    except ResourceNotFoundError:
+        return None, ""
+    except Exception:
+        return None, ""
 
 # ── Tool executor ─────────────────────────────────────────────────────────────
 
@@ -134,6 +301,81 @@ async def _run_save_tool(arguments: dict) -> dict:
     }
 
 
+async def _run_read_attachment_tool(arguments: dict) -> dict:
+    systematic_rfq_id = str(arguments.get("systematic_rfq_id") or "").strip()
+    file_id = str(arguments.get("file_id") or "").strip()
+    filename_contains = str(arguments.get("filename_contains") or "").strip()
+
+    if not systematic_rfq_id:
+        return {"error": "systematic_rfq_id is required"}
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(Rfq).where(
+                Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
+            ).limit(1)
+        )
+        rfq = result.scalar_one_or_none()
+        if rfq is None:
+            return {"error": f"RFQ not found: {systematic_rfq_id}"}
+
+        rfq_files = [
+            entry
+            for entry in list((rfq.rfq_data or {}).get("rfq_files") or [])
+            if isinstance(entry, dict)
+        ]
+        if not rfq_files:
+            return {
+                "error": "No RFQ attachments are registered for this RFQ.",
+                "systematic_rfq_id": systematic_rfq_id,
+            }
+
+        file_entry = _pick_rfq_file_entry(
+            rfq_files,
+            file_id=file_id,
+            filename_contains=filename_contains,
+        )
+        if file_entry is None:
+            return {
+                "error": "Requested RFQ attachment was not found.",
+                "systematic_rfq_id": systematic_rfq_id,
+            }
+
+    filename = str(
+        file_entry.get("filename")
+        or file_entry.get("name")
+        or os.path.basename(str(file_entry.get("blob_name") or "").strip())
+    ).strip()
+    content, content_type = await _download_attachment_bytes(file_entry)
+    if not content:
+        return {
+            "error": "Unable to download RFQ attachment from the registered sources.",
+            "systematic_rfq_id": systematic_rfq_id,
+            "file_id": str(file_entry.get("id") or "").strip(),
+            "filename": filename,
+        }
+
+    extracted_text = _extract_attachment_text(content, content_type, filename)
+    status = "ok" if extracted_text else "no_extractable_text"
+    message = (
+        "Attachment text extracted successfully."
+        if extracted_text
+        else "The attachment downloaded successfully but no readable text layer was extracted."
+    )
+
+    return {
+        "success": True,
+        "systematic_rfq_id": systematic_rfq_id,
+        "file_id": str(file_entry.get("id") or "").strip(),
+        "filename": filename,
+        "content_type": content_type,
+        "status": status,
+        "message": message,
+        "text_length": len(extracted_text),
+        "text": extracted_text,
+    }
+
+
 # ── JSON-RPC dispatcher ───────────────────────────────────────────────────────
 
 
@@ -162,7 +404,7 @@ async def _dispatch(message: dict) -> dict | None:
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {"tools": [_TOOL]},
+            "result": {"tools": _TOOLS},
         }
 
     if method == "tools/call":
@@ -170,15 +412,17 @@ async def _dispatch(message: dict) -> dict | None:
         tool_name = params.get("name", "")
         arguments = params.get("arguments") or {}
 
-        if tool_name != "save_ai_validation_result":
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
-            }
-
         try:
-            result = await _run_save_tool(arguments)
+            if tool_name == "save_ai_validation_result":
+                result = await _run_save_tool(arguments)
+            elif tool_name == "read_rfq_attachment_text":
+                result = await _run_read_attachment_tool(arguments)
+            else:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
+                }
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
