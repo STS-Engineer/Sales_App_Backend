@@ -1203,9 +1203,7 @@ async def _submit_rfq_for_validation_internal(
 
     is_resubmission = (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ)
 
-    if is_resubmission and rfq.sub_status in {
-        RfqSubStatus.PENDING_FOR_VALIDATION, RfqSubStatus.AI_APPROVED
-    }:
+    if is_resubmission and rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
         raise HTTPException(
             status_code=400,
             detail="This RFQ is already pending validation.",
@@ -1336,15 +1334,15 @@ async def _submit_rfq_for_validation_internal(
     rfq.product_line_acronym = acronym
     rfq.approved_at = None
     rfq.rejected_at = None
-    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.AI_APPROVED)
+    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION)
 
     action_label = "re-submitted for validation" if is_resubmission else "submitted for validation"
     await log_action(
         db,
         rfq.rfq_id,
         (
-            f"RFQ {action_label} (AI approved) -> "
-            f"{RfqPhase.RFQ.value}/{RfqSubStatus.AI_APPROVED.value}"
+            f"RFQ {action_label} -> "
+            f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_FOR_VALIDATION.value}"
         ),
         current_user.email,
     )
@@ -2351,13 +2349,11 @@ async def request_revision(
             detail="You are not assigned as the Validator for this RFQ.",
         )
 
-    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
-        RfqSubStatus.AI_APPROVED, RfqSubStatus.PENDING_FOR_VALIDATION
-    }:
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status != RfqSubStatus.PENDING_FOR_VALIDATION:
         raise HTTPException(
             status_code=400,
             detail=(
-                "RFQ must be in RFQ/AI_APPROVED or RFQ/PENDING_FOR_VALIDATION before requesting a revision. "
+                "RFQ must be in RFQ/PENDING_FOR_VALIDATION before requesting a revision. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
@@ -2552,13 +2548,11 @@ async def validate_rfq(
             detail="A validation action has already been recorded for this RFQ.",
         )
 
-    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in {
-        RfqSubStatus.AI_APPROVED, RfqSubStatus.PENDING_FOR_VALIDATION
-    }:
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status != RfqSubStatus.PENDING_FOR_VALIDATION:
         raise HTTPException(
             status_code=400,
             detail=(
-                "RFQ must be in RFQ/AI_APPROVED or RFQ/PENDING_FOR_VALIDATION before it can be validated. "
+                "RFQ must be in RFQ/PENDING_FOR_VALIDATION before it can be validated. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
