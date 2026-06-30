@@ -260,20 +260,31 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
 
 @router.post("/messages")
 async def messages_endpoint(request: Request) -> Response:
-    """Receives JSON-RPC 2.0 messages from the MCP client."""
-    session_id = request.query_params.get("session", "").strip()
-    queue = _sessions.get(session_id)
-    if queue is None:
-        return Response(status_code=404, content="MCP session not found")
+    """Receives JSON-RPC 2.0 messages from the MCP client.
 
+    Returns the JSON-RPC response directly in the HTTP body (Streamable HTTP
+    transport) so the endpoint works even when the SSE connection lands on a
+    different worker process.  The response is also pushed onto the SSE queue
+    when a matching session exists (classic SSE transport).
+    """
     try:
         body = await request.json()
     except Exception:
         return Response(status_code=400, content="Invalid JSON")
 
     response = await _dispatch(body)
-    if response is not None:
-        await queue.put(response)
 
-    # MCP spec: always return 202 — the actual response travels over SSE.
+    # Also forward via SSE if the session is alive on this worker.
+    session_id = request.query_params.get("session", "").strip()
+    if session_id and response is not None:
+        queue = _sessions.get(session_id)
+        if queue is not None:
+            await queue.put(response)
+
+    if response is not None:
+        return Response(
+            content=json.dumps(response),
+            status_code=200,
+            media_type="application/json",
+        )
     return Response(status_code=202)
