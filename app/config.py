@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     # Set to true locally to surface Graph errors instead of swallowing them
     SHAREPOINT_SYNC_RAISE_ERRORS: bool = False
 
+    # Workspace Agent GPT — AI pre-validation before sending the validator email.
+    # Required to enable AI validation; submission proceeds without it if not set.
+    AGENT_ACCESS_TOKEN: str | None = None
+    WORKSPACE_AGENT_TRIGGER_ID: str | None = None
+    WORKSPACE_AGENT_BASE_URL: str = "https://api.chatgpt.com/v1"
+    AI_VALIDATION_CALLBACK_TOKEN: str | None = None
+
+    # Public-facing backend URL used to build proxy URLs for external services.
+    BACKEND_BASE_URL: str = "https://sales-app-backend.azurewebsites.net"
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE))
 
     @property
@@ -154,6 +164,34 @@ class Settings(BaseSettings):
     @property
     def sharepoint_sync_raise_errors(self) -> bool:
         return bool(self.SHAREPOINT_SYNC_RAISE_ERRORS)
+
+    @property
+    def agent_access_token(self) -> str:
+        return (self.AGENT_ACCESS_TOKEN or "").strip("\"' ")
+
+    @property
+    def workspace_agent_trigger_id(self) -> str:
+        return (self.WORKSPACE_AGENT_TRIGGER_ID or "").strip("\"' ")
+
+    @property
+    def workspace_agent_base_url(self) -> str:
+        base_url = (self.WORKSPACE_AGENT_BASE_URL or "https://api.chatgpt.com/v1").strip("\"' ")
+        return base_url.rstrip("/")
+
+    @property
+    def workspace_agent_endpoint(self) -> str:
+        trigger_id = self.workspace_agent_trigger_id
+        if not trigger_id:
+            return ""
+        return f"{self.workspace_agent_base_url}/workspace_agents/{trigger_id}/trigger"
+
+    @property
+    def ai_validation_callback_token(self) -> str:
+        return (self.AI_VALIDATION_CALLBACK_TOKEN or "").strip("\"' ")
+
+    @property
+    def backend_base_url(self) -> str:
+        return (self.BACKEND_BASE_URL or "https://sales-app-backend.azurewebsites.net").strip().rstrip("/")
 
     @staticmethod
     def _build_async_db_url(raw_url: str | None) -> URL | None:

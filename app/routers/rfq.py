@@ -1,4 +1,5 @@
 import datetime
+import httpx
 import logging
 import os
 import re
@@ -6,7 +7,6 @@ import uuid
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
-
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSettings, generate_blob_sas
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile
@@ -42,6 +42,7 @@ from app.schemas.discussion import (
     DiscussionMessageOut,
 )
 from app.schemas.rfq import (
+    AiValidationStatusOut,
     AdvanceStatusRequest,
     AuditLogOut,
     CostingValidationRequest,
@@ -62,6 +63,14 @@ from app.schemas.rfq import (
     rfq_data_payload_to_dict,
 )
 from app.services.audit import log_action
+from app.services.ai_validation import (
+    AgentValidationResult,
+    build_ai_validation_record,
+    current_timestamp_iso,
+    extract_ai_validation_record,
+    prepare_rfq_files_for_agent,
+    validate_rfq_with_agent,
+)
 from app.services.sharepoint_service import sync_rfq_to_sharepoint, upload_feasibility_to_sharepoint
 from app.services.costing_template import (
     build_costing_template_filename,
@@ -293,6 +302,7 @@ def _build_blob_access_url(blob_name: str) -> str:
         expiry=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650),
     )
     return f"{blob_client.url}?{sas_token}" if sas_token else blob_client.url
+
 
 
 def _safe_upload_filename(filename: str | None) -> str:
@@ -1254,6 +1264,86 @@ async def _submit_rfq_for_validation_internal(
         extracted_data.pop("is_resubmission", None)
         extracted_data.pop("resubmission_restore_phase", None)
         extracted_data.pop("resubmission_restore_sub_status", None)
+
+    # ── AI pre-validation ─────────────────────────────────────────────────────
+    # Download each RFQ file from Azure and extract its text so the agent can
+    # read drawing content without making outbound requests from its sandbox.
+    _agent_data = dict(extracted_data)
+    _agent_data["kam_email"] = rfq.created_by_email
+    _raw_files = _agent_data.get("rfq_files")
+    if isinstance(_raw_files, list) and _raw_files:
+        _agent_data["rfq_files"] = await prepare_rfq_files_for_agent(
+            _raw_files,
+            backend_base_url=settings.backend_base_url,
+            azure_connection_string=settings.azure_connection_string,
+            azure_container=settings.azure_rfq_files_container,
+            openai_api_key=settings.OPENAI_API_KEY,
+        )
+
+    # Call the Workspace Agent before committing any DB change or sending email.
+    # On network / service errors we log and fail open to avoid blocking submissions
+    # when the AI endpoint is temporarily unavailable.
+    try:
+        ai_result: AgentValidationResult = await validate_rfq_with_agent(_agent_data)
+    except httpx.HTTPStatusError as ai_exc:
+        logger.warning(
+            "AI validation skipped for RFQ %s due to Workspace Agent HTTP error: %s",
+            systematic_rfq_id,
+            ai_exc,
+        )
+        ai_result = AgentValidationResult(
+            approved=True,
+            message="AI validation skipped: Workspace Agent access is not configured correctly.",
+            discussion=str(ai_exc),
+            status="skipped",
+        )
+    except Exception as ai_exc:
+        import traceback as _tb
+        _error_detail = f"{type(ai_exc).__name__}: {ai_exc}\n\n{_tb.format_exc()}"
+        print(f"\n[AI VALIDATION ERROR] RFQ {systematic_rfq_id}\n{_error_detail}\n", flush=True)
+        logger.exception(
+            "AI validation skipped for RFQ %s due to unexpected error.",
+            systematic_rfq_id,
+        )
+        ai_result = AgentValidationResult(
+            approved=True,
+            message="AI validation skipped due to service unavailability.",
+            discussion=(
+                "AI validation service unavailable. "
+                "See backend logs for technical details."
+            ),
+            status="skipped",
+        )
+
+    # Persist the AI result in rfq_data regardless of outcome so the frontend
+    # can always display the agent's response — even after a page reload.
+    extracted_data["ai_validation"] = build_ai_validation_record(
+        approved=ai_result.approved,
+        status=ai_result.status or "completed",
+        message=ai_result.message or "",
+        discussion=ai_result.discussion or "",
+        conversation_url=ai_result.conversation_url or "",
+        fields_to_correct=ai_result.fields_to_correct,
+        checked_at=current_timestamp_iso(),
+        source="workspace_agent_trigger",
+    )
+
+    if not ai_result.approved:
+        # Save the rejection result to the DB (rfq_data only, no status change),
+        # then surface the detail to the frontend via 422.
+        rfq.rfq_data = {**(rfq.rfq_data or {}), "ai_validation": extracted_data["ai_validation"]}
+        await db.commit()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ai_blocked": True,
+                "message": ai_result.message
+                or "The AI agent blocked this RFQ. Please correct the indicated fields.",
+                "fields_to_correct": ai_result.fields_to_correct,
+            },
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     rfq.rfq_data = extracted_data
     rfq.zone_manager_email = zone_manager_email
     rfq.product_line_acronym = acronym
@@ -1624,6 +1714,7 @@ async def upload_rfq_file(
         "path": blob_access_url,
         "url": blob_access_url,
         "download_url": blob_access_url,
+        "proxy_url": f"{settings.backend_base_url}/api/rfq/files/{file_id}/proxy",
         "blob_url": blob_client.url,
         "blob_name": blob_name,
         "content_type": file.content_type or "application/octet-stream",
@@ -1853,6 +1944,61 @@ async def download_costing_file(
     )
 
 
+@router.get("/files/{file_id}/proxy")
+async def proxy_rfq_file(
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Proxy an RFQ drawing/file for external services (e.g. ChatGPT Workspace Agent).
+
+    Public — no auth required. Streams the blob through the backend so external
+    callers are not blocked by Azure Storage network rules.
+    """
+    result = await db.execute(
+        select(Rfq).where(
+            Rfq.rfq_data["rfq_files"].contains([{"id": file_id}])
+        ).limit(1)
+    )
+    rfq = result.scalar_one_or_none()
+    if rfq is None:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    rfq_files = list((rfq.rfq_data or {}).get("rfq_files") or [])
+    file_entry = next((f for f in rfq_files if str(f.get("id") or "") == file_id), None)
+    if not file_entry:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    blob_name = str(file_entry.get("blob_name") or "").strip()
+    if not blob_name or not settings.azure_connection_string:
+        raise HTTPException(status_code=404, detail="File storage unavailable.")
+
+    original_name = str(
+        file_entry.get("filename") or
+        file_entry.get("name") or
+        os.path.basename(blob_name)
+    )
+    content_type = str(file_entry.get("content_type") or "application/octet-stream")
+
+    try:
+        blob_client = _get_rfq_files_container_client().get_blob_client(blob_name)
+        download_stream = blob_client.download_blob()
+        content = download_stream.readall()
+    except ResourceNotFoundError:
+        raise HTTPException(status_code=404, detail="File no longer exists in storage.")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to proxy file: {exc}")
+
+    safe_filename = original_name.replace('"', '\\"')
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{safe_filename}"',
+            "Content-Length": str(len(content)),
+        },
+    )
+
+
 @router.get("", response_model=list[RfqOut])
 async def list_rfqs(
     document_type: list[str] | None = Query(default=None),
@@ -1976,7 +2122,22 @@ async def get_rfq(
             "is_viewer": True,
         }
     return rfq
- 
+
+
+@router.get("/{rfq_id}/ai-validation-status", response_model=AiValidationStatusOut)
+async def get_rfq_ai_validation_status(
+    rfq_id: str,
+    db: AsyncSession = Depends(get_db),
+    db_kpi: AsyncSession | None = Depends(get_db4_optional),
+    current_user: User = Depends(get_current_user),
+):
+    rfq = await _get_rfq_or_404(db, rfq_id)
+    await _assert_can_view_rfq(db, current_user, rfq, db_kpi=db_kpi)
+    ai_validation = extract_ai_validation_record(rfq.rfq_data)
+    if ai_validation is None:
+        raise HTTPException(status_code=404, detail="AI validation status not found.")
+    return ai_validation
+
 
 @router.get("/{rfq_id}/discussion", response_model=list[DiscussionMessageOut])
 async def get_rfq_discussion(
@@ -2344,10 +2505,7 @@ async def request_revision(
             detail="You are not assigned as the Validator for this RFQ.",
         )
 
-    if (rfq.phase, rfq.sub_status) != (
-        RfqPhase.RFQ,
-        RfqSubStatus.PENDING_FOR_VALIDATION,
-    ):
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status != RfqSubStatus.PENDING_FOR_VALIDATION:
         raise HTTPException(
             status_code=400,
             detail=(
