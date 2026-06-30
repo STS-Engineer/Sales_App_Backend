@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     WORKSPACE_AGENT_BASE_URL: str = "https://api.chatgpt.com/v1"
     AI_VALIDATION_CALLBACK_TOKEN: str | None = None
 
+    # Public-facing backend URL used to build proxy URLs for external services.
+    BACKEND_BASE_URL: str = "https://sales-app-backend.azurewebsites.net"
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE))
 
     @property
@@ -185,6 +188,10 @@ class Settings(BaseSettings):
     @property
     def ai_validation_callback_token(self) -> str:
         return (self.AI_VALIDATION_CALLBACK_TOKEN or "").strip("\"' ")
+
+    @property
+    def backend_base_url(self) -> str:
+        return (self.BACKEND_BASE_URL or "https://sales-app-backend.azurewebsites.net").strip().rstrip("/")
 
     @staticmethod
     def _build_async_db_url(raw_url: str | None) -> URL | None:

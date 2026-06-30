@@ -1,5 +1,6 @@
 import datetime
 import httpx
+import json
 import logging
 import os
 import re
@@ -1265,11 +1266,24 @@ async def _submit_rfq_for_validation_internal(
         extracted_data.pop("resubmission_restore_sub_status", None)
 
     # ── AI pre-validation ─────────────────────────────────────────────────────
+    # Inject proxy_url for any rfq_files entries that lack it so the agent can
+    # access drawings through the backend proxy regardless of upload date.
+    _agent_data = dict(extracted_data)
+    _raw_files = _agent_data.get("rfq_files")
+    if isinstance(_raw_files, list) and _raw_files:
+        _base = settings.backend_base_url
+        _agent_data["rfq_files"] = [
+            {**f, "proxy_url": f"{_base}/api/rfq/files/{f['id']}/proxy"}
+            if f.get("id") and not f.get("proxy_url")
+            else f
+            for f in _raw_files
+        ]
+
     # Call the Workspace Agent before committing any DB change or sending email.
     # On network / service errors we log and fail open to avoid blocking submissions
     # when the AI endpoint is temporarily unavailable.
     try:
-        ai_result: AgentValidationResult = await validate_rfq_with_agent(extracted_data)
+        ai_result: AgentValidationResult = await validate_rfq_with_agent(_agent_data)
     except httpx.HTTPStatusError as ai_exc:
         logger.warning(
             "AI validation skipped for RFQ %s due to Workspace Agent HTTP error: %s",
@@ -1614,6 +1628,7 @@ async def upload_rfq_file(
         "path": blob_access_url,
         "url": blob_access_url,
         "download_url": blob_access_url,
+        "proxy_url": f"{settings.backend_base_url}/api/rfq/files/{file_id}/proxy",
         "blob_url": blob_client.url,
         "blob_name": blob_name,
         "content_type": file.content_type or "application/octet-stream",
@@ -1838,6 +1853,63 @@ async def download_costing_file(
         media_type=content_type,
         headers={
             "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Content-Length": str(len(content)),
+        },
+    )
+
+
+@router.get("/files/{file_id}/proxy")
+async def proxy_rfq_file(
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Proxy an RFQ drawing/file for external services (e.g. ChatGPT Workspace Agent).
+
+    Public — no auth required. Streams the blob through the backend so external
+    callers are not blocked by Azure Storage network rules.
+    """
+    result = await db.execute(
+        select(Rfq).where(
+            text("rfq_data->'rfq_files' @> :search_val::jsonb").bindparams(
+                search_val=json.dumps([{"id": file_id}])
+            )
+        ).limit(1)
+    )
+    rfq = result.scalar_one_or_none()
+    if rfq is None:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    rfq_files = list((rfq.rfq_data or {}).get("rfq_files") or [])
+    file_entry = next((f for f in rfq_files if str(f.get("id") or "") == file_id), None)
+    if not file_entry:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    blob_name = str(file_entry.get("blob_name") or "").strip()
+    if not blob_name or not settings.azure_connection_string:
+        raise HTTPException(status_code=404, detail="File storage unavailable.")
+
+    original_name = str(
+        file_entry.get("filename") or
+        file_entry.get("name") or
+        os.path.basename(blob_name)
+    )
+    content_type = str(file_entry.get("content_type") or "application/octet-stream")
+
+    try:
+        blob_client = _get_rfq_files_container_client().get_blob_client(blob_name)
+        download_stream = blob_client.download_blob()
+        content = download_stream.readall()
+    except ResourceNotFoundError:
+        raise HTTPException(status_code=404, detail="File no longer exists in storage.")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to proxy file: {exc}")
+
+    safe_filename = original_name.replace('"', '\\"')
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{safe_filename}"',
             "Content-Length": str(len(content)),
         },
     )
