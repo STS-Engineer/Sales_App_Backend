@@ -10,6 +10,7 @@ Protocol flow (Streamable HTTP):
   3. No shared sessions, no SSE required — works with multiple workers
 """
 
+import base64
 import json
 import os
 from functools import lru_cache
@@ -39,6 +40,16 @@ router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 RFQ_FILES_CONTAINER = settings.azure_rfq_files_container or "rfq-files"
 PDF_TEXT_MAX_PAGES = 8
 PDF_TEXT_MAX_CHARS = 20000
+OPENAI_FILE_ANALYSIS_MODEL = "gpt-4o"
+OPENAI_FILE_ANALYSIS_MAX_FILE_BYTES = 50 * 1024 * 1024
+OPENAI_FILE_ANALYSIS_TIMEOUT_SECONDS = 120.0
+DEFAULT_FILE_ANALYSIS_QUESTION = (
+    "Read this RFQ attachment as the original file and provide a precise summary "
+    "for costing triage. Extract all concrete technical details visible in the "
+    "document, including part numbers, dimensions, tolerances, materials, surface "
+    "treatments, drawing revision, title-block data, notes, and any missing or "
+    "ambiguous points."
+)
 
 # ── Tool definition ───────────────────────────────────────────────────────────
 
@@ -110,9 +121,78 @@ _READ_ATTACHMENT_TOOL = {
         },
         "required": ["systematic_rfq_id"],
     },
+    "annotations": {"readOnlyHint": True},
 }
 
-_TOOLS = [_SAVE_TOOL, _READ_ATTACHMENT_TOOL]
+_READ_BLOB_ATTACHMENT_TOOL = {
+    "name": "read_rfq_blob_attachment_text",
+    "description": (
+        "Download one RFQ attachment directly from Azure Blob storage and return "
+        "deterministic text extracted from the file. Prefer this tool when the "
+        "agent cannot access raw blob URLs itself."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "systematic_rfq_id": {
+                "type": "string",
+                "description": "RFQ identifier, e.g. 26511-ASS-00.",
+            },
+            "file_id": {
+                "type": "string",
+                "description": "Optional RFQ file identifier from rfq_files[].id.",
+            },
+            "filename_contains": {
+                "type": "string",
+                "description": "Optional case-insensitive filename fragment if file_id is unknown.",
+            },
+        },
+        "required": ["systematic_rfq_id"],
+    },
+    "annotations": {"readOnlyHint": True},
+}
+
+_ANALYZE_BLOB_WITH_OPENAI_TOOL = {
+    "name": "analyze_rfq_blob_attachment_with_openai",
+    "description": (
+        "Download one RFQ attachment directly from Azure Blob storage and analyze it "
+        "as a true OpenAI input_file. Use this when the Workspace Agent must reason "
+        "over the original PDF or document file instead of locally extracted text."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "systematic_rfq_id": {
+                "type": "string",
+                "description": "RFQ identifier, e.g. 26511-ASS-00.",
+            },
+            "file_id": {
+                "type": "string",
+                "description": "Optional RFQ file identifier from rfq_files[].id.",
+            },
+            "filename_contains": {
+                "type": "string",
+                "description": "Optional case-insensitive filename fragment if file_id is unknown.",
+            },
+            "question": {
+                "type": "string",
+                "description": (
+                    "Optional analysis question for the file. If omitted, a generic "
+                    "costing-triage summary prompt is used."
+                ),
+            },
+        },
+        "required": ["systematic_rfq_id"],
+    },
+    "annotations": {"readOnlyHint": True},
+}
+
+_TOOLS = [
+    _SAVE_TOOL,
+    _READ_ATTACHMENT_TOOL,
+    _READ_BLOB_ATTACHMENT_TOOL,
+    _ANALYZE_BLOB_WITH_OPENAI_TOOL,
+]
 
 
 @lru_cache(maxsize=1)
@@ -237,6 +317,183 @@ async def _download_attachment_bytes(file_entry: dict) -> tuple[bytes | None, st
         return None, ""
     except Exception:
         return None, ""
+
+
+async def _download_blob_attachment_bytes(file_entry: dict) -> tuple[bytes | None, str, str]:
+    candidate_urls = [
+        str(file_entry.get("download_url") or "").strip(),
+        str(file_entry.get("url") or "").strip(),
+        str(file_entry.get("path") or "").strip(),
+    ]
+    candidate_urls = [url for url in candidate_urls if url]
+
+    for candidate_url in candidate_urls:
+        if "blob.core.windows.net" not in candidate_url.lower():
+            continue
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0),
+                follow_redirects=True,
+                trust_env=False,
+            ) as client:
+                response = await client.get(candidate_url)
+            if response.status_code == 200 and response.content:
+                return (
+                    response.content,
+                    str(
+                        response.headers.get("content-type")
+                        or file_entry.get("content_type")
+                        or "application/octet-stream"
+                    ).strip(),
+                    "azure_blob_sas_url",
+                )
+        except Exception:
+            continue
+
+    blob_name = str(file_entry.get("blob_name") or "").strip()
+    if not blob_name or not settings.azure_connection_string:
+        return None, "", ""
+
+    try:
+        blob_client = _get_rfq_files_container_client().get_blob_client(blob_name)
+        content = blob_client.download_blob().readall()
+        return (
+            content,
+            str(file_entry.get("content_type") or "application/octet-stream").strip(),
+            "azure_blob_sdk",
+        )
+    except ResourceNotFoundError:
+        return None, "", ""
+    except Exception:
+        return None, "", ""
+
+
+def _resolve_attachment_content_type(content_type: str, filename: str) -> str:
+    normalized_type = str(content_type or "").strip().lower()
+    if normalized_type:
+        return normalized_type
+
+    extension = os.path.splitext(str(filename or "").strip().lower())[1]
+    if extension == ".pdf":
+        return "application/pdf"
+    if extension == ".txt":
+        return "text/plain"
+    if extension == ".csv":
+        return "text/csv"
+    if extension == ".json":
+        return "application/json"
+    return "application/octet-stream"
+
+
+def _extract_responses_output_text(body: dict) -> str:
+    direct_text = str(body.get("output_text") or "").strip()
+    if direct_text:
+        return direct_text
+
+    chunks: list[str] = []
+    for item in body.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        for content_part in item.get("content") or []:
+            if not isinstance(content_part, dict):
+                continue
+            if content_part.get("type") == "output_text":
+                text = str(content_part.get("text") or "").strip()
+                if text:
+                    chunks.append(text)
+    return "\n\n".join(chunks).strip()
+
+
+async def _analyze_file_with_openai(
+    *,
+    content: bytes,
+    content_type: str,
+    filename: str,
+    question: str,
+) -> dict:
+    openai_api_key = str(settings.OPENAI_API_KEY or "").strip()
+    if not openai_api_key:
+        return {"error": "OPENAI_API_KEY is not configured."}
+
+    if not content:
+        return {"error": "Attachment content is empty."}
+
+    if len(content) > OPENAI_FILE_ANALYSIS_MAX_FILE_BYTES:
+        return {
+            "error": (
+                "Attachment exceeds the OpenAI input_file size limit of 50 MB."
+            )
+        }
+
+    normalized_type = _resolve_attachment_content_type(content_type, filename)
+    file_data = (
+        f"data:{normalized_type};base64,"
+        f"{base64.b64encode(content).decode('ascii')}"
+    )
+    request_body = {
+        "model": OPENAI_FILE_ANALYSIS_MODEL,
+        "store": False,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": question},
+                    {
+                        "type": "input_file",
+                        "filename": filename or "attachment",
+                        "file_data": file_data,
+                    },
+                ],
+            }
+        ],
+    }
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(OPENAI_FILE_ANALYSIS_TIMEOUT_SECONDS)
+    ) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=request_body,
+        )
+
+    if not response.is_success:
+        return {
+            "error": "OpenAI file analysis request failed.",
+            "status_code": response.status_code,
+            "body": response.text[:1000],
+        }
+
+    try:
+        body = response.json()
+    except Exception:
+        return {
+            "error": "OpenAI file analysis returned non-JSON data.",
+            "status_code": response.status_code,
+            "body": response.text[:1000],
+        }
+
+    output_text = _extract_responses_output_text(body)
+    if not output_text:
+        return {
+            "error": "OpenAI file analysis returned no readable output.",
+            "response_id": str(body.get("id") or "").strip(),
+            "status": str(body.get("status") or "").strip(),
+        }
+
+    return {
+        "success": True,
+        "response_id": str(body.get("id") or "").strip(),
+        "status": str(body.get("status") or "").strip() or "completed",
+        "model": str(body.get("model") or OPENAI_FILE_ANALYSIS_MODEL),
+        "question": question,
+        "analysis": output_text,
+    }
 
 # ── Tool executor ─────────────────────────────────────────────────────────────
 
@@ -376,6 +633,169 @@ async def _run_read_attachment_tool(arguments: dict) -> dict:
     }
 
 
+async def _run_read_blob_attachment_tool(arguments: dict) -> dict:
+    systematic_rfq_id = str(arguments.get("systematic_rfq_id") or "").strip()
+    file_id = str(arguments.get("file_id") or "").strip()
+    filename_contains = str(arguments.get("filename_contains") or "").strip()
+
+    if not systematic_rfq_id:
+        return {"error": "systematic_rfq_id is required"}
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(Rfq).where(
+                Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
+            ).limit(1)
+        )
+        rfq = result.scalar_one_or_none()
+        if rfq is None:
+            return {"error": f"RFQ not found: {systematic_rfq_id}"}
+
+        rfq_files = [
+            entry
+            for entry in list((rfq.rfq_data or {}).get("rfq_files") or [])
+            if isinstance(entry, dict)
+        ]
+        if not rfq_files:
+            return {
+                "error": "No RFQ attachments are registered for this RFQ.",
+                "systematic_rfq_id": systematic_rfq_id,
+            }
+
+        file_entry = _pick_rfq_file_entry(
+            rfq_files,
+            file_id=file_id,
+            filename_contains=filename_contains,
+        )
+        if file_entry is None:
+            return {
+                "error": "Requested RFQ attachment was not found.",
+                "systematic_rfq_id": systematic_rfq_id,
+            }
+
+    filename = str(
+        file_entry.get("filename")
+        or file_entry.get("name")
+        or os.path.basename(str(file_entry.get("blob_name") or "").strip())
+    ).strip()
+    content, content_type, source = await _download_blob_attachment_bytes(file_entry)
+    if not content:
+        return {
+            "error": "Unable to download RFQ attachment directly from Azure Blob storage.",
+            "systematic_rfq_id": systematic_rfq_id,
+            "file_id": str(file_entry.get("id") or "").strip(),
+            "filename": filename,
+            "blob_name": str(file_entry.get("blob_name") or "").strip(),
+        }
+
+    extracted_text = _extract_attachment_text(content, content_type, filename)
+    status = "ok" if extracted_text else "no_extractable_text"
+    message = (
+        "Blob attachment text extracted successfully."
+        if extracted_text
+        else "The blob attachment downloaded successfully but no readable text layer was extracted."
+    )
+
+    return {
+        "success": True,
+        "systematic_rfq_id": systematic_rfq_id,
+        "file_id": str(file_entry.get("id") or "").strip(),
+        "filename": filename,
+        "blob_name": str(file_entry.get("blob_name") or "").strip(),
+        "content_type": content_type,
+        "source": source,
+        "status": status,
+        "message": message,
+        "text_length": len(extracted_text),
+        "text": extracted_text,
+    }
+
+
+async def _run_analyze_blob_with_openai_tool(arguments: dict) -> dict:
+    systematic_rfq_id = str(arguments.get("systematic_rfq_id") or "").strip()
+    file_id = str(arguments.get("file_id") or "").strip()
+    filename_contains = str(arguments.get("filename_contains") or "").strip()
+    question = str(arguments.get("question") or "").strip() or DEFAULT_FILE_ANALYSIS_QUESTION
+
+    if not systematic_rfq_id:
+        return {"error": "systematic_rfq_id is required"}
+
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(Rfq).where(
+                Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
+            ).limit(1)
+        )
+        rfq = result.scalar_one_or_none()
+        if rfq is None:
+            return {"error": f"RFQ not found: {systematic_rfq_id}"}
+
+        rfq_files = [
+            entry
+            for entry in list((rfq.rfq_data or {}).get("rfq_files") or [])
+            if isinstance(entry, dict)
+        ]
+        if not rfq_files:
+            return {
+                "error": "No RFQ attachments are registered for this RFQ.",
+                "systematic_rfq_id": systematic_rfq_id,
+            }
+
+        file_entry = _pick_rfq_file_entry(
+            rfq_files,
+            file_id=file_id,
+            filename_contains=filename_contains,
+        )
+        if file_entry is None:
+            return {
+                "error": "Requested RFQ attachment was not found.",
+                "systematic_rfq_id": systematic_rfq_id,
+            }
+
+    filename = str(
+        file_entry.get("filename")
+        or file_entry.get("name")
+        or os.path.basename(str(file_entry.get("blob_name") or "").strip())
+    ).strip()
+    content, content_type, source = await _download_blob_attachment_bytes(file_entry)
+    if not content:
+        return {
+            "error": "Unable to download RFQ attachment directly from Azure Blob storage.",
+            "systematic_rfq_id": systematic_rfq_id,
+            "file_id": str(file_entry.get("id") or "").strip(),
+            "filename": filename,
+            "blob_name": str(file_entry.get("blob_name") or "").strip(),
+        }
+
+    analysis_result = await _analyze_file_with_openai(
+        content=content,
+        content_type=content_type,
+        filename=filename,
+        question=question,
+    )
+    if "error" in analysis_result:
+        return {
+            **analysis_result,
+            "systematic_rfq_id": systematic_rfq_id,
+            "file_id": str(file_entry.get("id") or "").strip(),
+            "filename": filename,
+            "blob_name": str(file_entry.get("blob_name") or "").strip(),
+            "content_type": _resolve_attachment_content_type(content_type, filename),
+            "source": source,
+        }
+
+    return {
+        "success": True,
+        "systematic_rfq_id": systematic_rfq_id,
+        "file_id": str(file_entry.get("id") or "").strip(),
+        "filename": filename,
+        "blob_name": str(file_entry.get("blob_name") or "").strip(),
+        "content_type": _resolve_attachment_content_type(content_type, filename),
+        "source": source,
+        **analysis_result,
+    }
+
+
 # ── JSON-RPC dispatcher ───────────────────────────────────────────────────────
 
 
@@ -417,6 +837,10 @@ async def _dispatch(message: dict) -> dict | None:
                 result = await _run_save_tool(arguments)
             elif tool_name == "read_rfq_attachment_text":
                 result = await _run_read_attachment_tool(arguments)
+            elif tool_name == "read_rfq_blob_attachment_text":
+                result = await _run_read_blob_attachment_tool(arguments)
+            elif tool_name == "analyze_rfq_blob_attachment_with_openai":
+                result = await _run_analyze_blob_with_openai_tool(arguments)
             else:
                 return {
                     "jsonrpc": "2.0",
@@ -427,16 +851,19 @@ async def _dispatch(message: dict) -> dict | None:
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
+                    "structuredContent": result,
                     "content": [{"type": "text", "text": json.dumps(result)}],
                     "isError": "error" in result,
                 },
             }
         except Exception as exc:
+            error_result = {"error": str(exc)}
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
-                    "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
+                    "structuredContent": error_result,
+                    "content": [{"type": "text", "text": json.dumps(error_result)}],
                     "isError": True,
                 },
             }
