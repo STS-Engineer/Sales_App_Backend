@@ -1228,6 +1228,17 @@ async def _submit_rfq_for_validation_internal(
             },
         )
 
+    for idx, product in enumerate(extracted_data.get("products") or [], start=1):
+        if not isinstance(product, dict):
+            continue
+        pl = str(product.get("product_line") or "").strip().lower()
+        if pl in {"ass", "assembly"}:
+            if not str(product.get("components") or "").strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Component is required for Assembly product line (product {idx}).",
+                )
+
     acronym = (extracted_data.get("product_line_acronym") or "").strip()
     revision = str(extracted_data.get("revision_level") or "00").strip() or "00"
     zone_manager_email = (
