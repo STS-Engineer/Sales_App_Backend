@@ -1,10 +1,12 @@
+import datetime
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, settings
 from app.database import get_db
-from app.models.rfq import Rfq
+from app.models.rfq import Rfq, RfqSubStatus
 from app.schemas.rfq import AiValidationCallbackRequest, AiValidationCallbackResponse
 from app.services.ai_validation import (
     build_ai_validation_record,
@@ -14,7 +16,9 @@ from app.services.ai_validation import (
     normalize_ai_validation_status,
     resolve_ai_validation_approved,
 )
+from app.services.notifications import EMAIL_VALIDATION_REQUEST, record_notification_sent
 from app.tasks.followups import run_followup_sweep
+from app.utils import emails
 
 router = APIRouter(prefix="/api/internal", tags=["internal"])
 
@@ -137,6 +141,35 @@ async def save_ai_validation_result(
     rfq.rfq_data = rfq_data
     await db.commit()
     await db.refresh(rfq)
+
+    # Send the validator notification email now that AI has given its verdict.
+    # Only send if: AI approved, RFQ is still pending validation, and the creator
+    # is not the same person as the assigned validator (no self-notification).
+    if resolved_approved and rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
+        zone_manager_email = str(rfq.zone_manager_email or "").strip()
+        creator_email = str(rfq.created_by_email or "").strip().lower()
+        creator_is_validator = zone_manager_email.lower() == creator_email
+        if zone_manager_email and not creator_is_validator:
+            frontend_url = str(settings.frontend_url or "").rstrip("/")
+            rfq_link = f"{frontend_url}/rfqs/new?id={rfq.rfq_id}" if frontend_url else rfq.rfq_id
+            rfq_data_snapshot = rfq.rfq_data or {}
+            systematic_rfq_id_val = str(rfq_data_snapshot.get("systematic_rfq_id") or "").strip() or None
+            acronym_val = str(rfq.product_line_acronym or "").strip()
+            email_sent = emails.send_validation_email(
+                zone_manager_email,
+                systematic_rfq_id_val or rfq.rfq_id,
+                acronym_val,
+                rfq_link,
+            )
+            if email_sent:
+                rfq.last_notification_sent_at = datetime.datetime.now(datetime.timezone.utc)
+                await record_notification_sent(
+                    db,
+                    rfq_id=rfq.rfq_id,
+                    recipients=zone_manager_email,
+                    email_type=EMAIL_VALIDATION_REQUEST,
+                )
+                await db.commit()
 
     ai_validation = extract_ai_validation_record(rfq.rfq_data)
     if ai_validation is None:

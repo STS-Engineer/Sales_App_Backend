@@ -11,12 +11,11 @@ Environment variables:
         Published API channel trigger ID in agtch_... format.
 """
 
-import asyncio
-import base64
 import datetime
 import json
 import logging
 import re
+import base64
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -198,26 +197,6 @@ _PDF_VISION_MAX_PAGES = 2     # Pages rendered for GPT-4 Vision fallback
 _BLOB_DOWNLOAD_TIMEOUT = 30   # Seconds per file for Azure download
 
 
-def _extract_text_from_pdf_bytes(content: bytes) -> str:
-    """Return selectable text from a PDF binary using PyMuPDF (fitz)."""
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return ""
-    text_parts: list[str] = []
-    try:
-        with fitz.open(stream=content, filetype="pdf") as doc:
-            for page_num, page in enumerate(doc):
-                if page_num >= 5:
-                    break
-                text = page.get_text()
-                if text.strip():
-                    text_parts.append(text.strip())
-    except Exception as exc:
-        logger.debug("PyMuPDF text extraction failed: %s", exc)
-    return "\n\n".join(text_parts)
-
-
 async def _analyze_pdf_with_vision(
     content: bytes, openai_api_key: str, filename: str = ""
 ) -> str:
@@ -287,81 +266,47 @@ async def prepare_rfq_files_for_agent(
     rfq_files: list[dict],
     *,
     backend_base_url: str,
-    azure_connection_string: str,
-    azure_container: str,
-    openai_api_key: str | None = None,
 ) -> list[dict]:
-    """Enrich rfq_files with agent_file_text / agent_file_text_status before sending to agent.
+    """Expose stable attachment references for the Workspace Agent.
 
-    Status values the agent preface interprets:
+    The agent should inspect the original blob file via the MCP tool
       ok_text           — text layer extracted successfully by PyMuPDF
       ok_vision         — image PDF described by GPT-4 Vision
       vision_unavailable — image PDF, no OpenAI key configured
       vision_failed     — Vision API returned nothing useful
       download_failed   — blob unreachable (the only status that should block)
     """
-    if not rfq_files or not azure_connection_string:
+    if not rfq_files:
         return rfq_files
 
+    normalized_backend_base = str(backend_base_url or "").strip().rstrip("/")
     enriched: list[dict] = []
     for file_entry in rfq_files:
         f = dict(file_entry)
         file_id = str(f.get("id") or "").strip()
         blob_name = str(f.get("blob_name") or "").strip()
-        filename = str(f.get("filename") or f.get("name") or blob_name)
-        content_type = str(f.get("content_type") or "application/octet-stream")
+        filename = str(f.get("filename") or f.get("name") or blob_name).strip()
 
-        # Always expose the proxy URL as the reference the agent sees.
-        if file_id and not f.get("proxy_url"):
-            f["proxy_url"] = f"{backend_base_url}/api/rfq/files/{file_id}/proxy"
-        f["agent_file_url"] = f.get("proxy_url") or f.get("url") or ""
+        if file_id and normalized_backend_base and not f.get("proxy_url"):
+            f["proxy_url"] = f"{normalized_backend_base}/api/rfq/files/{file_id}/proxy"
+        f["agent_file_url"] = str(f.get("proxy_url") or f.get("url") or "").strip()
+        f["agent_file_strategy"] = (
+            "Use the MCP tool analyze_rfq_blob_attachment_with_openai to inspect the "
+            "original file instead of relying on pre-extracted text."
+        )
 
-        if not blob_name:
-            f["agent_file_text_status"] = "download_failed"
-            enriched.append(f)
-            continue
-
-        try:
-            content = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None,
-                    _download_blob_sync,
-                    azure_connection_string,
-                    azure_container,
-                    blob_name,
-                ),
-                timeout=_BLOB_DOWNLOAD_TIMEOUT,
-            )
-        except Exception as exc:
-            logger.warning("Blob download failed for agent (%s): %s", blob_name, exc)
-            f["agent_file_text_status"] = "download_failed"
-            enriched.append(f)
-            continue
-
-        is_pdf = "pdf" in content_type.lower() or filename.lower().endswith(".pdf")
-
-        if is_pdf:
-            text = await asyncio.get_event_loop().run_in_executor(
-                None, _extract_text_from_pdf_bytes, content
-            )
-            if text.strip():
-                f["agent_file_text"] = text[:_MAX_FILE_TEXT_CHARS]
-                f["agent_file_text_status"] = "ok_text"
-            elif openai_api_key and len(content) < 20 * 1024 * 1024:
-                vision_text = await _analyze_pdf_with_vision(content, openai_api_key, filename)
-                if vision_text.strip():
-                    f["agent_file_text"] = vision_text[:_MAX_FILE_TEXT_CHARS]
-                    f["agent_file_text_status"] = "ok_vision"
-                else:
-                    f["agent_file_text_status"] = "vision_failed"
-            else:
-                f["agent_file_text_status"] = "vision_unavailable"
-        else:
-            try:
-                f["agent_file_text"] = content.decode("utf-8", errors="replace")[:_MAX_FILE_TEXT_CHARS]
-                f["agent_file_text_status"] = "ok_text"
-            except Exception:
-                f["agent_file_text_status"] = "vision_unavailable"
+        tool_arguments: dict[str, str] = {}
+        if file_id:
+            tool_arguments["file_id"] = file_id
+        elif filename:
+            tool_arguments["filename_contains"] = filename
+        f["agent_file_tool"] = {
+            "name": "analyze_rfq_blob_attachment_with_openai",
+            "arguments": tool_arguments,
+            "purpose": "Analyze the original blob attachment as an OpenAI input_file.",
+        }
+        f["agent_file_text_status"] = "mcp_openai_input_file"
+        f["agent_file_text"] = ""
 
         logger.info(
             "[file-prep] %s → status=%s chars=%s",

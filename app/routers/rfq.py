@@ -1204,11 +1204,6 @@ async def _submit_rfq_for_validation_internal(
 
     is_resubmission = (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ)
 
-    if is_resubmission and rfq.sub_status == RfqSubStatus.PENDING_FOR_VALIDATION:
-        raise HTTPException(
-            status_code=400,
-            detail="This RFQ is already pending validation.",
-        )
     if _is_potential(rfq):
         raise HTTPException(
             status_code=409,
@@ -1277,8 +1272,8 @@ async def _submit_rfq_for_validation_internal(
         extracted_data.pop("resubmission_restore_sub_status", None)
 
     # ── AI pre-validation ─────────────────────────────────────────────────────
-    # Download each RFQ file from Azure and extract its text so the agent can
-    # read drawing content without making outbound requests from its sandbox.
+    # Expose stable attachment references so the Workspace Agent can call the
+    # MCP file-analysis tool on the original blob file when plan reading matters.
     _agent_data = dict(extracted_data)
     _agent_data["kam_email"] = rfq.created_by_email
     _agent_data["kam_name"] = current_user.full_name or rfq.created_by_email
@@ -1287,9 +1282,6 @@ async def _submit_rfq_for_validation_internal(
         _agent_data["rfq_files"] = await prepare_rfq_files_for_agent(
             _raw_files,
             backend_base_url=settings.backend_base_url,
-            azure_connection_string=settings.azure_connection_string,
-            azure_container=settings.azure_rfq_files_container,
-            openai_api_key=settings.OPENAI_API_KEY,
         )
 
     # Call the Workspace Agent before committing any DB change or sending email.
@@ -1381,7 +1373,8 @@ async def _submit_rfq_for_validation_internal(
         (rfq.created_by_email or "").strip().lower()
         == zone_manager_email.lower()
     )
-    if send_email and not creator_is_validator:
+    ai_is_queued = (extracted_data.get("ai_validation") or {}).get("status") == "queued"
+    if send_email and not creator_is_validator and not ai_is_queued:
         email_sent = emails.send_validation_email(
             zone_manager_email,
             systematic_rfq_id,
