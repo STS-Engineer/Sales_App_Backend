@@ -1173,10 +1173,11 @@ async def _maybe_assign_systematic_rfq_id(
         return next_data
 
     acronym = (next_data.get("product_line_acronym") or rfq.product_line_acronym or "").strip()
+    # DB value takes priority — zone_manager_email is set exclusively via /assign-validator.
     zone_manager_email = (
-        next_data.get("zone_manager_email")
+        rfq.zone_manager_email
+        or next_data.get("zone_manager_email")
         or next_data.get("validator_email")
-        or rfq.zone_manager_email
         or ""
     ).strip()
     revision = str(next_data.get("revision_level") or "00").strip() or "00"
@@ -1512,11 +1513,8 @@ async def update_rfq_data(
 
         if "product_line_acronym" in incoming_data or "product_name" in incoming_data:
             rfq.product_line_acronym = next_data.get("product_line_acronym") or None
-        if "zone_manager_email" in incoming_data or "validator_email" in incoming_data:
-            rfq.zone_manager_email = (
-                incoming_data.get("zone_manager_email")
-                or incoming_data.get("validator_email")
-            )
+        # zone_manager_email is set exclusively by the /assign-validator endpoint.
+        # Incoming payload values are intentionally ignored here.
 
         rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, next_data)
 
