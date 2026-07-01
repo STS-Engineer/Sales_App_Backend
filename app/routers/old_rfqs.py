@@ -3,10 +3,11 @@ import logging
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.middleware.auth import get_current_user
-from app.models.old_rfq_raw import OldRfqRaw
+from app.models.old_rfqs import OldRfqMonday, OldRfqSubitem
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -14,10 +15,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/old-rfqs", tags=["old-rfqs"])
 
 
-def _serialize_row(row: OldRfqRaw) -> dict:
+def _model_columns(model) -> list:
+    return [column.name for column in model.__table__.columns]
+
+
+def _serialize_row(row) -> dict:
     return {
         column.name: getattr(row, column.name)
-        for column in OldRfqRaw.__table__.columns
+        for column in row.__table__.columns
     }
 
 
@@ -27,29 +32,33 @@ async def get_old_rfqs(
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
-        select(OldRfqRaw).order_by(
-            OldRfqRaw.excel_row_number.asc(),
-            OldRfqRaw.import_id.asc(),
+        select(OldRfqMonday)
+        .options(selectinload(OldRfqMonday.subitems))
+        .order_by(
+            OldRfqMonday.excel_row_number.asc(),
+            OldRfqMonday.old_rfq_id.asc(),
         )
     )
-    rows = result.scalars().all()
+    rfqs = result.scalars().unique().all()
 
-    projects = []
-    current_project: dict | None = None
+    items = []
+    for rfq in rfqs:
+        rfq_data = _serialize_row(rfq)
+        ordered_subitems = sorted(
+            list(rfq.subitems or []),
+            key=lambda s: (
+                s.subitem_order if s.subitem_order is not None else 999999,
+                s.excel_row_number if s.excel_row_number is not None else 999999,
+                s.old_rfq_subitem_id,
+            ),
+        )
+        rfq_data["subitems"] = [_serialize_row(sub) for sub in ordered_subitems]
+        rfq_data["subitems_count"] = len(rfq_data["subitems"])
+        items.append(rfq_data)
 
-    for row in rows:
-        if row.row_type == "project":
-            project_data = _serialize_row(row)
-            project_data["subitems"] = []
-            current_project = project_data
-            projects.append(project_data)
-        elif row.row_type == "subitem":
-            if current_project is None:
-                continue
-            current_project["subitems"].append(_serialize_row(row))
-        # empty rows are ignored
-
-    for project in projects:
-        project["subitems_count"] = len(project["subitems"])
-
-    return {"items": projects, "total": len(projects)}
+    return {
+        "items": items,
+        "total": len(items),
+        "project_columns": _model_columns(OldRfqMonday) + ["subitems_count"],
+        "subitem_columns": _model_columns(OldRfqSubitem),
+    }
