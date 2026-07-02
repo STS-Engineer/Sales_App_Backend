@@ -33,14 +33,14 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
     (
         "Logistics details",
         [
-            ("PO date", ("po_date", "poDate")),
-            ("PPAP date", ("ppap_date", "ppapDate")),
+            ("Expected PO date", ("po_date", "poDate")),
+            ("Expected PPAP date", ("ppap_date", "ppapDate")),
             ("RFQ reception date", ("rfq_reception_date", "rfqReceptionDate")),
             ("Expected quotation date", ("quotation_expected_date", "expectedQuotationDate")),
         ],
     ),
     (
-        "Contact details",
+        "Customer contact details",
         [
             ("Contact name", ("contact_name", "contact_first_name", "contactName")),
             ("Contact function", ("contact_role", "contactFunction")),
@@ -51,7 +51,8 @@ FIELD_GROUPS: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = [
     (
         "Commercial expectations",
         [
-            ("Expected delivery conditions", ("expected_delivery_conditions", "expectedDeliveryConditions")),
+            ("Delivery Incoterm", ("delivery_incoterm", "deliveryIncoterm", "expected_delivery_conditions", "expectedDeliveryConditions")),
+            ("Incoterm Location", ("incoterm_location", "incotermLocation")),
             ("Expected payment terms", ("expected_payment_terms", "expectedPaymentTerms")),
             ("Type of packaging", ("type_of_packaging", "typeOfPackaging")),
             ("Business trigger", ("business_trigger", "businessTrigger")),

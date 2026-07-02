@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     AI_VALIDATION_CALLBACK_TOKEN: str | None = None
 
     # Public-facing backend URL used to build proxy URLs for external services.
-    BACKEND_BASE_URL: str = "http://localhost:8000"
+    BACKEND_BASE_URL: str = "https://sales-app-backend.azurewebsites.net"
 
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE))
 
@@ -191,7 +191,7 @@ class Settings(BaseSettings):
 
     @property
     def backend_base_url(self) -> str:
-        return (self.BACKEND_BASE_URL or "http://localhost:8000").strip().rstrip("/")
+        return (self.BACKEND_BASE_URL or "https://sales-app-backend.azurewebsites.net").strip().rstrip("/")
 
     @staticmethod
     def _build_async_db_url(raw_url: str | None) -> URL | None:
