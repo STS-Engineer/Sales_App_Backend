@@ -1275,15 +1275,15 @@ async def _submit_rfq_for_validation_internal(
     # ── AI pre-validation ─────────────────────────────────────────────────────
     # Expose stable attachment references so the Workspace Agent can call the
     # MCP file-analysis tool on the original blob file when plan reading matters.
-    _agent_data = dict(extracted_data)
-    _agent_data["kam_email"] = rfq.created_by_email
-    _agent_data["kam_name"] = current_user.full_name or rfq.created_by_email
-    _raw_files = _agent_data.get("rfq_files")
+    extracted_data["kam_email"] = rfq.created_by_email
+    extracted_data["kam_name"] = current_user.full_name or rfq.created_by_email
+    _raw_files = extracted_data.get("rfq_files")
     if isinstance(_raw_files, list) and _raw_files:
-        _agent_data["rfq_files"] = await prepare_rfq_files_for_agent(
+        extracted_data["rfq_files"] = await prepare_rfq_files_for_agent(
             _raw_files,
             backend_base_url=settings.backend_base_url,
         )
+    _agent_data = dict(extracted_data)
 
     # Call the Workspace Agent before committing any DB change or sending email.
     # On network / service errors we log and fail open to avoid blocking submissions
