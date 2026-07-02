@@ -543,7 +543,7 @@ FIELD_QUESTION_OVERRIDES = {
     "contact_phone": "**What is the Contact phone number?**",
     "expected_delivery_conditions": "**What are the expected Delivery Conditions?**",
     "expected_payment_terms": "**What are the expected Payment Terms?**",
-    "type_of_packaging": "**Which type of packaging applies?**\n\n1. carboard divider\n2. one way tray\n3. returnable plastic tray",
+    "type_of_packaging": "**Which type of packaging applies?**\n\n1. Cardboard divider\n2. one way tray\n3. returnable plastic tray",
     "business_trigger": "**What is the Business Trigger?**",
     "customer_tooling_conditions": "**What are the Customer Tooling Conditions?**",
     "entry_barriers": "**What are the Entry Barriers?**",
@@ -570,7 +570,7 @@ PRE_SUBMISSION_MODIFY_PROMPT = (
     "No"
 )
 TYPE_OF_PACKAGING_OPTIONS = [
-    "carboard divider",
+    "Cardboard divider",
     "one way tray",
     "returnable plastic tray",
 ]
@@ -3629,7 +3629,7 @@ OR:
 4. If the currency IS EUR, save the same raw product target prices directly in the `products` array.
 5. When relaying any backend-derived conversion, keep at most 5 digits after the decimal point and truncate extra digits instead of rounding.
 CRITICAL PACKAGING RULE: If the user voluntarily provides `type_of_packaging`, or if you need to confirm a packaging value that the user already mentioned, you MUST restrict it to exactly one of these 3 options:
-1. carboard divider
+1. Cardboard divider
 2. one way tray
 3. returnable plastic tray
 As soon as the user chooses one option, you MUST immediately call `updateFormFields` with {"fields_to_update": {"type_of_packaging": "<chosen_option>"}} using exactly the chosen option text.
