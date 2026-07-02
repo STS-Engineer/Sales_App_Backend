@@ -1203,7 +1203,7 @@ async def _submit_rfq_for_validation_internal(
 ) -> dict[str, str | bool]:
     _assert_can_edit_rfq_phase(current_user, rfq)
 
-    is_resubmission = (rfq.phase, rfq.sub_status) != (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ)
+    is_resubmission = rfq.phase != RfqPhase.RFQ
 
     if _is_potential(rfq):
         raise HTTPException(
@@ -2770,7 +2770,6 @@ async def validate_rfq(
         )
         if route_entries:
             refreshed_data = dict(refreshed_rfq.rfq_data or {})
-            is_resubmission_approval = bool(refreshed_data.get("is_resubmission"))
             systematic_rfq_id_val = str(refreshed_data.get("systematic_rfq_id") or "")
             acronym_val = str(refreshed_rfq.product_line_acronym or "")
             rfq_link_val = _build_rfq_link(refreshed_rfq.rfq_id)
@@ -2779,21 +2778,13 @@ async def validate_rfq(
                 recipient_email = str(route_entry.get("email") or "")
                 if not recipient_email:
                     continue
-                if is_resubmission_approval:
-                    sent = emails.send_rfq_revalidation_notification(
-                        recipient_email,
-                        systematic_rfq_id_val,
-                        acronym_val,
-                        rfq_link_val,
-                    )
-                else:
-                    sent = emails.send_costing_entry_email(
-                        recipient_email,
-                        str(route_entry.get("product_line") or ""),
-                        str(route_entry.get("acronym") or ""),
-                        systematic_rfq_id_val,
-                        rfq_link_val,
-                    )
+                sent = emails.send_costing_entry_email(
+                    recipient_email,
+                    str(route_entry.get("product_line") or ""),
+                    str(route_entry.get("acronym") or ""),
+                    systematic_rfq_id_val,
+                    rfq_link_val,
+                )
                 if sent:
                     notified_costing.append(recipient_email)
             if notified_costing:
@@ -2807,7 +2798,7 @@ async def validate_rfq(
                 # record_notification_sent commits internally — reload to avoid
                 # accessing expired attributes on the next read.
                 refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
-            if is_resubmission_approval:
+            if refreshed_data.get("is_resubmission"):
                 next_data = dict(refreshed_rfq.rfq_data or {})
                 next_data.pop("is_resubmission", None)
                 next_data.pop("resubmission_restore_phase", None)
