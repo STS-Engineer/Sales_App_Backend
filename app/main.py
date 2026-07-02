@@ -128,6 +128,7 @@ app.include_router(mcp_router.router)
 app.include_router(kpi_settings.router)
 app.include_router(kpi_data.router)
 app.include_router(old_rfqs.router)
+app.include_router(old_rfqs.subitem_router)
 
 
 @app.get("/health", tags=["system"])
