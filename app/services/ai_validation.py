@@ -190,6 +190,181 @@ def extract_ai_validation_record(rfq_data: dict | None) -> dict[str, Any] | None
     )
 
 
+def _coerce_number_like(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = text.replace(" ", "").replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _compact_number(value: float | None) -> int | float | None:
+    if value is None:
+        return None
+    return int(value) if float(value).is_integer() else value
+
+
+def _numbers_match(left: float | None, right: float | None, *, tolerance: float = 0.5) -> bool:
+    if left is None or right is None:
+        return False
+    return abs(left - right) <= tolerance
+
+
+def _sort_yearly_volume_items(yearly_volumes: dict[str, float]) -> list[tuple[str, float]]:
+    def _sort_key(item: tuple[str, float]) -> tuple[int, int | str]:
+        year = str(item[0]).strip()
+        try:
+            return (0, int(year))
+        except ValueError:
+            return (1, year)
+
+    return sorted(yearly_volumes.items(), key=_sort_key)
+
+
+def prepare_rfq_payload_for_agent(rfq_data: dict[str, Any]) -> dict[str, Any]:
+    """Add agent-only quantity interpretation hints without changing saved RFQ data."""
+    payload = dict(rfq_data or {})
+
+    raw_products = payload.get("products")
+    products = (
+        [dict(item) if isinstance(item, dict) else item for item in raw_products]
+        if isinstance(raw_products, list)
+        else []
+    )
+    if products:
+        payload["products"] = products
+
+    raw_volumes = payload.get("volumes")
+    volumes = (
+        [dict(item) if isinstance(item, dict) else item for item in raw_volumes]
+        if isinstance(raw_volumes, list)
+        else []
+    )
+    if volumes:
+        payload["volumes"] = volumes
+
+    agent_volume_rows: list[dict[str, Any]] = []
+    first_cumulative_total: float | None = None
+
+    for index, product in enumerate(products):
+        if not isinstance(product, dict):
+            continue
+
+        volume_row = volumes[index] if index < len(volumes) and isinstance(volumes[index], dict) else {}
+        raw_yearly_profile = volume_row.get("volumes")
+        if not isinstance(raw_yearly_profile, dict):
+            continue
+
+        normalized_yearly_profile: dict[str, float] = {}
+        for year, raw_amount in raw_yearly_profile.items():
+            amount = _coerce_number_like(raw_amount)
+            if amount is None:
+                continue
+            normalized_yearly_profile[str(year)] = amount
+
+        if not normalized_yearly_profile:
+            continue
+
+        sorted_yearly_items = _sort_yearly_volume_items(normalized_yearly_profile)
+        yearly_profile = {
+            year: _compact_number(amount)
+            for year, amount in sorted_yearly_items
+        }
+        yearly_total = sum(amount for _, amount in sorted_yearly_items)
+        product_quantity = _coerce_number_like(product.get("quantity"))
+        multi_year_profile = len(sorted_yearly_items) > 1
+        quantity_matches_yearly_total = _numbers_match(product_quantity, yearly_total)
+
+        quantity_basis = "yearly_profile_only"
+        if product_quantity is not None:
+            quantity_basis = "explicit_product_quantity"
+            if quantity_matches_yearly_total and multi_year_profile:
+                quantity_basis = "cumulative_program_total_matching_yearly_profile"
+            elif quantity_matches_yearly_total:
+                quantity_basis = "single_year_quantity_matching_yearly_profile"
+
+        summary: dict[str, Any] = {
+            "product_index": index + 1,
+            "part_number": str(product.get("part_number") or "").strip(),
+            "yearly_profile": yearly_profile,
+            "yearly_total": _compact_number(yearly_total),
+            "first_listed_year": sorted_yearly_items[0][0],
+            "first_listed_year_quantity": _compact_number(sorted_yearly_items[0][1]),
+            "quantity_basis": quantity_basis,
+        }
+        if product_quantity is not None:
+            summary["raw_product_quantity"] = _compact_number(product_quantity)
+
+        product["agent_yearly_volume_profile"] = yearly_profile
+        product["agent_yearly_total_quantity"] = _compact_number(yearly_total)
+        product["agent_quantity_basis"] = quantity_basis
+
+        if quantity_basis == "cumulative_program_total_matching_yearly_profile":
+            summary["annual_volume_confirmation_required"] = False
+            summary["agent_interpretation"] = (
+                "The linked product quantity matches the sum of the listed years. "
+                "Treat it as cumulative program volume across those years, not as a separate annual quantity."
+            )
+            product["agent_annual_volume_confirmation_required"] = False
+            product["agent_quantity_interpretation"] = (
+                "Cumulative program total across the listed yearly profile."
+            )
+            if first_cumulative_total is None:
+                first_cumulative_total = yearly_total
+
+        agent_volume_rows.append(summary)
+
+    if agent_volume_rows:
+        payload["agent_volume_rows"] = agent_volume_rows
+        payload["agent_volume_guidance"] = (
+            "Use agent_volume_rows as the authoritative quantity-interpretation helper. "
+            "When quantity_basis is `cumulative_program_total_matching_yearly_profile`, "
+            "the linked product quantity and any matching legacy top-level quantity mirror "
+            "represent the cumulative total across the listed years for turnover calculation. "
+            "Do not ask the KAM to confirm whether that matching sum is annual or cumulative. "
+            "Only raise a blocking quantity issue when the yearly profile itself is missing, "
+            "internally contradictory, or cannot be mapped to the product."
+        )
+
+    if first_cumulative_total is not None:
+        legacy_quantity_mirrors: dict[str, int | float] = {}
+        for key in ("annual_volume", "qty_per_year", "qtyPerYear"):
+            raw_value = _coerce_number_like(payload.get(key))
+            if _numbers_match(raw_value, first_cumulative_total):
+                compact_value = _compact_number(raw_value)
+                if compact_value is not None:
+                    legacy_quantity_mirrors[key] = compact_value
+                payload.pop(key, None)
+        if legacy_quantity_mirrors:
+            payload["agent_legacy_quantity_mirrors"] = legacy_quantity_mirrors
+
+    return payload
+
+
+def build_workspace_agent_input(rfq_data: dict[str, Any]) -> str:
+    prepared_payload = prepare_rfq_payload_for_agent(rfq_data)
+    preamble = (
+        "Important interpretation rules for this RFQ JSON:\n"
+        "- `agent_volume_rows` is a backend-generated helper for quantity interpretation.\n"
+        "- When a row uses `cumulative_program_total_matching_yearly_profile`, the linked "
+        "`products[*].quantity` and any removed legacy top-level quantity mirror represent "
+        "the cumulative program total across the listed years for turnover calculation.\n"
+        "- In that case, use the year-by-year profile as authoritative and do not ask the "
+        "KAM to confirm whether the matching sum is annual or cumulative.\n"
+        "- Only block on quantity when the yearly profile itself is missing, contradictory, "
+        "or cannot be mapped to the product.\n\n"
+        "RFQ JSON:\n"
+    )
+    return preamble + json.dumps(prepared_payload, ensure_ascii=False, default=str)
+
+
 # ── PDF / file extraction for agent payload ───────────────────────────────────
 
 _MAX_FILE_TEXT_CHARS = 8_000  # Truncate to keep agent token budget sane
@@ -440,7 +615,7 @@ async def validate_rfq_with_agent(rfq_data: dict) -> AgentValidationResult:
         access_token[:8] + "..." if len(access_token) > 8 else "(short)",
     )
 
-    payload = {"input": json.dumps(rfq_data, ensure_ascii=False, default=str)}
+    payload = {"input": build_workspace_agent_input(rfq_data)}
     conversation_key = str(
         rfq_data.get("systematic_rfq_id") or rfq_data.get("rfq_id") or ""
     ).strip()

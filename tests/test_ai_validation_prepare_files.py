@@ -1,6 +1,10 @@
 import pytest
 
-from app.services.ai_validation import prepare_rfq_files_for_agent
+from app.services.ai_validation import (
+    build_workspace_agent_input,
+    prepare_rfq_files_for_agent,
+    prepare_rfq_payload_for_agent,
+)
 
 
 @pytest.mark.asyncio
@@ -46,3 +50,61 @@ async def test_prepare_rfq_files_for_agent_falls_back_to_filename_contains():
     assert prepared[0]["agent_file_tool"]["arguments"] == {
         "filename_contains": "assy-plan-v2.pdf"
     }
+
+
+def test_prepare_rfq_payload_for_agent_marks_matching_multi_year_quantity_as_cumulative():
+    payload = prepare_rfq_payload_for_agent(
+        {
+            "annual_volume": 3000000,
+            "products": [
+                {
+                    "part_number": "1004321000",
+                    "quantity": 3000000,
+                }
+            ],
+            "volumes": [
+                {
+                    "volumes": {
+                        "2026": 480000,
+                        "2027": 480000,
+                        "2028": 600000,
+                        "2029": 720000,
+                        "2030": 720000,
+                    }
+                }
+            ],
+        }
+    )
+
+    assert "annual_volume" not in payload
+    assert payload["agent_legacy_quantity_mirrors"] == {"annual_volume": 3000000}
+    assert payload["agent_volume_rows"][0]["quantity_basis"] == (
+        "cumulative_program_total_matching_yearly_profile"
+    )
+    assert payload["agent_volume_rows"][0]["annual_volume_confirmation_required"] is False
+    assert payload["products"][0]["agent_quantity_basis"] == (
+        "cumulative_program_total_matching_yearly_profile"
+    )
+    assert payload["products"][0]["agent_yearly_total_quantity"] == 3000000
+
+
+def test_build_workspace_agent_input_instructs_agent_not_to_ask_for_annual_vs_cumulative_confirmation():
+    message = build_workspace_agent_input(
+        {
+            "products": [{"part_number": "PN-1", "quantity": 3000000}],
+            "volumes": [
+                {
+                    "volumes": {
+                        "2026": 480000,
+                        "2027": 480000,
+                        "2028": 600000,
+                        "2029": 720000,
+                        "2030": 720000,
+                    }
+                }
+            ],
+        }
+    )
+
+    assert "do not ask the KAM to confirm whether the matching sum is annual or cumulative" in message
+    assert "cumulative_program_total_matching_yearly_profile" in message
