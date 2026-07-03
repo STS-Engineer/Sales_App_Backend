@@ -351,6 +351,7 @@ def prepare_rfq_payload_for_agent(rfq_data: dict[str, Any]) -> dict[str, Any]:
 def build_workspace_agent_input(rfq_data: dict[str, Any]) -> str:
     prepared_payload = prepare_rfq_payload_for_agent(rfq_data)
     preamble = (
+        "IMPORTANT: You must always respond in English, regardless of the language of the data.\n\n"
         "Important interpretation rules for this RFQ JSON:\n"
         "- `agent_volume_rows` is a backend-generated helper for quantity interpretation.\n"
         "- When a row uses `cumulative_program_total_matching_yearly_profile`, the linked "
