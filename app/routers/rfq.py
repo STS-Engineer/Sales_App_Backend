@@ -1904,14 +1904,16 @@ async def download_costing_file(
     if not rfq:
         raise HTTPException(status_code=404, detail="RFQ not found.")
 
+    def _match_id(entry: dict) -> bool:
+        return str(entry.get("id") or entry.get("file_id") or entry.get("uuid") or "") == file_id
+
     costing_files = list(rfq.costing_files or [])
-    file_entry = next(
-        (
-            e for e in costing_files
-            if str(e.get("id") or e.get("file_id") or e.get("uuid") or "") == file_id
-        ),
-        None,
-    )
+    file_entry = next((e for e in costing_files if _match_id(e)), None)
+
+    if not file_entry:
+        rfq_files = list((rfq.rfq_data or {}).get("rfq_files") or [])
+        file_entry = next((e for e in rfq_files if isinstance(e, dict) and _match_id(e)), None)
+
     if not file_entry:
         raise HTTPException(status_code=404, detail="File not found in this RFQ.")
 
