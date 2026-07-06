@@ -526,8 +526,8 @@ async def _run_save_tool(arguments: dict) -> dict:
     async with async_session_maker() as db:
         result = await db.execute(
             select(Rfq).where(
-                Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
-            ).limit(1)
+                Rfq.systematic_rfq_id == systematic_rfq_id
+            ).order_by(Rfq.updated_at.desc(), Rfq.created_at.desc()).limit(1)
         )
         rfq = result.scalar_one_or_none()
         if rfq is None:
@@ -569,8 +569,8 @@ async def _run_read_attachment_tool(arguments: dict) -> dict:
     async with async_session_maker() as db:
         result = await db.execute(
             select(Rfq).where(
-                Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
-            ).limit(1)
+                Rfq.systematic_rfq_id == systematic_rfq_id
+            ).order_by(Rfq.updated_at.desc(), Rfq.created_at.desc()).limit(1)
         )
         rfq = result.scalar_one_or_none()
         if rfq is None:
@@ -644,8 +644,8 @@ async def _run_read_blob_attachment_tool(arguments: dict) -> dict:
     async with async_session_maker() as db:
         result = await db.execute(
             select(Rfq).where(
-                Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
-            ).limit(1)
+                Rfq.systematic_rfq_id == systematic_rfq_id
+            ).order_by(Rfq.updated_at.desc(), Rfq.created_at.desc()).limit(1)
         )
         rfq = result.scalar_one_or_none()
         if rfq is None:
@@ -723,8 +723,8 @@ async def _run_analyze_blob_with_openai_tool(arguments: dict) -> dict:
     async with async_session_maker() as db:
         result = await db.execute(
             select(Rfq).where(
-                Rfq.rfq_data["systematic_rfq_id"].astext == systematic_rfq_id
-            ).limit(1)
+                Rfq.systematic_rfq_id == systematic_rfq_id
+            ).order_by(Rfq.updated_at.desc(), Rfq.created_at.desc()).limit(1)
         )
         rfq = result.scalar_one_or_none()
         if rfq is None:

@@ -45,9 +45,10 @@ async def _get_rfq_for_ai_validation_callback(
         return None
 
     result = await db.execute(
-        select(Rfq).where(
-            Rfq.rfq_data["systematic_rfq_id"].astext == normalized_systematic_id
-        ).limit(1)
+        select(Rfq)
+        .where(Rfq.systematic_rfq_id == normalized_systematic_id)
+        .order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
+        .limit(1)
     )
     return result.scalar_one_or_none()
 
