@@ -191,10 +191,14 @@ class Rfq(Base):
     __tablename__ = "rfq"
 
     # The UUID remains the durable primary key.
-    # The user-facing formatted ID is stored in rfq_data["systematic_rfq_id"].
     rfq_id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: str(uuid.uuid4())
     )
+    # The user-facing formatted ID (e.g. "26517-BRU-00"). This column is the
+    # source of truth for uniqueness (enforced by a partial unique index —
+    # NULLs allowed, duplicates are not). Mirrored into rfq_data["systematic_rfq_id"]
+    # for existing readers (frontend, emails, PDFs, MCP tools).
+    systematic_rfq_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # ── New phase / sub-status columns ────────────────────────────────
     phase: Mapped[RfqPhase] = mapped_column(

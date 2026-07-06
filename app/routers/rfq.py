@@ -12,6 +12,7 @@ from azure.storage.blob import BlobServiceClient, BlobSasPermissions, ContentSet
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import and_, delete as sa_delete, func, or_, select, text, update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified, set_committed_value
@@ -983,26 +984,67 @@ def _allowed_transitions_for(rfq: Rfq) -> set[tuple[RfqPhase, RfqSubStatus]]:
     return allowed
 
 
-async def _generate_systematic_rfq_id(
+_SYSTEMATIC_ID_MAX_ATTEMPTS = 8
+
+
+async def _next_systematic_sequence(db: AsyncSession, yy: str) -> int:
+    """Highest sequence number already used this year, derived from the real column."""
+    result = await db.execute(
+        text(
+            """
+            SELECT COALESCE(
+                MAX(substring(systematic_rfq_id from ('^' || :yy || '(\\d+)-'))::int),
+                499
+            )
+            FROM rfq
+            WHERE systematic_rfq_id ~ ('^' || :yy || '\\d+-')
+            """
+        ),
+        {"yy": yy},
+    )
+    return result.scalar_one() + 1
+
+
+async def _assign_unique_systematic_rfq_id(
     db: AsyncSession,
+    rfq: Rfq,
     acronym: str,
     revision: str,
 ) -> str:
-    now = datetime.datetime.now()
-    yy = now.strftime("%y")
-    current_year = now.year
-    count_query = await db.execute(
-        select(func.count())
-        .select_from(Rfq)
-        .where(
-            func.extract("year", Rfq.created_at) == current_year,
-            Rfq.zone_manager_email.is_not(None),
-            Rfq.document_type != RfqDocumentType.POTENTIAL,
-        )
-    )
-    current_count = count_query.scalar_one() or 0
-    sequence = 500 + current_count
-    return f"{yy}{sequence}-{acronym}-{revision}"
+    """Generate and persist a unique systematic_rfq_id on `rfq`.
+
+    The MAX-based candidate is just a good first guess; the partial unique index
+    on Rfq.systematic_rfq_id is the actual source of truth. If two requests race
+    and compute the same candidate, the losing one hits a unique violation on
+    flush and retries with a fresh MAX instead of silently duplicating.
+    `rfq` must already be attached to `db` (via db.add()) before calling this.
+    """
+    yy = datetime.datetime.now().strftime("%y")
+    last_error: IntegrityError | None = None
+    for _ in range(_SYSTEMATIC_ID_MAX_ATTEMPTS):
+        # no_autoflush: on a retry, `rfq` still carries the previous (rejected)
+        # candidate in memory. Without this, the plain SELECT below would trigger
+        # an autoflush that re-attempts that same bad value.
+        with db.no_autoflush:
+            sequence = await _next_systematic_sequence(db, yy)
+        candidate = f"{yy}{sequence}-{acronym}-{revision}"
+        rfq.systematic_rfq_id = candidate
+        try:
+            await db.flush()
+            return candidate
+        except IntegrityError as exc:
+            last_error = exc
+            # A failed flush poisons the whole transaction, not just this statement —
+            # roll back and re-attach `rfq` (its in-memory attributes are preserved,
+            # only its session membership is lost) before retrying with a fresh MAX.
+            await db.rollback()
+            if rfq not in db:
+                db.add(rfq)
+            continue
+    raise HTTPException(
+        status_code=409,
+        detail="Could not generate a unique RFQ reference. Please retry.",
+    ) from last_error
 
 
 def _increment_rfq_reference_index(rfq_reference: str) -> str:
@@ -1188,7 +1230,10 @@ async def _maybe_assign_systematic_rfq_id(
     next_data["product_line_acronym"] = acronym
     next_data["zone_manager_email"] = zone_manager_email
     next_data.pop("validator_email", None)
-    next_data["systematic_rfq_id"] = await _generate_systematic_rfq_id(db, acronym, revision)
+    next_data["systematic_rfq_id"] = await _assign_unique_systematic_rfq_id(db, rfq, acronym, revision)
+    # Re-assert after the call above: a collision retry rolls back the session,
+    # which would otherwise silently revert these two columns to their prior
+    # (possibly stale) DB values.
     rfq.product_line_acronym = acronym
     rfq.zone_manager_email = zone_manager_email
     return next_data
@@ -1258,8 +1303,8 @@ async def _submit_rfq_for_validation_internal(
     extracted_data["validator_role"] = validator_role
     extracted_data.pop("validator_email", None)
     if not extracted_data.get("systematic_rfq_id"):
-        extracted_data["systematic_rfq_id"] = await _generate_systematic_rfq_id(
-            db, acronym, revision
+        extracted_data["systematic_rfq_id"] = await _assign_unique_systematic_rfq_id(
+            db, rfq, acronym, revision
         )
     systematic_rfq_id = str(extracted_data["systematic_rfq_id"])
     extracted_data.pop("post_validation_edit_unlocked", None)
@@ -1435,6 +1480,7 @@ async def create_rfq(
         rfq_data=rfq_data,
         chat_history=[],
     )
+    db.add(rfq)
     rfq_data = await _sync_product_line_from_product_name(
         db,
         rfq,
@@ -1450,7 +1496,6 @@ async def create_rfq(
     rfq.zone_manager_email = zone_manager_email
     rfq.rfq_data = rfq_data
     rfq.rfq_data = await _maybe_assign_systematic_rfq_id(db, rfq, rfq_data)
-    db.add(rfq)
     if document_type == RfqDocumentType.POTENTIAL:
         rfq.potential = Potential(chat_history=[])
 
@@ -1585,7 +1630,7 @@ async def update_rfq_data(
             new_systematic_id = _increment_rfq_reference_index(old_systematic_id)
             dup_result = await db.execute(
                 select(func.count()).select_from(Rfq).where(
-                    Rfq.rfq_data["systematic_rfq_id"].astext == new_systematic_id,
+                    Rfq.systematic_rfq_id == new_systematic_id,
                     Rfq.rfq_id != rfq_id,
                 )
             )
@@ -1596,6 +1641,7 @@ async def update_rfq_data(
                 )
             final_data["systematic_rfq_id"] = new_systematic_id
             rfq.rfq_data = final_data
+            rfq.systematic_rfq_id = new_systematic_id
             await log_action(
                 db,
                 rfq_id,
@@ -1748,7 +1794,7 @@ async def upload_rfq_file(
         new_systematic_id = _increment_rfq_reference_index(old_systematic_id)
         dup_result = await db.execute(
             select(func.count()).select_from(Rfq).where(
-                Rfq.rfq_data["systematic_rfq_id"].astext == new_systematic_id,
+                Rfq.systematic_rfq_id == new_systematic_id,
                 Rfq.rfq_id != rfq_id,
             )
         )
@@ -1758,6 +1804,7 @@ async def upload_rfq_file(
                 detail=f"RFQ reference {new_systematic_id} already exists.",
             )
         extracted_data["systematic_rfq_id"] = new_systematic_id
+        rfq.systematic_rfq_id = new_systematic_id
 
     rfq.rfq_data = extracted_data
 

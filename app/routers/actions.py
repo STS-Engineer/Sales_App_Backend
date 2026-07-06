@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -15,6 +15,7 @@ from app.models.user import User, UserRole
 from app.routers.rfq import (
     _assert_can_edit_rfq_phase,
     _assert_costing_phase_assignment,
+    _assign_unique_systematic_rfq_id,
 )
 from app.services.audit import log_action
 
@@ -136,24 +137,17 @@ async def trigger_workflow(
     if not zone_manager_email:
         raise HTTPException(status_code=400, detail="Missing zone_manager_email.")
 
-    count_query = await db.execute(
-        select(func.count())
-        .select_from(Rfq)
-        .where(Rfq.product_line_acronym == acronym, Rfq.zone_manager_email.is_not(None))
-    )
-    current_count = count_query.scalar_one() or 0
-    sequence = current_count + 1
-    year = datetime.now().strftime("%y")
-    systematic_rfq_id = f"{year}{sequence:03d}-{acronym}-{revision}"
-
+    rfq_data["zone_manager_email"] = zone_manager_email
+    rfq_data.pop("validator_email", None)
+    systematic_rfq_id = await _assign_unique_systematic_rfq_id(db, rfq, acronym, revision)
+    rfq_data["systematic_rfq_id"] = systematic_rfq_id
+    # Assert these after the call above: a collision retry rolls back the
+    # session, which would otherwise silently revert any earlier assignment.
     rfq.product_line_acronym = acronym
     rfq.zone_manager_email = zone_manager_email
     rfq.phase = RfqPhase.RFQ
     rfq.sub_status = RfqSubStatus.PENDING_FOR_VALIDATION
     rfq.last_notification_sent_at = None
-    rfq_data["zone_manager_email"] = zone_manager_email
-    rfq_data.pop("validator_email", None)
-    rfq_data["systematic_rfq_id"] = systematic_rfq_id
     rfq.rfq_data = rfq_data
 
     await log_action(
