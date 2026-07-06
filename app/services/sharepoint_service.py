@@ -359,6 +359,30 @@ async def upload_file_to_folder(
     logger.warning("DEBUG SHAREPOINT: file uploaded — %s/%s", folder_path, file_name)
 
 
+async def _mark_files_uploaded_to_sharepoint(rfq_id: str, file_ids: list[str]) -> None:
+    """Append file IDs to rfq_data["sharepoint"]["uploaded_file_ids"] so re-approvals skip them."""
+    from app.models.rfq import Rfq  # local import
+    async with async_session_maker() as db:
+        rfq = await db.get(Rfq, rfq_id)
+        if rfq is None:
+            logger.error("DEBUG SHAREPOINT: RFQ %s not found — cannot mark files uploaded", rfq_id)
+            return
+        existing_data = dict(rfq.rfq_data or {})
+        sp = dict(existing_data.get("sharepoint") or {})
+        already: set[str] = set(sp.get("uploaded_file_ids") or [])
+        already.update(file_ids)
+        sp["uploaded_file_ids"] = sorted(already)
+        existing_data["sharepoint"] = sp
+        rfq.rfq_data = existing_data
+        flag_modified(rfq, "rfq_data")
+        await db.commit()
+        logger.warning(
+            "DEBUG SHAREPOINT: marked %d file(s) as uploaded for RFQ %s",
+            len(file_ids),
+            rfq_id,
+        )
+
+
 async def _update_rfq_sharepoint_data(rfq_id: str, folder_url: str, folder_path: str) -> None:
     """
     Persist sharepoint.folder_url and sharepoint.folder_path into rfq.rfq_data.
@@ -539,7 +563,7 @@ async def sync_rfq_to_sharepoint(
             )
             return
 
-        # Guard: if the folder is already recorded in the DB, skip creation entirely.
+        # Guard: if the folder is already recorded in the DB, upload only new files.
         from app.models.rfq import Rfq  # local import — avoids circular dependency
         async with async_session_maker() as _db:
             _rfq = await _db.get(Rfq, rfq_id)
@@ -547,12 +571,70 @@ async def sync_rfq_to_sharepoint(
                 (_rfq.rfq_data or {}).get("sharepoint", {}).get("folder_path")
                 if _rfq else None
             )
+            _already_uploaded: set[str] = set(
+                ((_rfq.rfq_data or {}).get("sharepoint", {}).get("uploaded_file_ids") or [])
+                if _rfq else []
+            )
         if _existing_path:
             logger.warning(
-                "DEBUG SHAREPOINT: folder already exists in DB for RFQ %s ('%s') — skipping creation",
+                "DEBUG SHAREPOINT: folder already exists in DB for RFQ %s ('%s') — checking for new files",
                 rfq_id,
                 _existing_path,
             )
+            _new_files = [
+                f for f in rfq_files
+                if str(f.get("id") or "").strip() not in _already_uploaded
+            ]
+            if not _new_files:
+                logger.warning("DEBUG SHAREPOINT: no new customer input files to upload for RFQ %s", rfq_id)
+                return
+            logger.warning(
+                "DEBUG SHAREPOINT: uploading %d new customer input file(s) for RFQ %s",
+                len(_new_files),
+                rfq_id,
+            )
+            try:
+                _token = await get_graph_token()
+                _drive_id = await get_drive_id(_token)
+                _customer_input_path = f"{_existing_path}/01-Customer Input"
+                _new_uploaded_ids: list[str] = []
+                for file_meta in _new_files:
+                    _blob_name = (file_meta.get("blob_name") or "").strip()
+                    _file_name = (
+                        file_meta.get("filename")
+                        or file_meta.get("name")
+                        or (_blob_name.split("/")[-1] if _blob_name else "")
+                    ).strip()
+                    if not _blob_name or not _file_name:
+                        logger.warning(
+                            "DEBUG SHAREPOINT: skipping new file with missing blob_name/filename for RFQ %s: %s",
+                            rfq_id,
+                            file_meta,
+                        )
+                        continue
+                    try:
+                        _file_bytes = await asyncio.to_thread(_download_blob_sync, _blob_name)
+                        await upload_file_to_folder(_token, _drive_id, _customer_input_path, _file_name, _file_bytes)
+                        _fid = str(file_meta.get("id") or "").strip()
+                        if _fid:
+                            _new_uploaded_ids.append(_fid)
+                    except Exception as _file_exc:
+                        logger.error(
+                            "DEBUG SHAREPOINT: failed to upload new file '%s' for RFQ %s: %s",
+                            _file_name,
+                            rfq_id,
+                            _file_exc,
+                        )
+                if _new_uploaded_ids:
+                    await _mark_files_uploaded_to_sharepoint(rfq_id, _new_uploaded_ids)
+                logger.warning("DEBUG SHAREPOINT: new files upload completed for RFQ %s", rfq_id)
+            except Exception as _exc:
+                logger.error(
+                    "DEBUG SHAREPOINT: failed to upload new customer input files for RFQ %s: %s",
+                    rfq_id,
+                    _exc,
+                    exc_info=True,
+                )
             return
 
         sharepoint_rfq_folder_name = normalize_sharepoint_rfq_folder_name(rfq_name)
@@ -578,6 +660,7 @@ async def sync_rfq_to_sharepoint(
 
         # Upload each pre-approval file to 01-Customer Input
         customer_input_path = result["customer_input_path"]
+        _initial_uploaded_ids: list[str] = []
         for file_meta in rfq_files:
             blob_name: str = (file_meta.get("blob_name") or "").strip()
             file_name: str = (
@@ -597,6 +680,9 @@ async def sync_rfq_to_sharepoint(
             try:
                 file_bytes = await asyncio.to_thread(_download_blob_sync, blob_name)
                 await upload_file_to_folder(token, drive_id, customer_input_path, file_name, file_bytes)
+                _fid = str(file_meta.get("id") or "").strip()
+                if _fid:
+                    _initial_uploaded_ids.append(_fid)
             except Exception as file_exc:
                 logger.error(
                     "DEBUG SHAREPOINT: failed to upload file '%s' for RFQ %s: %s",
@@ -605,6 +691,8 @@ async def sync_rfq_to_sharepoint(
                     file_exc,
                 )
 
+        if _initial_uploaded_ids:
+            await _mark_files_uploaded_to_sharepoint(rfq_id, _initial_uploaded_ids)
         logger.warning("DEBUG SHAREPOINT: sync_rfq_to_sharepoint COMPLETED for RFQ %s", rfq_id)
 
     except Exception as exc:

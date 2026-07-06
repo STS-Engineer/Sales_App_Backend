@@ -1311,12 +1311,27 @@ async def _submit_rfq_for_validation_internal(
     extracted_data.pop("post_validation_edit_unlocked", None)
     if is_resubmission:
         extracted_data["is_resubmission"] = True
-        # Clear costing phase data so the costing team starts fresh after an RFQ update.
-        # SharePoint folders are preserved — the folder_path in rfq_data["sharepoint"] is kept.
+
         rfq.costing_files = None
         rfq.costing_file_state = None
         extracted_data.pop("pricing_bom_upload", None)
         extracted_data.pop("pricing_final_price_upload", None)
+        await db.execute(
+            sa_delete(AuditLog).where(
+                AuditLog.rfq_id == rfq.rfq_id,
+                or_(
+                    AuditLog.action == "Costing review approved",
+                    AuditLog.action.like("Costing review rejected%"),
+                    AuditLog.action.like("Status advanced to COSTING/PRICING%"),
+                ),
+            )
+        )
+        await log_action(
+            db,
+            rfq.rfq_id,
+            "RFQ updated by creator — reset to pending validation, costing data cleared.",
+            current_user.email,
+        )
     else:
         extracted_data.pop("is_resubmission", None)
         extracted_data.pop("resubmission_restore_phase", None)
