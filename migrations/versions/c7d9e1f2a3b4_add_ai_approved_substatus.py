@@ -17,12 +17,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # ADD VALUE is idempotent with IF NOT EXISTS — safe to re-run.
     op.execute("ALTER TYPE rfqsubstatus ADD VALUE IF NOT EXISTS 'AI_APPROVED'")
 
 
 def downgrade() -> None:
-    # PostgreSQL does not support removing enum values.
-    # To roll back: manually migrate any AI_APPROVED rows to PENDING_FOR_VALIDATION,
-    # then recreate the enum without the value and update the column type.
     pass
