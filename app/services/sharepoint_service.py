@@ -539,6 +539,22 @@ async def sync_rfq_to_sharepoint(
             )
             return
 
+        # Guard: if the folder is already recorded in the DB, skip creation entirely.
+        from app.models.rfq import Rfq  # local import — avoids circular dependency
+        async with async_session_maker() as _db:
+            _rfq = await _db.get(Rfq, rfq_id)
+            _existing_path = (
+                (_rfq.rfq_data or {}).get("sharepoint", {}).get("folder_path")
+                if _rfq else None
+            )
+        if _existing_path:
+            logger.warning(
+                "DEBUG SHAREPOINT: folder already exists in DB for RFQ %s ('%s') — skipping creation",
+                rfq_id,
+                _existing_path,
+            )
+            return
+
         sharepoint_rfq_folder_name = normalize_sharepoint_rfq_folder_name(rfq_name)
         logger.warning(
             "DEBUG SHAREPOINT: rfq_name original='%s' sharepoint_folder_name='%s'",

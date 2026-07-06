@@ -99,6 +99,7 @@ from app.services.notifications import (
     EMAIL_PRICING_READY,
     EMAIL_REVISION_REQUEST,
     EMAIL_RFI_COMPLETED,
+    EMAIL_RFQ_REVALIDATION,
     EMAIL_VALIDATION_REQUEST,
     record_notification_sent,
 )
@@ -1265,8 +1266,12 @@ async def _submit_rfq_for_validation_internal(
     extracted_data.pop("post_validation_edit_unlocked", None)
     if is_resubmission:
         extracted_data["is_resubmission"] = True
-        extracted_data["resubmission_restore_phase"] = rfq.phase.value
-        extracted_data["resubmission_restore_sub_status"] = rfq.sub_status.value
+        # Clear costing phase data so the costing team starts fresh after an RFQ update.
+        # SharePoint folders are preserved — the folder_path in rfq_data["sharepoint"] is kept.
+        rfq.costing_files = None
+        rfq.costing_file_state = None
+        extracted_data.pop("pricing_bom_upload", None)
+        extracted_data.pop("pricing_final_price_upload", None)
     else:
         extracted_data.pop("is_resubmission", None)
         extracted_data.pop("resubmission_restore_phase", None)
@@ -2723,22 +2728,21 @@ async def validate_rfq(
         rfq.rejected_at = None
 
     if body.approved:
-        _pre_commit_data = dict(rfq.rfq_data or {})
-        _is_resubmission_approval = bool(_pre_commit_data.get("is_resubmission"))
-        if _is_resubmission_approval:
-            _restore_phase_val = _pre_commit_data.get("resubmission_restore_phase")
-            _restore_sub_val = _pre_commit_data.get("resubmission_restore_sub_status")
-            try:
-                _restore_phase = RfqPhase(_restore_phase_val) if _restore_phase_val else RfqPhase.COSTING
-                _restore_sub = RfqSubStatus(_restore_sub_val) if _restore_sub_val else RfqSubStatus.FEASIBILITY
-            except ValueError:
-                _restore_phase = RfqPhase.COSTING
-                _restore_sub = RfqSubStatus.FEASIBILITY
-            _set_phase_sub_status(rfq, _restore_phase, _restore_sub)
-            _log_approval_target = f"{_restore_phase.value}/{_restore_sub.value}"
-        else:
-            _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.FEASIBILITY)
-            _log_approval_target = f"{RfqPhase.COSTING.value}/{RfqSubStatus.FEASIBILITY.value}"
+        # Check for a previous "Validator approved" entry BEFORE adding the current one.
+        # owner_update resets phase to RFQ so is_resubmission is unreliable; audit logs
+        # are the only accurate signal that this RFQ has been approved before.
+        _prior_approval_result = await db.execute(
+            select(func.count()).select_from(AuditLog).where(
+                AuditLog.rfq_id == rfq_id,
+                AuditLog.action.like("Validator approved%"),
+            )
+        )
+        _had_prior_approval: bool = (_prior_approval_result.scalar() or 0) > 0
+
+        # Always start costing fresh at FEASIBILITY — whether first approval or re-approval
+        # after an RFQ update. Costing data was already cleared at re-submit time.
+        _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.FEASIBILITY)
+        _log_approval_target = f"{RfqPhase.COSTING.value}/{RfqSubStatus.FEASIBILITY.value}"
         rfq.approved_at = datetime.datetime.now(datetime.timezone.utc)
         rfq.rejected_at = None
         rfq.rejection_reason = None
@@ -2780,13 +2784,21 @@ async def validate_rfq(
                 recipient_email = str(route_entry.get("email") or "")
                 if not recipient_email:
                     continue
-                sent = emails.send_costing_entry_email(
-                    recipient_email,
-                    str(route_entry.get("product_line") or ""),
-                    str(route_entry.get("acronym") or ""),
-                    systematic_rfq_id_val,
-                    rfq_link_val,
-                )
+                if _had_prior_approval:
+                    sent = emails.send_rfq_revalidation_notification(
+                        recipient_email,
+                        systematic_rfq_id_val,
+                        acronym_val,
+                        rfq_link_val,
+                    )
+                else:
+                    sent = emails.send_costing_entry_email(
+                        recipient_email,
+                        str(route_entry.get("product_line") or ""),
+                        str(route_entry.get("acronym") or ""),
+                        systematic_rfq_id_val,
+                        rfq_link_val,
+                    )
                 if sent:
                     notified_costing.append(recipient_email)
             if notified_costing:
@@ -2795,18 +2807,10 @@ async def validate_rfq(
                     db,
                     rfq_id=refreshed_rfq.rfq_id,
                     recipients=notified_costing,
-                    email_type=EMAIL_COSTING_ENTRY,
+                    email_type=EMAIL_RFQ_REVALIDATION if _had_prior_approval else EMAIL_COSTING_ENTRY,
                 )
                 # record_notification_sent commits internally — reload to avoid
                 # accessing expired attributes on the next read.
-                refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
-            if refreshed_data.get("is_resubmission"):
-                next_data = dict(refreshed_rfq.rfq_data or {})
-                next_data.pop("is_resubmission", None)
-                next_data.pop("resubmission_restore_phase", None)
-                next_data.pop("resubmission_restore_sub_status", None)
-                refreshed_rfq.rfq_data = next_data
-                await db.commit()
                 refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
