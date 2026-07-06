@@ -27,7 +27,7 @@ def test_escalation_constants():
     )
 
     assert N2_ASIA_EAST_EMAIL == "tao.ren@avocarbon.com"
-    assert N2_ASIA_SOUTH_EMAIL == "eipe.thomas@avocarbon.com"
+    assert N2_ASIA_SOUTH_EMAIL == "ramkumar.p@avocarbon.com"
     assert N2_ZONE_EMAIL == "franck.lagadec@avocarbon.com"
     assert N2_AMERICAS_EMAIL == "dean.hayward@avocarbon.com"
     assert N1_VP_EMAIL == "eric.suszylo@avocarbon.com"
@@ -59,7 +59,7 @@ def test_get_zone_manager_email_uses_canonical_zone_mapping():
         "Africa",
     )
     assert get_zone_manager_email("India") == (
-        "eipe.thomas@avocarbon.com",
+        "ramkumar.p@avocarbon.com",
         "India",
     )
     assert get_zone_manager_email("North America") == (

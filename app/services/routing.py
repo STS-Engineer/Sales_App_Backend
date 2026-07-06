@@ -13,7 +13,7 @@ from app.models.validation_matrix import ValidationMatrix
 N2_ZONE_EMAIL = "franck.lagadec@avocarbon.com"
 N2_AMERICAS_EMAIL = "dean.hayward@avocarbon.com"
 N2_ASIA_EAST_EMAIL = "tao.ren@avocarbon.com"
-N2_ASIA_SOUTH_EMAIL = "eipe.thomas@avocarbon.com"
+N2_ASIA_SOUTH_EMAIL = "ramkumar.p@avocarbon.com"
 # N-1 (VP Sales)
 N1_VP_EMAIL = "eric.suszylo@avocarbon.com"
 # N (CEO - above N-1 threshold)
