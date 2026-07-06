@@ -35,6 +35,8 @@ class RfqSubStatus(str, enum.Enum):
     # RFQ phase
     NEW_RFQ = "NEW_RFQ"
     AI_APPROVED = "AI_APPROVED"          # AI pre-validation passed; awaiting human validator
+    PENDING_AI_APPROVAL = "PENDING_AI_APPROVAL"
+    REJECTED_BY_AI = "REJECTED_BY_AI"
     PENDING_FOR_VALIDATION = "PENDING_FOR_VALIDATION"
     REVISION_REQUESTED = "REVISION_REQUESTED"
     # COSTING phase
