@@ -66,6 +66,7 @@ from app.schemas.rfq import (
 from app.services.audit import log_action
 from app.services.ai_validation import (
     AgentValidationResult,
+    apply_ai_validation_verdict,
     build_ai_validation_record,
     current_timestamp_iso,
     extract_ai_validation_record,
@@ -1378,28 +1379,17 @@ async def _submit_rfq_for_validation_internal(
         source="workspace_agent_trigger",
     )
 
-    if not ai_result.approved:
-        # Save the rejection result to the DB (rfq_data only, no status change),
-        # then surface the detail to the frontend via 422.
-        rfq.rfq_data = {**(rfq.rfq_data or {}), "ai_validation": extracted_data["ai_validation"]}
-        await db.commit()
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "ai_blocked": True,
-                "message": ai_result.message
-                or "The AI agent blocked this RFQ. Please correct the indicated fields.",
-                "fields_to_correct": ai_result.fields_to_correct,
-            },
-        )
     # ─────────────────────────────────────────────────────────────────────────
-
+    # Always land on PENDING_AI_APPROVAL first. The human validator step only
+    # starts once the AI pre-check clears — synchronously below when the agent
+    # already returned a decision, or later via its async callback when the
+    # trigger response was "queued" (the normal production path).
     rfq.rfq_data = extracted_data
     rfq.zone_manager_email = zone_manager_email
     rfq.product_line_acronym = acronym
     rfq.approved_at = None
     rfq.rejected_at = None
-    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION)
+    _set_phase_sub_status(rfq, RfqPhase.RFQ, RfqSubStatus.PENDING_AI_APPROVAL)
 
     action_label = "re-submitted for validation" if is_resubmission else "submitted for validation"
     await log_action(
@@ -1407,7 +1397,7 @@ async def _submit_rfq_for_validation_internal(
         rfq.rfq_id,
         (
             f"RFQ {action_label} -> "
-            f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_FOR_VALIDATION.value}"
+            f"{RfqPhase.RFQ.value}/{RfqSubStatus.PENDING_AI_APPROVAL.value}"
         ),
         current_user.email,
     )
@@ -1415,27 +1405,26 @@ async def _submit_rfq_for_validation_internal(
     await db.refresh(rfq)
 
     email_sent = False
-    creator_is_validator = (
-        (rfq.created_by_email or "").strip().lower()
-        == zone_manager_email.lower()
-    )
-    ai_is_queued = (extracted_data.get("ai_validation") or {}).get("status") == "queued"
-    if send_email and not creator_is_validator and not ai_is_queued:
-        email_sent = emails.send_validation_email(
-            zone_manager_email,
-            systematic_rfq_id,
-            acronym,
-            _build_rfq_link(rfq.rfq_id),
-            validator_role=validator_role,
+    ai_status = str((extracted_data.get("ai_validation") or {}).get("status") or "")
+    if ai_status != "queued":
+        # The agent already returned a decision synchronously (legacy direct
+        # response, or a skipped/error fallback that defaults to approved) —
+        # resolve the AI step immediately instead of waiting for a callback.
+        email_sent = await apply_ai_validation_verdict(
+            db, rfq, approved=ai_result.approved, send_email=send_email,
         )
-        if email_sent:
-            rfq.last_notification_sent_at = datetime.datetime.now(datetime.timezone.utc)
-            await record_notification_sent(
-                db,
-                rfq_id=rfq.rfq_id,
-                recipients=zone_manager_email,
-                email_type=EMAIL_VALIDATION_REQUEST,
+        await db.refresh(rfq)
+        if not ai_result.approved:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ai_blocked": True,
+                    "message": ai_result.message
+                    or "The AI agent blocked this RFQ. Please correct the indicated fields.",
+                    "fields_to_correct": ai_result.fields_to_correct,
+                },
             )
+    # ─────────────────────────────────────────────────────────────────────────
 
     return {
         "message": "RFQ submitted for validation.",

@@ -72,6 +72,8 @@ VALID_PHASE_SUBSTATUS: dict[RfqPhase, set[RfqSubStatus]] = {
     RfqPhase.RFQ: {
         RfqSubStatus.NEW_RFQ,
         RfqSubStatus.AI_APPROVED,
+        RfqSubStatus.PENDING_AI_APPROVAL,
+        RfqSubStatus.REJECTED_BY_AI,
         RfqSubStatus.PENDING_FOR_VALIDATION,
         RfqSubStatus.REVISION_REQUESTED,
     } | _TERMINAL_ANYWHERE,
@@ -114,8 +116,18 @@ ALLOWED_TRANSITIONS: dict[
 ] = {
     # ── RFQ phase ────────────────────────────────────────────────────
     (RfqPhase.RFQ, RfqSubStatus.NEW_RFQ): {
-        (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED),            # normal path via AI validation
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_AI_APPROVAL),     # normal path: submit -> AI pre-check
+        (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED),            # legacy
         (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),  # fallback / legacy
+        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
+    },
+    (RfqPhase.RFQ, RfqSubStatus.PENDING_AI_APPROVAL): {
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),  # AI approved -> human validator queue
+        (RfqPhase.RFQ, RfqSubStatus.REJECTED_BY_AI),          # AI blocked -> creator must fix
+        (RfqPhase.RFQ, RfqSubStatus.CANCELED),
+    },
+    (RfqPhase.RFQ, RfqSubStatus.REJECTED_BY_AI): {
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_AI_APPROVAL),     # creator fixes and resubmits
         (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED): {
@@ -129,7 +141,8 @@ ALLOWED_TRANSITIONS: dict[
         (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },
     (RfqPhase.RFQ, RfqSubStatus.REVISION_REQUESTED): {
-        (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED),            # resubmit via AI validation
+        (RfqPhase.RFQ, RfqSubStatus.PENDING_AI_APPROVAL),     # resubmit -> AI pre-check again
+        (RfqPhase.RFQ, RfqSubStatus.AI_APPROVED),            # legacy
         (RfqPhase.RFQ, RfqSubStatus.PENDING_FOR_VALIDATION),  # fallback / legacy
         (RfqPhase.RFQ, RfqSubStatus.CANCELED),
     },

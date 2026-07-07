@@ -20,8 +20,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings
+from app.config import Settings, settings
+from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
+from app.services.notifications import EMAIL_VALIDATION_REQUEST, record_notification_sent
+from app.utils import emails
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +144,69 @@ def resolve_ai_validation_approved(
     if aliased and isinstance(aliased[1], bool):
         return aliased[1]
     return fallback
+
+
+async def apply_ai_validation_verdict(
+    db: AsyncSession,
+    rfq: Rfq,
+    *,
+    approved: bool,
+    send_email: bool = True,
+) -> bool:
+    """Resolve an RFQ sitting in PENDING_AI_APPROVAL once the agent's verdict is known.
+
+    Approved -> moves to PENDING_FOR_VALIDATION and, unless the creator is also
+    the assigned validator, emails the validator so they know it's their turn.
+    Rejected -> moves to REJECTED_BY_AI; the creator must fix and resubmit.
+
+    Returns True if a validator notification email was sent. No-ops (returns
+    False) if the RFQ isn't currently awaiting an AI decision — e.g. a stale or
+    duplicate callback arriving after the RFQ was already resolved.
+    """
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status != RfqSubStatus.PENDING_AI_APPROVAL:
+        return False
+
+    if not approved:
+        rfq.sub_status = RfqSubStatus.REJECTED_BY_AI
+        await db.commit()
+        return False
+
+    rfq.sub_status = RfqSubStatus.PENDING_FOR_VALIDATION
+    await db.commit()
+    await db.refresh(rfq)
+
+    zone_manager_email = str(rfq.zone_manager_email or "").strip()
+    creator_email = str(rfq.created_by_email or "").strip().lower()
+    creator_is_validator = zone_manager_email.lower() == creator_email
+    if not send_email or not zone_manager_email or creator_is_validator:
+        return False
+
+    rfq_data = rfq.rfq_data or {}
+    systematic_rfq_id = str(rfq_data.get("systematic_rfq_id") or "").strip() or rfq.rfq_id
+    acronym = str(rfq.product_line_acronym or "").strip()
+    validator_role = str(rfq_data.get("validator_role") or "Validator").strip() or "Validator"
+    frontend_url = str(settings.frontend_url or "").rstrip("/")
+    rfq_link = f"{frontend_url}/rfqs/new?id={rfq.rfq_id}" if frontend_url else rfq.rfq_id
+
+    email_sent = emails.send_validation_email(
+        zone_manager_email,
+        systematic_rfq_id,
+        acronym,
+        rfq_link,
+        validator_role=validator_role,
+    )
+    if email_sent:
+        # Rfq.last_notification_sent_at is a naive DateTime column — asyncpg
+        # rejects a tz-aware value here.
+        rfq.last_notification_sent_at = datetime.datetime.utcnow()
+        await record_notification_sent(
+            db,
+            rfq_id=rfq.rfq_id,
+            recipients=zone_manager_email,
+            email_type=EMAIL_VALIDATION_REQUEST,
+        )
+        await db.commit()
+    return email_sent
 
 
 def build_ai_validation_record(
