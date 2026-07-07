@@ -30,7 +30,7 @@ def test_escalation_constants():
     assert N2_ASIA_SOUTH_EMAIL == "ramkumar.p@avocarbon.com"
     assert N2_ZONE_EMAIL == "franck.lagadec@avocarbon.com"
     assert N2_AMERICAS_EMAIL == "dean.hayward@avocarbon.com"
-    assert N1_VP_EMAIL == "eric.suszylo@avocarbon.com"
+    assert N1_VP_EMAIL == "hamdi.aouichaoui@avocarbon.com"
     assert N0_CEO_EMAIL == "olivier.spicker@avocarbon.com"
 
 

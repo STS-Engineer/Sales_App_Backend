@@ -28,6 +28,7 @@ from app.config import settings
 from app.database import async_session_maker
 from app.models.rfq import Rfq
 from app.services.ai_validation import (
+    apply_ai_validation_verdict,
     build_ai_validation_record,
     current_timestamp_iso,
     infer_approved_from_discussion,
@@ -547,6 +548,12 @@ async def _run_save_tool(arguments: dict) -> dict:
         )
         rfq.rfq_data = rfq_data
         await db.commit()
+
+        # Move the RFQ out of PENDING_AI_APPROVAL now that the agent's verdict is
+        # in — approved goes to the human validator queue (and emails them),
+        # rejected goes to REJECTED_BY_AI. No-ops if this RFQ isn't currently
+        # awaiting an AI decision (e.g. a stale/duplicate callback).
+        await apply_ai_validation_verdict(db, rfq, approved=resolved_approved)
 
     return {
         "success": True,
