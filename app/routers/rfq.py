@@ -381,9 +381,11 @@ async def _can_view_rfq(
     if current_user.role == UserRole.OWNER:
         return True
     if current_user.role == UserRole.COSTING_TEAM:
-        return await _is_assigned_costing_agent(db, current_user, rfq)
-    if current_user.role == UserRole.RND:
-        return rfq.phase == RfqPhase.COSTING and await _is_assigned_rnd(db, current_user, rfq)
+        if await _is_assigned_costing_agent(db, current_user, rfq):
+            return True
+    elif current_user.role == UserRole.RND:
+        if rfq.phase == RfqPhase.COSTING and await _is_assigned_rnd(db, current_user, rfq):
+            return True
     if _user_has_plm(current_user):
         return True
     if (
@@ -393,7 +395,8 @@ async def _can_view_rfq(
         return True
     if current_user.role == UserRole.ZONE_MANAGER and db_kpi is not None:
         team_emails = await _get_zone_manager_team_emails(db_kpi, current_user.email)
-        return (rfq.created_by_email or "").lower() in team_emails
+        if (rfq.created_by_email or "").lower() in team_emails:
+            return True
     if await user_is_routing_viewer_for_rfq(db, current_user.email, rfq):
         return True
     return False
@@ -2193,6 +2196,7 @@ async def get_rfq(
             "can_upload": False,
             "is_viewer": True,
         }
+
     return rfq
 
 
