@@ -1,12 +1,12 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.database import get_db
+from app.database import get_db, get_db4_optional
 from app.middleware.auth import get_current_user
 from app.models.old_rfqs import OldRfqMonday, OldRfqSubitem
 from app.models.user import User
@@ -26,6 +26,46 @@ def _serialize_row(row) -> dict:
         column.name: getattr(row, column.name)
         for column in row.__table__.columns
     }
+
+
+@router.get("/customer-options")
+async def get_customer_options(
+    current_user: User = Depends(get_current_user),
+    db4: AsyncSession | None = Depends(get_db4_optional),
+):
+    """Return distinct customer names from v_sales_customer_directory (KPI_DB_Final)."""
+    if db4 is None:
+        return {"names": []}
+    try:
+        result = await db4.execute(
+            text("SELECT DISTINCT customer_name FROM v_sales_customer_directory WHERE customer_name IS NOT NULL ORDER BY customer_name")
+        )
+        rows = result.fetchall()
+        names = [row[0] for row in rows if row[0] and str(row[0]).strip()]
+        return {"names": names}
+    except Exception:
+        logger.exception("Failed to fetch customer options from v_sales_customer_directory")
+        return {"names": []}
+
+
+@router.get("/kam-options")
+async def get_kam_options(
+    current_user: User = Depends(get_current_user),
+    db4: AsyncSession | None = Depends(get_db4_optional),
+):
+    """Return distinct commercial names from v_sales_organisation (KPI_DB_Final)."""
+    if db4 is None:
+        return {"names": []}
+    try:
+        result = await db4.execute(
+            text("SELECT DISTINCT person FROM v_sales_organisation WHERE person IS NOT NULL ORDER BY person")
+        )
+        rows = result.fetchall()
+        names = [row[0] for row in rows if row[0] and str(row[0]).strip()]
+        return {"names": names}
+    except Exception:
+        logger.exception("Failed to fetch KAM options from v_sales_organisation")
+        return {"names": []}
 
 
 @router.get("")
@@ -103,6 +143,25 @@ async def update_old_rfq(
     }
 
 
+@router.delete("/{old_rfq_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_old_rfq(
+    old_rfq_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(OldRfqMonday).where(OldRfqMonday.old_rfq_id == old_rfq_id)
+    )
+    old_rfq = result.scalar_one_or_none()
+
+    if old_rfq is None:
+        raise HTTPException(status_code=404, detail="Old RFQ not found.")
+
+    await db.delete(old_rfq)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # Subitem protected columns — these are never overwritten.
 _PROTECTED_SUBITEM_COLUMNS = {
     "old_rfq_subitem_id",
@@ -144,3 +203,22 @@ async def update_old_rfq_subitem(
     return {
         "item": _serialize_row(subitem),
     }
+
+
+@subitem_router.delete("/{old_rfq_subitem_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_old_rfq_subitem(
+    old_rfq_subitem_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(OldRfqSubitem).where(OldRfqSubitem.old_rfq_subitem_id == old_rfq_subitem_id)
+    )
+    subitem = result.scalar_one_or_none()
+
+    if subitem is None:
+        raise HTTPException(status_code=404, detail="Old RFQ subitem not found.")
+
+    await db.delete(subitem)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
