@@ -2,12 +2,14 @@ import os
 import shutil
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+import logging
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
+from app.database import get_db, get_db4_optional
 from app.middleware.auth import get_current_user, require_role
 from app.models.contact import Contact
 from app.models.rfq import Rfq, RfqPhase, RfqSubStatus
@@ -19,7 +21,19 @@ from app.routers.rfq import (
 )
 from app.services.audit import log_action
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/actions", tags=["actions"])
+
+_CUSTOMER_DIRECTORY_SQL = text("""
+    SELECT DISTINCT customer_name
+    FROM v_sales_customer_directory
+    WHERE customer_name IS NOT NULL
+      AND customer_name <> ''
+      AND (:search = '' OR customer_name ILIKE :search_pattern)
+    ORDER BY customer_name
+    LIMIT 5000
+""")
 
 
 class CheckGroupRequest(BaseModel):
@@ -64,6 +78,27 @@ async def check_group(
             for contact in contacts
         ],
     }
+
+
+@router.get("/customers", operation_id="listSalesCustomers")
+async def list_sales_customers(
+    search: str = Query(default="", description="Optional case-insensitive partial match on customer name"),
+    db4: AsyncSession = Depends(get_db4_optional),
+    current_user: User = Depends(get_current_user),
+):
+    if db4 is None:
+        return {"customers": []}
+    normalized_search = search.strip()
+    try:
+        result = await db4.execute(
+            _CUSTOMER_DIRECTORY_SQL,
+            {"search": normalized_search, "search_pattern": f"%{normalized_search}%"},
+        )
+        names = [row.customer_name for row in result.mappings().all() if row.customer_name]
+        return {"customers": names}
+    except Exception:
+        logger.exception("Failed to query v_sales_customer_directory.")
+        return {"customers": []}
 
 
 @router.post("/upload-file", operation_id="uploadRfqFiles")

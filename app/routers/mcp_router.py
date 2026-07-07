@@ -44,6 +44,12 @@ PDF_TEXT_MAX_CHARS = 20000
 OPENAI_FILE_ANALYSIS_MODEL = "gpt-4o"
 OPENAI_FILE_ANALYSIS_MAX_FILE_BYTES = 50 * 1024 * 1024
 OPENAI_FILE_ANALYSIS_TIMEOUT_SECONDS = 120.0
+IMAGE_ANALYSIS_MAX_PAGES = 3  # caps multi-page TIFF drawings
+IMAGE_ATTACHMENT_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+DOCX_ATTACHMENT_EXTENSIONS = {".docx"}
+DOCX_ATTACHMENT_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
 DEFAULT_FILE_ANALYSIS_QUESTION = (
     "Read this RFQ attachment as the original file and provide a precise summary "
     "for costing triage. Extract all concrete technical details visible in the "
@@ -157,8 +163,10 @@ _ANALYZE_BLOB_WITH_OPENAI_TOOL = {
     "name": "analyze_rfq_blob_attachment_with_openai",
     "description": (
         "Download one RFQ attachment directly from Azure Blob storage and analyze it "
-        "as a true OpenAI input_file. Use this when the Workspace Agent must reason "
-        "over the original PDF or document file instead of locally extracted text."
+        "with OpenAI. Use this when the Workspace Agent must reason over the original "
+        "drawing/document file instead of locally extracted text. Supports PDF, Word "
+        "(.docx), and image formats (TIFF, PNG, JPEG, BMP, GIF, WEBP) — image files "
+        "including multi-page TIFF drawings are rendered and read via vision."
     ),
     "inputSchema": {
         "type": "object",
@@ -234,6 +242,9 @@ def _extract_attachment_text(content: bytes, content_type: str, filename: str) -
 
     if normalized_type == "application/pdf" or extension == ".pdf":
         return _extract_pdf_text(content)
+
+    if normalized_type in DOCX_ATTACHMENT_MIME_TYPES or extension in DOCX_ATTACHMENT_EXTENSIONS:
+        return _extract_docx_text(content)
 
     if normalized_type.startswith("text/") or extension in {".txt", ".csv", ".json", ".xml"}:
         try:
@@ -407,6 +418,66 @@ def _extract_responses_output_text(body: dict) -> str:
     return "\n\n".join(chunks).strip()
 
 
+def _classify_attachment_kind(content_type: str, filename: str) -> str:
+    """Return 'pdf', 'docx', 'image', or 'other' to pick how to send the file to OpenAI.
+
+    The Responses API's `input_file` part only reliably supports document formats
+    like PDF — raster images (TIFF included) must go through `input_image`, and
+    Office formats like .docx aren't parsed by the model at all, so we extract
+    their text ourselves first.
+    """
+    normalized_type = str(content_type or "").strip().lower()
+    extension = os.path.splitext(str(filename or "").strip().lower())[1]
+    if normalized_type == "application/pdf" or extension == ".pdf":
+        return "pdf"
+    if normalized_type in DOCX_ATTACHMENT_MIME_TYPES or extension in DOCX_ATTACHMENT_EXTENSIONS:
+        return "docx"
+    if normalized_type.startswith("image/") or extension in IMAGE_ATTACHMENT_EXTENSIONS:
+        return "image"
+    return "other"
+
+
+def _extract_docx_text(content: bytes) -> str:
+    import io
+
+    from docx import Document
+
+    try:
+        document = Document(io.BytesIO(content))
+        parts = [p.text for p in document.paragraphs if p.text.strip()]
+        parts.extend(
+            cell.text
+            for table in document.tables
+            for row in table.rows
+            for cell in row.cells
+            if cell.text.strip()
+        )
+        return "\n".join(parts).strip()[:PDF_TEXT_MAX_CHARS]
+    except Exception:
+        return ""
+
+
+def _render_image_pages_to_png(content: bytes, filename: str) -> list[bytes]:
+    """Render an image attachment (TIFF/PNG/JPEG/BMP/GIF/WEBP) to PNG page(s).
+
+    Routed through fitz.open (not fitz.Pixmap) so multi-page TIFF drawings are
+    handled the same way multi-page PDFs already are, capped at a few pages.
+    """
+    extension = os.path.splitext(str(filename or "").strip().lower())[1].lstrip(".") or None
+    pages: list[bytes] = []
+    try:
+        with fitz.open(stream=content, filetype=extension) as doc:
+            for page_index, page in enumerate(doc):
+                if page_index >= IMAGE_ANALYSIS_MAX_PAGES:
+                    break
+                mat = fitz.Matrix(2.0, 2.0)
+                pix = page.get_pixmap(matrix=mat)
+                pages.append(pix.tobytes("png"))
+    except Exception:
+        return []
+    return pages
+
+
 async def _analyze_file_with_openai(
     *,
     content: bytes,
@@ -428,25 +499,45 @@ async def _analyze_file_with_openai(
             )
         }
 
-    normalized_type = _resolve_attachment_content_type(content_type, filename)
-    file_data = (
-        f"data:{normalized_type};base64,"
-        f"{base64.b64encode(content).decode('ascii')}"
-    )
+    kind = _classify_attachment_kind(content_type, filename)
+    user_content: list[dict] = [{"type": "input_text", "text": question}]
+
+    if kind == "docx":
+        extracted_text = _extract_docx_text(content)
+        if not extracted_text:
+            return {"error": f"Unable to extract readable text from '{filename}' (Word document)."}
+        user_content.append({
+            "type": "input_text",
+            "text": f"Document text extracted from '{filename}':\n\n{extracted_text}",
+        })
+    elif kind == "image":
+        pages = _render_image_pages_to_png(content, filename)
+        if not pages:
+            return {"error": f"Unable to read '{filename}' as an image for analysis."}
+        for page_bytes in pages:
+            page_data_url = f"data:image/png;base64,{base64.b64encode(page_bytes).decode('ascii')}"
+            user_content.append({"type": "input_image", "image_url": page_data_url})
+    else:
+        # PDF (and any unrecognized format, as a best-effort fallback): forward
+        # the original file as-is via input_file — unchanged existing behavior.
+        normalized_type = _resolve_attachment_content_type(content_type, filename)
+        file_data = (
+            f"data:{normalized_type};base64,"
+            f"{base64.b64encode(content).decode('ascii')}"
+        )
+        user_content.append({
+            "type": "input_file",
+            "filename": filename or "attachment",
+            "file_data": file_data,
+        })
+
     request_body = {
         "model": OPENAI_FILE_ANALYSIS_MODEL,
         "store": False,
         "input": [
             {
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": question},
-                    {
-                        "type": "input_file",
-                        "filename": filename or "attachment",
-                        "file_data": file_data,
-                    },
-                ],
+                "content": user_content,
             }
         ],
     }
