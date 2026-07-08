@@ -742,31 +742,20 @@ async def _assert_costing_phase_assignment(
     allow_rnd: bool = False,
     allow_plm: bool = False,
 ) -> None:
-    if current_user.role == UserRole.OWNER:
+    # Check the full multi-role set, not just the primary role — a user whose
+    # primary role is e.g. COSTING_TEAM may also hold PLM/RND as a secondary role.
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+
+    if UserRole.OWNER.value in all_roles:
         return
 
-    if current_user.role == UserRole.COSTING_TEAM:
-        if not await _is_assigned_costing_agent(db, current_user, rfq):
-            raise HTTPException(
-                status_code=403,
-                detail="You are not assigned as the costing agent for this RFQ.",
-            )
+    if UserRole.COSTING_TEAM.value in all_roles and await _is_assigned_costing_agent(db, current_user, rfq):
         return
 
-    if allow_rnd and current_user.role == UserRole.RND:
-        if not await _is_assigned_rnd(db, current_user, rfq):
-            raise HTTPException(
-                status_code=403,
-                detail="You are not assigned as the R&D contact for this RFQ.",
-            )
+    if allow_rnd and UserRole.RND.value in all_roles and await _is_assigned_rnd(db, current_user, rfq):
         return
 
-    if allow_plm and current_user.role == UserRole.PLM:
-        if not await _is_assigned_plm(db, current_user, rfq):
-            raise HTTPException(
-                status_code=403,
-                detail="You are not assigned as the PLM for this RFQ.",
-            )
+    if allow_plm and UserRole.PLM.value in all_roles and await _is_assigned_plm(db, current_user, rfq):
         return
 
     raise HTTPException(
@@ -2890,10 +2879,10 @@ async def costing_review(
     rfq_id: str,
     body: CostingReviewRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.PLM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    await _assert_costing_phase_assignment(db, current_user, rfq)
+    await _assert_costing_phase_assignment(db, current_user, rfq, allow_plm=True)
 
     if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY):
         raise HTTPException(
@@ -2926,10 +2915,17 @@ async def costing_review(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
-    cc_email = str(refreshed_rfq.zone_manager_email or "").strip() or None
+    refreshed_data = dict(refreshed_rfq.rfq_data or {})
+    # Fall back to rfq_data when the zone_manager_email column wasn't backfilled —
+    # mirrors the same fallback chain the frontend uses to display the validator.
+    cc_email = str(
+        refreshed_rfq.zone_manager_email
+        or refreshed_data.get("zone_manager_email")
+        or refreshed_data.get("validator_email")
+        or ""
+    ).strip() or None
     if _normalize_email(cc_email) == _normalize_email(refreshed_rfq.created_by_email):
         cc_email = None
-    refreshed_data = dict(refreshed_rfq.rfq_data or {})
     systematic_rfq_id = str(refreshed_data.get("systematic_rfq_id") or "")
     rfq_link = _build_rfq_link(refreshed_rfq.rfq_id)
     reception_email_sent = emails.send_costing_reception_results_email(
@@ -3043,16 +3039,16 @@ async def submit_costing_file_action(
     feasibility_status: str = Form(...),
     files: list[UploadFile] = File(default=[]),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.RND, UserRole.OWNER)),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    await _assert_costing_phase_assignment(db, current_user, rfq, allow_rnd=True)
+    await _assert_costing_phase_assignment(db, current_user, rfq, allow_rnd=True, allow_plm=True)
 
-    if (rfq.phase, rfq.sub_status) != (RfqPhase.COSTING, RfqSubStatus.FEASIBILITY):
+    if rfq.phase != RfqPhase.COSTING:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Costing file actions are only allowed during COSTING/FEASIBILITY. "
+                "Costing file actions are only allowed during the COSTING phase. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
@@ -3165,7 +3161,7 @@ async def submit_costing_file_action(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
-    if current_user.role == UserRole.RND:
+    if current_user.role in {UserRole.RND, UserRole.PLM}:
         refreshed_data = dict(refreshed_rfq.rfq_data or {})
         systematic_rfq_id = str(refreshed_data.get("systematic_rfq_id") or "")
         email_sent = emails.send_feasibility_result_email(
@@ -3287,16 +3283,16 @@ async def upload_pricing_final_price_file(
     note: str = Form(""),
     files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.OWNER)),
+    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.PLM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
-    await _assert_costing_phase_assignment(db, current_user, rfq)
+    await _assert_costing_phase_assignment(db, current_user, rfq, allow_plm=True)
 
-    if rfq.phase != RfqPhase.COSTING or rfq.sub_status != RfqSubStatus.PRICING:
+    if rfq.phase != RfqPhase.COSTING:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Final price uploads are only allowed during COSTING/PRICING. "
+                "Final price uploads are only allowed during the COSTING phase. "
                 f"Current state: {rfq.phase.value}/{rfq.sub_status.value}."
             ),
         )
