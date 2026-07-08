@@ -16,6 +16,10 @@ class AuditLog(Base):
     rfq_id: Mapped[str] = mapped_column(
         String, ForeignKey("rfq.rfq_id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Denormalized copy of Rfq.systematic_rfq_id (e.g. "26517-BRU-00"), populated
+    # automatically by log_action — lets audit queries/exports show the
+    # human-readable reference without joining back to rfq.
+    systematic_rfq_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     action: Mapped[str] = mapped_column(String, nullable=False)
     performed_by: Mapped[str] = mapped_column(String, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
