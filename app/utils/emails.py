@@ -949,7 +949,7 @@ Open the RFQ here:
             {rfq_id_html}
             <li><strong>Product line:</strong> {acronym}</li>
           </ul>
-          <p>Once the validator approves the updated RFQ, please review the changes and update your costing accordingly.</p>
+          <p>Please review the changes and update your costing accordingly.</p>
           <div style="margin: 30px 0; text-align: center;">
             <a href="{rfq_link}" style="background-color: #d97706; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
               Open RFQ
