@@ -102,6 +102,7 @@ from app.services.notifications import (
     EMAIL_REVISION_REQUEST,
     EMAIL_RFI_COMPLETED,
     EMAIL_RFQ_REVALIDATION,
+    EMAIL_RFQ_INDEX_CHANGED,
     EMAIL_VALIDATION_REQUEST,
     record_notification_sent,
 )
@@ -1041,6 +1042,16 @@ async def _assign_unique_systematic_rfq_id(
     ) from last_error
 
 
+def _humanize_field_name(key: str) -> str:
+    return " ".join(word.capitalize() for word in str(key or "").replace("_", " ").split())
+
+
+def _extract_rfq_revision_suffix(rfq_reference: str) -> str:
+    """Return the trailing numeric revision suffix of an RFQ reference (e.g. "01" for "26510-ASS-01")."""
+    match = re.match(r"^.*-(\d+)$", str(rfq_reference or "").strip())
+    return match.group(1) if match else ""
+
+
 def _increment_rfq_reference_index(rfq_reference: str) -> str:
     match = re.match(r"^(.*)-(\d+)$", rfq_reference or "")
     if not match:
@@ -1216,15 +1227,15 @@ async def _maybe_assign_systematic_rfq_id(
         or next_data.get("validator_email")
         or ""
     ).strip()
-    revision = str(next_data.get("revision_level") or "00").strip() or "00"
-
     if not acronym or not zone_manager_email:
         return next_data
 
     next_data["product_line_acronym"] = acronym
     next_data["zone_manager_email"] = zone_manager_email
     next_data.pop("validator_email", None)
-    next_data["systematic_rfq_id"] = await _assign_unique_systematic_rfq_id(db, rfq, acronym, revision)
+    # New RFQs always start at revision "00" — revision_level is a customer-supplied
+    # drawing/product revision field, unrelated to our internal Change Index counter.
+    next_data["systematic_rfq_id"] = await _assign_unique_systematic_rfq_id(db, rfq, acronym, "00")
     # Re-assert after the call above: a collision retry rolls back the session,
     # which would otherwise silently revert these two columns to their prior
     # (possibly stale) DB values.
@@ -1275,7 +1286,6 @@ async def _submit_rfq_for_validation_internal(
                 )
 
     acronym = (extracted_data.get("product_line_acronym") or "").strip()
-    revision = str(extracted_data.get("revision_level") or "00").strip() or "00"
     zone_manager_email = (
         extracted_data.get("zone_manager_email") or extracted_data.get("validator_email") or ""
     ).strip()
@@ -1297,8 +1307,10 @@ async def _submit_rfq_for_validation_internal(
     extracted_data["validator_role"] = validator_role
     extracted_data.pop("validator_email", None)
     if not extracted_data.get("systematic_rfq_id"):
+        # New RFQs always start at revision "00" — revision_level is a customer-supplied
+        # drawing/product revision field, unrelated to our internal Change Index counter.
         extracted_data["systematic_rfq_id"] = await _assign_unique_systematic_rfq_id(
-            db, rfq, acronym, revision
+            db, rfq, acronym, "00"
         )
     systematic_rfq_id = str(extracted_data["systematic_rfq_id"])
     extracted_data.pop("post_validation_edit_unlocked", None)
@@ -1539,6 +1551,7 @@ async def update_rfq_data(
         rfq = await _get_rfq_or_404(db, rfq_id)
         _assert_can_edit_base_rfq_data(current_user, rfq)
 
+        original_data = dict(rfq.rfq_data or {})
         incoming_data = rfq_data_payload_to_dict(body.rfq_data)
         incoming_data.pop("rfq_files", None)
         next_data = dict(rfq.rfq_data or {})
@@ -1572,7 +1585,7 @@ async def update_rfq_data(
                     status_code=403,
                     detail="Only the RFQ creator or an Owner can perform this action.",
                 )
-        if update_type == "owner_update":
+        if update_type in ("owner_update", "change_index"):
             # Clear resubmission markers from rfq_data so next validation is treated as fresh.
             _cleaned = dict(rfq.rfq_data or {})
             _cleaned.pop("is_resubmission", None)
@@ -1614,12 +1627,12 @@ async def update_rfq_data(
                     ),
                 )
             )
-            await log_action(
-                db,
-                rfq_id,
-                "RFQ updated by creator — reset to pending validation, costing data cleared.",
-                current_user.email,
+            reset_message = (
+                "RFQ updated by creator — reset to pending validation, costing data cleared."
+                if update_type == "owner_update"
+                else "RFQ index changed by creator — reset to pending validation, costing data cleared."
             )
+            await log_action(db, rfq_id, reset_message, current_user.email)
         if update_type == "change_index":
             final_data = dict(rfq.rfq_data or {})
             old_systematic_id = final_data.get("systematic_rfq_id") or ""
@@ -1640,15 +1653,46 @@ async def update_rfq_data(
                     status_code=409,
                     detail=f"RFQ reference {new_systematic_id} already exists.",
                 )
+            changed_field_keys = {
+                key for key in incoming_data.keys()
+                if key != "systematic_rfq_id"
+                and str(original_data.get(key)) != str(final_data.get(key))
+            }
+            # rfq_files is popped from incoming_data, so attachment/drawing changes
+            # (uploaded separately) would never show up above — the frontend flags
+            # them explicitly via body.changed_fields.
+            changed_field_keys.update(body.changed_fields or [])
+            changed_field_keys = sorted(changed_field_keys)
+            changed_fields_display = (
+                ", ".join(_humanize_field_name(key) for key in changed_field_keys)
+                if changed_field_keys
+                else "No field changes detected"
+            )
             final_data["systematic_rfq_id"] = new_systematic_id
             rfq.rfq_data = final_data
             rfq.systematic_rfq_id = new_systematic_id
             await log_action(
                 db,
                 rfq_id,
-                f"RFQ index changed from {old_systematic_id} to {new_systematic_id}",
+                (
+                    f"RFQ index changed from {old_systematic_id} to {new_systematic_id} "
+                    f"| Fields changed: {changed_fields_display}"
+                ),
                 current_user.email,
             )
+        if update_type == "simple" and body.changed_fields:
+            # Sent only from the Update-mode Submit action (not routine autosaves) —
+            # lets the resubmission email to Costing list which fields actually changed.
+            changed_fields_display = ", ".join(
+                _humanize_field_name(key) for key in body.changed_fields
+            )
+            if changed_fields_display:
+                await log_action(
+                    db,
+                    rfq_id,
+                    f"RFQ fields updated | Fields changed: {changed_fields_display}",
+                    current_user.email,
+                )
 
         await db.commit()
         rfq_result = await _get_rfq_or_404(db, rfq_id)
@@ -1806,6 +1850,10 @@ async def upload_rfq_file(
             )
         extracted_data["systematic_rfq_id"] = new_systematic_id
         rfq.systematic_rfq_id = new_systematic_id
+
+    # Tag this file with the RFQ revision in effect after this upload (00 at creation,
+    # 01/02/... after each Change Index) so the SharePoint sync can set the VersionNo column.
+    file_meta["revision"] = _extract_rfq_revision_suffix(extracted_data.get("systematic_rfq_id") or "")
 
     rfq.rfq_data = extracted_data
 
@@ -2783,6 +2831,47 @@ async def validate_rfq(
         )
         _had_prior_approval: bool = (_prior_approval_result.scalar() or 0) > 0
 
+        # If this resubmission was triggered by a Change Index (not a plain Update),
+        # a different email is sent to Costing — find the most recent "RFQ index
+        # changed" log entry recorded after the last Validator approval, if any.
+        # Otherwise, look for a plain "RFQ fields updated" marker to list changed
+        # fields in the regular re-validation email.
+        _index_change_log_action: str | None = None
+        _fields_updated_log_action: str | None = None
+        if _had_prior_approval:
+            _last_approval_result = await db.execute(
+                select(AuditLog.timestamp)
+                .where(AuditLog.rfq_id == rfq_id, AuditLog.action.like("Validator approved%"))
+                .order_by(AuditLog.timestamp.desc())
+                .limit(1)
+            )
+            _last_approval_at = _last_approval_result.scalar_one_or_none()
+            if _last_approval_at is not None:
+                _index_change_result = await db.execute(
+                    select(AuditLog.action)
+                    .where(
+                        AuditLog.rfq_id == rfq_id,
+                        AuditLog.action.like("RFQ index changed from%"),
+                        AuditLog.timestamp > _last_approval_at,
+                    )
+                    .order_by(AuditLog.timestamp.desc())
+                    .limit(1)
+                )
+                _index_change_log_action = _index_change_result.scalar_one_or_none()
+
+                if not _index_change_log_action:
+                    _fields_updated_result = await db.execute(
+                        select(AuditLog.action)
+                        .where(
+                            AuditLog.rfq_id == rfq_id,
+                            AuditLog.action.like("RFQ fields updated | Fields changed:%"),
+                            AuditLog.timestamp > _last_approval_at,
+                        )
+                        .order_by(AuditLog.timestamp.desc())
+                        .limit(1)
+                    )
+                    _fields_updated_log_action = _fields_updated_result.scalar_one_or_none()
+
         # Always start costing fresh at FEASIBILITY — whether first approval or re-approval
         # after an RFQ update. Costing data was already cleared at re-submit time.
         _set_phase_sub_status(rfq, RfqPhase.COSTING, RfqSubStatus.FEASIBILITY)
@@ -2823,17 +2912,50 @@ async def validate_rfq(
             systematic_rfq_id_val = str(refreshed_data.get("systematic_rfq_id") or "")
             acronym_val = str(refreshed_rfq.product_line_acronym or "")
             rfq_link_val = _build_rfq_link(refreshed_rfq.rfq_id)
+
+            _index_change_old_id = ""
+            _index_change_new_id = ""
+            _index_change_fields = ""
+            if _index_change_log_action:
+                _idx_match = re.match(
+                    r"^RFQ index changed from (.+?) to (.+?) \| Fields changed: (.*)$",
+                    _index_change_log_action,
+                )
+                if _idx_match:
+                    _index_change_old_id = _idx_match.group(1)
+                    _index_change_new_id = _idx_match.group(2)
+                    _index_change_fields = _idx_match.group(3)
+
+            _update_changed_fields = ""
+            if _fields_updated_log_action:
+                _upd_match = re.match(
+                    r"^RFQ fields updated \| Fields changed: (.*)$",
+                    _fields_updated_log_action,
+                )
+                if _upd_match:
+                    _update_changed_fields = _upd_match.group(1)
+
             notified_costing: list[str] = []
             for route_entry in route_entries:
                 recipient_email = str(route_entry.get("email") or "")
                 if not recipient_email:
                     continue
-                if _had_prior_approval:
+                if _index_change_log_action:
+                    sent = emails.send_rfq_index_changed_notification(
+                        recipient_email,
+                        _index_change_old_id or systematic_rfq_id_val,
+                        _index_change_new_id or systematic_rfq_id_val,
+                        acronym_val,
+                        _index_change_fields,
+                        rfq_link_val,
+                    )
+                elif _had_prior_approval:
                     sent = emails.send_rfq_revalidation_notification(
                         recipient_email,
                         systematic_rfq_id_val,
                         acronym_val,
                         rfq_link_val,
+                        _update_changed_fields,
                     )
                 else:
                     sent = emails.send_costing_entry_email(
@@ -2851,7 +2973,11 @@ async def validate_rfq(
                     db,
                     rfq_id=refreshed_rfq.rfq_id,
                     recipients=notified_costing,
-                    email_type=EMAIL_RFQ_REVALIDATION if _had_prior_approval else EMAIL_COSTING_ENTRY,
+                    email_type=(
+                        EMAIL_RFQ_INDEX_CHANGED if _index_change_log_action
+                        else EMAIL_RFQ_REVALIDATION if _had_prior_approval
+                        else EMAIL_COSTING_ENTRY
+                    ),
                 )
                 # record_notification_sent commits internally — reload to avoid
                 # accessing expired attributes on the next read.
