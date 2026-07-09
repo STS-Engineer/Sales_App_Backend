@@ -120,4 +120,23 @@ async def get_team_view(
         .where(Rfq.created_by_email.in_(team_emails))
         .order_by(Rfq.created_at.desc())
     )
-    return rfq_result.scalars().all()
+    rfqs = rfq_result.scalars().all()
+
+    unique_emails = {
+        e
+        for rfq in rfqs
+        for e in (rfq.created_by_email, rfq.zone_manager_email)
+        if e
+    }
+    name_by_email: dict[str, str] = {}
+    if unique_emails:
+        users_result = await db_main.execute(select(User).where(User.email.in_(unique_emails)))
+        for user in users_result.scalars().all():
+            if user.full_name:
+                name_by_email[user.email] = user.full_name
+
+    for rfq in rfqs:
+        rfq.created_by_name = name_by_email.get(rfq.created_by_email)
+        rfq.zone_manager_name = name_by_email.get(rfq.zone_manager_email or "")
+
+    return rfqs

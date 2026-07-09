@@ -708,6 +708,24 @@ def _set_pricing_workflow_state(rfq: Rfq, **updates: object | None) -> None:
     rfq.costing_file_state = next_state
 
 
+async def _annotate_rfq_routing_leaders(db: AsyncSession, rfq: Rfq) -> None:
+    rfq.costing_leaders = await resolve_product_line_role_emails(
+        db,
+        role=ProductLineRoutingRole.COSTING,
+        acronym=rfq.product_line_acronym,
+    )
+    rfq.rnd_leaders = await resolve_product_line_role_emails(
+        db,
+        role=ProductLineRoutingRole.RND,
+        acronym=rfq.product_line_acronym,
+    )
+    rfq.plm_leaders = await resolve_product_line_role_emails(
+        db,
+        role=ProductLineRoutingRole.PLM,
+        acronym=rfq.product_line_acronym,
+    )
+
+
 async def _is_assigned_plm(db: AsyncSession, current_user: User, rfq: Rfq) -> bool:
     assigned = await resolve_product_line_role_emails(
         db,
@@ -1513,7 +1531,9 @@ async def create_rfq(
         rfq.potential = Potential(chat_history=[])
 
     await db.commit()
-    return await _get_rfq_or_404(db, rfq.rfq_id)
+    created_rfq = await _get_rfq_or_404(db, rfq.rfq_id)
+    await _annotate_rfq_routing_leaders(db, created_rfq)
+    return created_rfq
 
 
 @router.get("/fx/eur-rate", response_model=RfqFxRateOut)
@@ -1696,6 +1716,7 @@ async def update_rfq_data(
 
         await db.commit()
         rfq_result = await _get_rfq_or_404(db, rfq_id)
+        await _annotate_rfq_routing_leaders(db, rfq_result)
         # Validate inside try/except so any MissingGreenlet / ResponseValidationError
         # is caught here rather than escaping to the generic 500 handler.
         return RfqOut.model_validate(rfq_result, from_attributes=True)
@@ -1763,7 +1784,9 @@ async def proceed_to_rfq(
     label = target_type.value
     await log_action(db, rfq_id, f"Potential promoted to formal {label}", current_user.email)
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    proceed_result = await _get_rfq_or_404(db, rfq_id)
+    await _annotate_rfq_routing_leaders(db, proceed_result)
+    return proceed_result
 
 
 @router.post("/{rfq_id}/upload")
@@ -2190,6 +2213,7 @@ async def get_rfq(
         name_map = {u.email: u.full_name for u in users_result.scalars().all() if u.full_name}
         rfq.created_by_name = name_map.get(rfq.created_by_email)
         rfq.zone_manager_name = name_map.get(rfq.zone_manager_email or "")
+    await _annotate_rfq_routing_leaders(db, rfq)
     is_viewer = await user_is_routing_viewer_for_rfq(db, current_user.email, rfq)
     if is_viewer:
         has_leader_access = (
@@ -2587,7 +2611,9 @@ async def unlock_chat_for_edit(
     next_data["post_validation_edit_unlocked"] = True
     rfq.rfq_data = next_data
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    unlock_result = await _get_rfq_or_404(db, rfq_id)
+    await _annotate_rfq_routing_leaders(db, unlock_result)
+    return unlock_result
 
 
 @router.post("/{rfq_id}/request-revision", response_model=RfqOut)
@@ -2648,7 +2674,9 @@ async def request_revision(
             email_type=EMAIL_REVISION_REQUEST,
         )
 
-    return await _get_rfq_or_404(db, rfq_id)
+    revision_result = await _get_rfq_or_404(db, rfq_id)
+    await _annotate_rfq_routing_leaders(db, revision_result)
+    return revision_result
 
 
 @router.post("/{rfq_id}/submit-revision", response_model=RfqOut)
@@ -2682,7 +2710,9 @@ async def submit_revision(
         current_user.email,
     )
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    submit_revision_result = await _get_rfq_or_404(db, rfq_id)
+    await _annotate_rfq_routing_leaders(db, submit_revision_result)
+    return submit_revision_result
 
 
 @router.put("/{rfq_id}/status", response_model=RfqOut)
@@ -2720,7 +2750,9 @@ async def update_rfq_status(
         current_user.email,
     )
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    status_result = await _get_rfq_or_404(db, rfq_id)
+    await _annotate_rfq_routing_leaders(db, status_result)
+    return status_result
 
 
 @router.post("/{rfq_id}/autopsy", response_model=RfqOut)
@@ -2746,7 +2778,9 @@ async def submit_autopsy(
     rfq.autopsy_notes = body.autopsy_notes
     await log_action(db, rfq_id, "Autopsy submitted", current_user.email)
     await db.commit()
-    return await _get_rfq_or_404(db, rfq_id)
+    autopsy_result = await _get_rfq_or_404(db, rfq_id)
+    await _annotate_rfq_routing_leaders(db, autopsy_result)
+    return autopsy_result
 
 
 @router.get("/{rfq_id}/audit-logs", response_model=list[AuditLogOut])
@@ -2984,6 +3018,7 @@ async def validate_rfq(
                 refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
+    await _annotate_rfq_routing_leaders(db, refreshed_rfq)
 
     if body.approved:
         _sp_rfq_name = str((refreshed_rfq.rfq_data or {}).get("systematic_rfq_id") or "")
@@ -3153,6 +3188,7 @@ async def costing_review(
                 )
  
     await _refresh_rfq_response_state(db, refreshed_rfq)
+    await _annotate_rfq_routing_leaders(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -3165,7 +3201,7 @@ async def submit_costing_file_action(
     feasibility_status: str = Form(...),
     files: list[UploadFile] = File(default=[]),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM, UserRole.OWNER)),
+    current_user: User = Depends(require_role(UserRole.RND, UserRole.PLM, UserRole.OWNER)),
 ):
     rfq = await _get_rfq_or_404(db, rfq_id)
     await _assert_costing_phase_assignment(db, current_user, rfq, allow_rnd=True, allow_plm=True)
@@ -3305,6 +3341,7 @@ async def submit_costing_file_action(
             )
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
+    await _annotate_rfq_routing_leaders(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -3399,6 +3436,7 @@ async def upload_pricing_bom_file(
     #         email_type=EMAIL_BOM_READY,
     #     )
     await _refresh_rfq_response_state(db, refreshed_rfq)
+    await _annotate_rfq_routing_leaders(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -3547,6 +3585,7 @@ async def upload_pricing_final_price_file(
         )
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
+    await _annotate_rfq_routing_leaders(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -3613,6 +3652,7 @@ async def delete_costing_file_entry(
     await db.commit()
     refreshed = await _get_rfq_or_404(db, rfq_id)
     await _refresh_rfq_response_state(db, refreshed)
+    await _annotate_rfq_routing_leaders(db, refreshed)
     return refreshed
 
 
@@ -3745,6 +3785,7 @@ async def costing_validation(
             )
 
     await _refresh_rfq_response_state(db, refreshed_rfq)
+    await _annotate_rfq_routing_leaders(db, refreshed_rfq)
     return refreshed_rfq
 
 
@@ -3759,6 +3800,7 @@ async def advance_status(
             UserRole.ZONE_MANAGER,
             UserRole.COSTING_TEAM,
             UserRole.PLANT_MANAGER,
+            UserRole.RND,
             UserRole.PLM,
             UserRole.OWNER,
         )
@@ -3775,6 +3817,8 @@ async def advance_status(
             await _assert_costing_phase_assignment(db, current_user, rfq)
         elif current_user.role == UserRole.PLM:
             await _assert_costing_phase_assignment(db, current_user, rfq, allow_plm=True)
+        elif current_user.role == UserRole.RND:
+            await _assert_costing_phase_assignment(db, current_user, rfq, allow_rnd=True)
         elif current_user.role != UserRole.OWNER:
             raise HTTPException(
                 status_code=403,
@@ -3906,4 +3950,6 @@ async def advance_status(
                 rfq_id,
             )
  
-    return await _get_rfq_or_404(db, rfq_id)
+    advance_result = await _get_rfq_or_404(db, rfq_id)
+    await _annotate_rfq_routing_leaders(db, advance_result)
+    return advance_result

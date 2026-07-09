@@ -21,6 +21,9 @@ class RfqOut(BaseModel):
     zone_manager_name: str | None = None
     created_by_email: str
     created_by_name: str | None = None
+    costing_leaders: list[str] | None = None
+    rnd_leaders: list[str] | None = None
+    plm_leaders: list[str] | None = None
     rfq_data: dict[str, Any] | None
     chat_history: list[dict[str, Any]] | None
     costing_files: list[dict[str, Any]] | None
