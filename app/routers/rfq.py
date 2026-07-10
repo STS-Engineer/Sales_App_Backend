@@ -1591,7 +1591,14 @@ async def update_rfq_data(
         rfq.rfq_data = next_data
 
         if "product_line_acronym" in incoming_data or "product_name" in incoming_data:
-            rfq.product_line_acronym = next_data.get("product_line_acronym") or None
+            candidate_acronym = next_data.get("product_line_acronym") or None
+            if candidate_acronym is not None:
+                pl_context = await resolve_product_line_context(
+                    db, identifier=candidate_acronym
+                )
+                if pl_context is None:
+                    candidate_acronym = None
+            rfq.product_line_acronym = candidate_acronym
         # zone_manager_email is set exclusively by the /assign-validator endpoint.
         # Incoming payload values are intentionally ignored here.
 

@@ -26,6 +26,7 @@ from app.services.routing import (
     N1_VP_EMAIL,
     get_zone_manager_email,
     normalize_delivery_zone,
+    resolve_product_line_context,
 )
 from app.models.user import User
 from app.models.validation_matrix import ValidationMatrix
@@ -201,6 +202,7 @@ RFQ_ALLOWED_FIELDS = POTENTIAL_ALLOWED_FIELDS | {
     "target_price_is_estimated",
     "target_price_note",
     "expected_delivery_conditions",
+    "incoterm_location",
     "expected_payment_terms",
     "type_of_packaging",
     "business_trigger",
@@ -244,6 +246,7 @@ UPDATE_FORM_FIELD_ALIASES = {
     "targetPriceIsEstimated": "target_price_is_estimated",
     "targetPriceNote": "target_price_note",
     "expectedDeliveryConditions": "expected_delivery_conditions",
+    "incotermLocation": "incoterm_location",
     "expectedPaymentTerms": "expected_payment_terms",
     "typeOfPackaging": "type_of_packaging",
     "businessTrigger": "business_trigger",
@@ -281,6 +284,16 @@ PRODUCT_ITEM_TOOL_SCHEMA = {
             "part_number": {"type": "string"},
             "product_line": {"type": "string"},
             "costing_data": {"type": "string"},
+            "components": {
+                "type": "string",
+                "description": (
+                    "List of the sub-parts/components making up this product "
+                    "(e.g. connector, grommet, terminals, retainer for a wire "
+                    "harness assembly). Required when the product's line is "
+                    "Assembly. Put ONE component per line (separate them with "
+                    "'\\n' newlines), never with commas or semicolons."
+                ),
+            },
             "po_date": {
                 "type": "string",
                 "description": "Date in YYYY-MM-DD format.",
@@ -413,6 +426,7 @@ RFQ_STEPS: list[tuple[int, list[dict[str, object]]]] = [
         2,
         [
             _step_field("expected_delivery_conditions"),
+            _step_field("incoterm_location", is_optional=True),
             _step_field("expected_payment_terms"),
             _step_field("type_of_packaging", is_optional=True),
             _step_field("business_trigger", is_optional=True),
@@ -477,7 +491,7 @@ FIELD_LABELS = {
     "costing_data": "Costing data",
     "products": "Products",
     "volumes": "Volumes",
-    "rfq_files": "RFQ Files",
+    "rfq_files": "Drawing",
     "delivery_zone": "Delivery zone",
     "delivery_plant": "Plant",
     "country": "Country",
@@ -491,6 +505,7 @@ FIELD_LABELS = {
     "contact_role": "Contact function",
     "contact_phone": "Contact phone",
     "expected_delivery_conditions": "Expected Delivery Conditions",
+    "incoterm_location": "Incoterm Location",
     "expected_payment_terms": "Expected Payment Terms",
     "type_of_packaging": "Type of Packaging",
     "business_trigger": "Business Trigger",
@@ -542,6 +557,7 @@ FIELD_QUESTION_OVERRIDES = {
     "contact_role": "**What is the Contact function?**",
     "contact_phone": "**What is the Contact phone number?**",
     "expected_delivery_conditions": "**What are the expected Delivery Conditions?**",
+    "incoterm_location": "**What is the Incoterm Location?**",
     "expected_payment_terms": "**What are the expected Payment Terms?**",
     "type_of_packaging": "**Which type of packaging applies?**\n\n1. Cardboard divider\n2. one way tray\n3. returnable plastic tray",
     "business_trigger": "**What is the Business Trigger?**",
@@ -3302,7 +3318,14 @@ async def _execute_tool_calls(
             if "zone_manager_email" in filtered_fields:
                 rfq.zone_manager_email = str(filtered_fields.get("zone_manager_email") or "").strip() or None
             if "product_line_acronym" in filtered_fields:
-                rfq.product_line_acronym = str(filtered_fields.get("product_line_acronym") or "").strip() or None
+                candidate_acronym = str(filtered_fields.get("product_line_acronym") or "").strip() or None
+                if candidate_acronym is not None:
+                    pl_context = await resolve_product_line_context(
+                        db, identifier=candidate_acronym
+                    )
+                    if pl_context is None:
+                        candidate_acronym = None
+                rfq.product_line_acronym = candidate_acronym
             rfq.rfq_data = await _maybe_assign_systematic_rfq_id(
                 db,
                 rfq,
@@ -3430,6 +3453,7 @@ When calling updateFormFields, you MUST ONLY use the following exact keys:
 - target_price_is_estimated (boolean: true if estimated by Avocarbon, false if given by customer)
 - target_price_note
 - expected_delivery_conditions
+- incoterm_location
 - expected_payment_terms
 - type_of_packaging
 - business_trigger
@@ -3707,6 +3731,7 @@ You MUST NOT ask about or save any of these fields in Potential mode:
 - quotation_expected_date
 - target_price_eur
 - expected_delivery_conditions
+- incoterm_location
 - expected_payment_terms
 - type_of_packaging
 - business_trigger
