@@ -43,8 +43,13 @@ async def retrieve_products(
     result = await db.execute(query)
     rows = result.scalars().all()
 
-    # Build local acronym map (product_line → acronym)
-    local_acronym_map = {row.product_line: row.acronym for row in rows}
+    # Build the acronym lookup from ALL product lines, not just the ones matching
+    # `productName` — that filter is meant for product names (e.g. "Wire Harness"),
+    # not product-line categories (e.g. "Assembly"), so filtering this map by it
+    # would drop the correct acronym whenever the product name text doesn't
+    # resemble its own product-line's name.
+    all_rows_result = await db.execute(select(ValidationMatrix))
+    local_acronym_map = {row.product_line: row.acronym for row in all_rows_result.scalars().all()}
 
     # Fetch from production catalog
     try:

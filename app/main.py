@@ -22,6 +22,7 @@ from app.routers import (
     actions,
     auth,
     chat,
+    chat_autofill,
     chat_offer,
     chat_potential,
     internal,
@@ -120,6 +121,7 @@ app.include_router(actions.router)
 app.include_router(owner.router)
 app.include_router(routing_config.router)
 app.include_router(chat.router)
+app.include_router(chat_autofill.router)
 app.include_router(chat_offer.router)
 app.include_router(chat_potential.router)
 app.include_router(team_view.router)
