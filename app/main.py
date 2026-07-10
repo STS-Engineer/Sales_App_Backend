@@ -27,6 +27,7 @@ from app.routers import (
     internal,
     kpi_data,
     kpi_settings,
+    market_view,
     old_rfqs,
     mcp_router,
     owner,
@@ -123,6 +124,7 @@ app.include_router(chat.router)
 app.include_router(chat_offer.router)
 app.include_router(chat_potential.router)
 app.include_router(team_view.router)
+app.include_router(market_view.router)
 app.include_router(internal.router)
 app.include_router(mcp_router.router)
 app.include_router(kpi_settings.router)
