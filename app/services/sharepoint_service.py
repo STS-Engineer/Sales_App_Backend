@@ -65,13 +65,15 @@ def encode_graph_path(path: str) -> str:
 
 
 def normalize_sharepoint_rfq_folder_name(rfq_name: str) -> str:
-    """Strip the revision suffix '-00' from the RFQ name for SharePoint folder naming.
+    """Strip the revision suffix from the RFQ name for SharePoint folder naming —
+    the folder stays the same across every Change Index revision.
 
     26510-ASS-00 -> 26510-ASS
-    26501-BRU-00 -> 26501-BRU
+    26501-BRU-01 -> 26501-BRU
+    26522-BRU-02 -> 26522-BRU
     """
     value = (rfq_name or "").strip()
-    return re.sub(r"-00$", "", value)
+    return re.sub(r"-\d+$", "", value)
 
 
 def _raise_graph_error(resp: httpx.Response, context: str) -> None:
@@ -338,10 +340,10 @@ async def upload_file_to_folder(
     folder_path: str,
     file_name: str,
     file_bytes: bytes,
-) -> None:
+) -> dict:
     """
     Upload a file to a SharePoint folder via Graph simple upload (≤4 MB).
-    Replaces the file if it already exists.
+    Replaces the file if it already exists. Returns the created/updated driveItem.
     """
     encoded_folder = encode_graph_path(folder_path)
     encoded_name = quote(file_name, safe="")
@@ -357,6 +359,29 @@ async def upload_file_to_folder(
         )
         _raise_graph_error(resp, f"upload file '{file_name}' to '{folder_path}'")
     logger.warning("DEBUG SHAREPOINT: file uploaded — %s/%s", folder_path, file_name)
+    return dict(resp.json())
+
+
+async def set_drive_item_field(
+    token: str,
+    drive_id: str,
+    item_id: str,
+    field_name: str,
+    field_value: str,
+) -> None:
+    """Set a custom SharePoint list column value (e.g. VersionNo) on an uploaded file's list item."""
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/listItem/fields"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.patch(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={field_name: field_value},
+        )
+        _raise_graph_error(resp, f"set field '{field_name}'='{field_value}' on item {item_id}")
+    logger.warning("DEBUG SHAREPOINT: field '%s'='%s' set on item %s", field_name, field_value, item_id)
 
 
 async def _mark_files_uploaded_to_sharepoint(rfq_id: str, file_ids: list[str]) -> None:
@@ -614,7 +639,9 @@ async def sync_rfq_to_sharepoint(
                         continue
                     try:
                         _file_bytes = await asyncio.to_thread(_download_blob_sync, _blob_name)
-                        await upload_file_to_folder(_token, _drive_id, _customer_input_path, _file_name, _file_bytes)
+                        _item = await upload_file_to_folder(_token, _drive_id, _customer_input_path, _file_name, _file_bytes)
+                        _version_no = str(file_meta.get("revision") or "00").strip() or "00"
+                        await set_drive_item_field(_token, _drive_id, _item["id"], "VersionNo", _version_no)
                         _fid = str(file_meta.get("id") or "").strip()
                         if _fid:
                             _new_uploaded_ids.append(_fid)
@@ -679,7 +706,9 @@ async def sync_rfq_to_sharepoint(
 
             try:
                 file_bytes = await asyncio.to_thread(_download_blob_sync, blob_name)
-                await upload_file_to_folder(token, drive_id, customer_input_path, file_name, file_bytes)
+                item = await upload_file_to_folder(token, drive_id, customer_input_path, file_name, file_bytes)
+                version_no = str(file_meta.get("revision") or "00").strip() or "00"
+                await set_drive_item_field(token, drive_id, item["id"], "VersionNo", version_no)
                 _fid = str(file_meta.get("id") or "").strip()
                 if _fid:
                     _initial_uploaded_ids.append(_fid)

@@ -920,21 +920,68 @@ Open the RFQ here:
     )
     return send_email(recipient_email, subject, text_body, html_body=html_body)
 
+
+def send_rfq_index_changed_notification(
+    recipient_email: str,
+    old_systematic_rfq_id: str,
+    new_systematic_rfq_id: str,
+    acronym: str,
+    changed_fields: str,
+    rfq_link: str,
+) -> bool:
+    fields_display = changed_fields.strip() if changed_fields and changed_fields.strip() else "Not specified"
+    subject = f"RFQ Index Changed — Re-validation Required{_rfq_id_subject_suffix(new_systematic_rfq_id)}"
+    text_body = f"""Hello,
+
+An RFQ that is currently in your costing queue has had its index changed by the sales team and has been re-submitted for validation.
+
+RFQ reference changed: {old_systematic_rfq_id} -> {new_systematic_rfq_id}
+Product line: {acronym}
+Fields changed: {fields_display}
+
+Once the validator approves the updated RFQ, please review the changes and update your costing accordingly.
+
+Open the RFQ here:
+{rfq_link}
+"""
+    html_body = _build_base_html(
+        "RFQ Index Changed — Re-validation Required",
+        f"""
+          <p>Hello,</p>
+          <p>An RFQ that is currently in your costing queue has had its <strong>index changed</strong> by the sales team and has been re-submitted for validation.</p>
+          <ul>
+            <li><strong>RFQ reference changed:</strong> {old_systematic_rfq_id} &rarr; {new_systematic_rfq_id}</li>
+            <li><strong>Product line:</strong> {acronym}</li>
+            <li><strong>Fields changed:</strong> {fields_display}</li>
+          </ul>
+          <p>Please review the changes and update your costing accordingly.</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="{rfq_link}" style="background-color: #d97706; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Open RFQ
+            </a>
+          </div>
+        """,
+    )
+    return send_email(recipient_email, subject, text_body, html_body=html_body)
+
+
 def send_rfq_revalidation_notification(
     recipient_email: str,
     systematic_rfq_id: str,
     acronym: str,
     rfq_link: str,
+    changed_fields: str = "",
 ) -> bool:
     rfq_id_line = _rfq_id_text_block(systematic_rfq_id)
     rfq_id_html = _rfq_id_html_item(systematic_rfq_id)
+    fields_display = changed_fields.strip() if changed_fields and changed_fields.strip() else ""
     subject = f"RFQ Updated — Re-validation Required{_rfq_id_subject_suffix(systematic_rfq_id)}"
     text_body = f"""Hello,
 
 An RFQ that is currently in your costing queue has been updated by the sales team and has been re-submitted for validation.
 
 {rfq_id_line}Product line: {acronym}
-
+{f"Fields changed: {fields_display}" + chr(10) if fields_display else ""}
 Once the validator approves the updated RFQ, please review the changes and update your costing accordingly.
 
 Open the RFQ here:
@@ -948,6 +995,7 @@ Open the RFQ here:
           <ul>
             {rfq_id_html}
             <li><strong>Product line:</strong> {acronym}</li>
+            {f"<li><strong>Fields changed:</strong> {fields_display}</li>" if fields_display else ""}
           </ul>
           <p>Please review the changes and update your costing accordingly.</p>
           <div style="margin: 30px 0; text-align: center;">
@@ -955,10 +1003,6 @@ Open the RFQ here:
               Open RFQ
             </a>
           </div>
-          <p style="font-size: 14px; color: #666666;">
-            If the button above does not work, copy and paste this link into your browser:<br>
-            <a href="{rfq_link}" style="color: #2563eb; word-break: break-all;">{rfq_link}</a>
-          </p>
         """,
     )
     return send_email(recipient_email, subject, text_body, html_body=html_body)

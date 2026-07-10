@@ -858,6 +858,7 @@ class ProceedToFormalRequest(BaseModel):
 class RfqDataUpdateRequest(BaseModel):
     rfq_data: RfqDataPayload
     update_type: str = "simple"
+    changed_fields: list[str] | None = None
 
 
 class PhaseStatusUpdateRequest(BaseModel):
