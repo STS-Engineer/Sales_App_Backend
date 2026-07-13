@@ -1,5 +1,5 @@
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import quote
@@ -27,6 +27,8 @@ from app.security import (
     decode_token,
 )
 from app.utils import emails
+from app.utils.time import local_now
+from app.utils.user_agent import parse_os_from_user_agent
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 PASSWORD_RESET_REQUEST_MESSAGE = (
@@ -189,7 +191,7 @@ async def reset_password(
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     user = await _get_user_by_email(db, body.email)
 
     if not user:
@@ -215,7 +217,10 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
 
     if user.needs_password_rehash():
         user.set_password(body.password)
-        await db.commit()
+
+    user.last_login = local_now()
+    user.operating_system = parse_os_from_user_agent(request.headers.get("user-agent"))
+    await db.commit()
 
     access_token = create_access_token(email, role)
     refresh_token = create_refresh_token(email, role)

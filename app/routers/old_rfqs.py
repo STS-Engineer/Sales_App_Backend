@@ -10,6 +10,7 @@ from app.database import get_db, get_db4_optional
 from app.middleware.auth import get_current_user
 from app.models.old_rfqs import OldRfqMonday, OldRfqSubitem
 from app.models.user import User
+from app.utils.time import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ async def get_old_rfqs(
 
 
 # Columns that must never be overwritten by the PUT endpoint.
-_PROTECTED_COLUMNS = {"old_rfq_id", "excel_row_number"}
+_PROTECTED_COLUMNS = {"old_rfq_id", "excel_row_number", "updated_at", "updated_by"}
 
 _EDITABLE_COLUMNS = {
     col.name
@@ -134,6 +135,9 @@ async def update_old_rfq(
     for key, value in payload.items():
         if key in _EDITABLE_COLUMNS:
             setattr(old_rfq, key, value)
+
+    old_rfq.updated_at = local_now()
+    old_rfq.updated_by = current_user.email
 
     await db.commit()
     await db.refresh(old_rfq)
@@ -169,6 +173,8 @@ _PROTECTED_SUBITEM_COLUMNS = {
     "excel_row_number",
     "subitem_order",
     "parent_id",
+    "updated_at",
+    "updated_by",
 }
 
 _EDITABLE_SUBITEM_COLUMNS = {
@@ -196,6 +202,9 @@ async def update_old_rfq_subitem(
     for key, value in payload.items():
         if key in _EDITABLE_SUBITEM_COLUMNS:
             setattr(subitem, key, value)
+
+    subitem.updated_at = local_now()
+    subitem.updated_by = current_user.email
 
     await db.commit()
     await db.refresh(subitem)

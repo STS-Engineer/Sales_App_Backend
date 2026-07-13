@@ -1,4 +1,4 @@
-from sqlalchemy import BigInteger, Column, ForeignKey, Integer, Text
+from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, Text
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -93,6 +93,8 @@ class OldRfqMonday(Base):
     acknowledge_input = Column(Text)
     costing_leader = Column(Text)
     feasibility_leader = Column(Text)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
+    updated_by = Column(Text, nullable=True)
 
     subitems = relationship(
         "OldRfqSubitem",
@@ -191,5 +193,7 @@ class OldRfqSubitem(Base):
     modified_by = Column(Text)
     scenario_id = Column(Text)
     volume_title = Column(Text)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
+    updated_by = Column(Text, nullable=True)
 
     rfq = relationship("OldRfqMonday", back_populates="subitems")

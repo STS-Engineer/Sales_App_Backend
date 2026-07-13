@@ -54,6 +54,8 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+    last_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    operating_system: Mapped[str | None] = mapped_column(String, nullable=True)
 
     def set_password(self, password: str) -> None:
         self.password_hash = hash_password(password)
