@@ -3323,8 +3323,11 @@ async def _execute_tool_calls(
                     pl_context = await resolve_product_line_context(
                         db, identifier=candidate_acronym
                     )
-                    if pl_context is None:
-                        candidate_acronym = None
+                    # Use the resolved acronym (never the raw text) — the model or a
+                    # manual entry may provide the product-line NAME (e.g. "Chokes")
+                    # instead of its code ("CHO"); the column requires the code, so
+                    # storing the raw text back would still violate the FK constraint.
+                    candidate_acronym = pl_context["acronym"] if pl_context else None
                 rfq.product_line_acronym = candidate_acronym
             rfq.rfq_data = await _maybe_assign_systematic_rfq_id(
                 db,
