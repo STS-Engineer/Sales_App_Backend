@@ -20,6 +20,7 @@ from app.database import engine
 from app.models.user import UserRoleAssignment
 from app.routers import (
     actions,
+    audit_logs,
     auth,
     chat,
     chat_autofill,
@@ -115,6 +116,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
     )
 
 app.include_router(auth.router)
+app.include_router(audit_logs.router)
 app.include_router(users.router)
 app.include_router(rfq.router)
 app.include_router(products.router)

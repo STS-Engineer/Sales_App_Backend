@@ -47,6 +47,7 @@ class RfqOut(BaseModel):
 class AuditLogOut(BaseModel):
     log_id: str
     rfq_id: str
+    systematic_rfq_id: str | None = None
     action: str
     performed_by: str
     timestamp: datetime
