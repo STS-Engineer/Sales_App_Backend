@@ -11,6 +11,7 @@ from app.models.routing_setting_viewers import RoutingSettingViewer
 from app.models.user import User, UserRole
 from app.models.validation_matrix import ValidationMatrix
 from app.schemas.product_line_routing import (
+    ProductLineOut,
     ProductLineRoutingCreate,
     ProductLineRoutingOut,
     ProductLineRoutingUpdate,
@@ -33,6 +34,24 @@ async def _ensure_product_line_exists(db: AsyncSession, product_line: str) -> st
     if matrix is None:
         raise HTTPException(status_code=404, detail="Product line not found.")
     return matrix.product_line
+
+
+# ---------------------------------------------------------------------------
+# Product line catalog (static path — must come before /{routing_id})
+# ---------------------------------------------------------------------------
+
+@router.get("/product-lines", response_model=list[ProductLineOut])
+async def list_product_lines(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(UserRole.OWNER)),
+):
+    """Return every product line known to the app (validation_matrix), regardless
+    of whether it currently has any products in the external catalog. Used to
+    populate the product-line dropdowns in Routing Settings."""
+    result = await db.execute(
+        select(ValidationMatrix).order_by(ValidationMatrix.product_line.asc())
+    )
+    return result.scalars().all()
 
 
 # ---------------------------------------------------------------------------

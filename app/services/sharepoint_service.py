@@ -41,6 +41,7 @@ PRODUCT_LINE_FOLDER_MAP: dict[str, str] = {
     "CHO": "Choke",
     "FRI": "Friction",
     "SEA": "Seal",
+    "ADM": "Advanced Material",
 }
 
 RFQ_SUBFOLDERS: list[str] = [

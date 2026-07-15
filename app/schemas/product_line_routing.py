@@ -48,3 +48,10 @@ class RoutingViewerAssignRequest(BaseModel):
     product_line: str
     role: ProductLineRoutingRole
     viewer_emails: list[str]
+
+
+class ProductLineOut(BaseModel):
+    product_line: str
+    acronym: str
+
+    model_config = {"from_attributes": True}
