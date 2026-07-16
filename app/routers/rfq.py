@@ -380,12 +380,13 @@ async def _can_view_rfq(
     rfq: Rfq,
     db_kpi: AsyncSession | None = None,
 ) -> bool:
-    if current_user.role == UserRole.OWNER:
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if UserRole.OWNER.value in all_roles:
         return True
-    if current_user.role == UserRole.COSTING_TEAM:
+    if UserRole.COSTING_TEAM.value in all_roles:
         if await _is_assigned_costing_agent(db, current_user, rfq):
             return True
-    elif current_user.role == UserRole.RND:
+    if UserRole.RND.value in all_roles:
         if rfq.phase == RfqPhase.COSTING and await _is_assigned_rnd(db, current_user, rfq):
             return True
     if _user_has_plm(current_user):
@@ -395,7 +396,7 @@ async def _can_view_rfq(
         or rfq.zone_manager_email == current_user.email
     ):
         return True
-    if current_user.role == UserRole.ZONE_MANAGER and db_kpi is not None:
+    if UserRole.ZONE_MANAGER.value in all_roles and db_kpi is not None:
         team_emails = await _get_zone_manager_team_emails(db_kpi, current_user.email)
         if (rfq.created_by_email or "").lower() in team_emails:
             return True
@@ -423,7 +424,8 @@ def _is_assigned_validator(current_user: User, rfq: Rfq) -> bool:
 
 
 def _is_costing_specialist_role(current_user: User) -> bool:
-    return current_user.role in {UserRole.COSTING_TEAM, UserRole.RND, UserRole.PLM}
+    all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    return bool(all_roles & {UserRole.COSTING_TEAM.value, UserRole.RND.value, UserRole.PLM.value})
 
 
 def _user_has_plm(current_user: User) -> bool:
@@ -2146,26 +2148,31 @@ async def list_rfqs(
         query = query.where(Rfq.document_type.in_(document_type_filters))
  
     if current_user.role != UserRole.OWNER:
+        all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
         viewer_acronyms = await get_viewer_product_line_acronyms(db, email=current_user.email)
 
         if _user_has_plm(current_user):
             pass  # PLM has global visibility — no product line filter applied
-        elif current_user.role in {UserRole.COSTING_TEAM, UserRole.RND}:
-            routing_role = {
-                UserRole.COSTING_TEAM: ProductLineRoutingRole.COSTING,
-                UserRole.RND: ProductLineRoutingRole.RND,
-            }[current_user.role]
-            assigned_acronyms = await get_assigned_product_line_acronyms(
-                db,
-                role=routing_role,
-                email=current_user.email,
-            )
+        elif all_roles & {UserRole.COSTING_TEAM.value, UserRole.RND.value}:
             conditions = []
-            if assigned_acronyms:
-                leader_cond = Rfq.product_line_acronym.in_(assigned_acronyms)
-                if current_user.role == UserRole.RND:
-                    leader_cond = and_(leader_cond, Rfq.phase == RfqPhase.COSTING)
-                conditions.append(leader_cond)
+            if UserRole.COSTING_TEAM.value in all_roles:
+                costing_acronyms = await get_assigned_product_line_acronyms(
+                    db,
+                    role=ProductLineRoutingRole.COSTING,
+                    email=current_user.email,
+                )
+                if costing_acronyms:
+                    conditions.append(Rfq.product_line_acronym.in_(costing_acronyms))
+            if UserRole.RND.value in all_roles:
+                rnd_acronyms = await get_assigned_product_line_acronyms(
+                    db,
+                    role=ProductLineRoutingRole.RND,
+                    email=current_user.email,
+                )
+                if rnd_acronyms:
+                    conditions.append(
+                        and_(Rfq.product_line_acronym.in_(rnd_acronyms), Rfq.phase == RfqPhase.COSTING)
+                    )
             if viewer_acronyms:
                 conditions.append(Rfq.product_line_acronym.in_(viewer_acronyms))
             if not conditions:
@@ -2226,12 +2233,13 @@ async def get_rfq(
     await _annotate_rfq_routing_leaders(db, rfq)
     is_viewer = await user_is_routing_viewer_for_rfq(db, current_user.email, rfq)
     if is_viewer:
+        viewer_all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
         has_leader_access = (
-            current_user.role == UserRole.OWNER
+            UserRole.OWNER.value in viewer_all_roles
             or rfq.created_by_email == current_user.email
             or rfq.zone_manager_email == current_user.email
-            or (current_user.role == UserRole.COSTING_TEAM and await _is_assigned_costing_agent(db, current_user, rfq))
-            or (current_user.role == UserRole.RND and await _is_assigned_rnd(db, current_user, rfq))
+            or (UserRole.COSTING_TEAM.value in viewer_all_roles and await _is_assigned_costing_agent(db, current_user, rfq))
+            or (UserRole.RND.value in viewer_all_roles and await _is_assigned_rnd(db, current_user, rfq))
             or (_user_has_plm(current_user) and await _is_assigned_plm(db, current_user, rfq))
         )
         if not has_leader_access:
@@ -3333,7 +3341,8 @@ async def submit_costing_file_action(
     await db.commit()
     refreshed_rfq = await _get_rfq_or_404(db, rfq_id)
 
-    if current_user.role in {UserRole.RND, UserRole.PLM}:
+    submit_all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+    if submit_all_roles & {UserRole.RND.value, UserRole.PLM.value}:
         refreshed_data = dict(refreshed_rfq.rfq_data or {})
         systematic_rfq_id = str(refreshed_data.get("systematic_rfq_id") or "")
         email_sent = emails.send_feasibility_result_email(
@@ -3823,13 +3832,12 @@ async def advance_status(
     elif rfq.phase == RfqPhase.OFFER:
         _assert_can_edit_offer_phase(current_user, rfq)
     elif rfq.phase == RfqPhase.COSTING:
-        if current_user.role == UserRole.COSTING_TEAM:
-            await _assert_costing_phase_assignment(db, current_user, rfq)
-        elif current_user.role == UserRole.PLM:
-            await _assert_costing_phase_assignment(db, current_user, rfq, allow_plm=True)
-        elif current_user.role == UserRole.RND:
-            await _assert_costing_phase_assignment(db, current_user, rfq, allow_rnd=True)
-        elif current_user.role != UserRole.OWNER:
+        advance_all_roles: set[str] = current_user.__dict__.get("_all_roles", {current_user.role.value})
+        if _is_costing_specialist_role(current_user):
+            await _assert_costing_phase_assignment(
+                db, current_user, rfq, allow_rnd=True, allow_plm=True
+            )
+        elif UserRole.OWNER.value not in advance_all_roles:
             raise HTTPException(
                 status_code=403,
                 detail="You are not authorized to advance this costing RFQ.",
