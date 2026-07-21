@@ -965,6 +965,41 @@ Open the RFQ here:
     return send_email(recipient_email, subject, text_body, html_body=html_body)
 
 
+def send_support_ticket_email(
+    recipients: str | list[str],
+    reporter_email: str,
+    reporter_name: str | None,
+    subject_line: str,
+    description: str,
+) -> bool:
+    display_name = reporter_name or reporter_email
+    subject = f"[Support Ticket] {subject_line}"
+    text_body = f"""Hello,
+
+A user has reported a problem on the AVO Carbon RFQ Portal.
+
+Reported by: {display_name} ({reporter_email})
+Subject: {subject_line}
+
+Description:
+{description}
+"""
+    html_body = _build_base_html(
+        "New Support Ticket",
+        f"""
+          <p>Hello,</p>
+          <p>A user has reported a problem on the <strong>AVO Carbon RFQ Portal</strong>.</p>
+          <ul>
+            <li><strong>Reported by:</strong> {display_name} ({reporter_email})</li>
+            <li><strong>Subject:</strong> {subject_line}</li>
+          </ul>
+          <p><strong>Description:</strong></p>
+          <div style="white-space: pre-wrap; background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 12px;">{description}</div>
+        """,
+    )
+    return send_email(recipients, subject, text_body, html_body=html_body)
+
+
 def send_rfq_revalidation_notification(
     recipient_email: str,
     systematic_rfq_id: str,

@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     SMTP_USER: str | None = None
     SMTP_PASSWORD: str | None = None
     FROM_EMAIL: str | None = None
+    SUPPORT_TICKET_RECIPIENTS: str | None = None
     AZURE_CONNECTION_STRING: str | None = None
     AZURE_RFQ_FILES_CONTAINER: str = "rfq-files"
     CRON_TOKEN: str | None = None
@@ -114,6 +115,18 @@ class Settings(BaseSettings):
     @property
     def from_email(self) -> str:
         return (self.FROM_EMAIL or "").strip("\"' ")
+
+    @property
+    def support_ticket_recipients(self) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for candidate in (self.SUPPORT_TICKET_RECIPIENTS or "").split(","):
+            value = candidate.strip().strip("\"' ")
+            if not value or value.casefold() in seen:
+                continue
+            seen.add(value.casefold())
+            normalized.append(value)
+        return normalized
 
     @property
     def azure_connection_string(self) -> str:

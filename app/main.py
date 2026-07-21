@@ -36,6 +36,7 @@ from app.routers import (
     products,
     rfq,
     routing_config,
+    support,
     team_view,
     users,
 )
@@ -123,6 +124,7 @@ app.include_router(products.router)
 app.include_router(actions.router)
 app.include_router(owner.router)
 app.include_router(routing_config.router)
+app.include_router(support.router)
 app.include_router(chat.router)
 app.include_router(chat_autofill.router)
 app.include_router(chat_offer.router)
