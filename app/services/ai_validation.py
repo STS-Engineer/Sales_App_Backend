@@ -34,7 +34,9 @@ logger = logging.getLogger(__name__)
 # Checked in order: explicit "Statut:" line → negated release → positive release.
 
 _BLOCKED_STATUS_WORDS = ("bloqué", "blocked", "rejeté", "rejected", "attente", "waiting")
-_APPROVED_STATUS_WORDS = ("libéré", "released", "ok pour", "validé", "approved", "approuvé")
+_APPROVED_STATUS_WORDS = (
+    "libéré", "released", "ok pour", "validé", "validated", "approved", "approuvé",
+)
 
 _BLOCKED_PHRASES = (
     "ne peut pas être libéré",
@@ -153,17 +155,25 @@ async def apply_ai_validation_verdict(
     approved: bool,
     send_email: bool = True,
 ) -> bool:
-    """Resolve an RFQ sitting in PENDING_AI_APPROVAL once the agent's verdict is known.
+    """Resolve an RFQ awaiting an AI decision once the agent's verdict is known.
 
     Approved -> moves to PENDING_FOR_VALIDATION and, unless the creator is also
     the assigned validator, emails the validator so they know it's their turn.
     Rejected -> moves to REJECTED_BY_AI; the creator must fix and resubmit.
 
+    REJECTED_BY_AI is also accepted as a starting state (in addition to
+    PENDING_AI_APPROVAL) because the agent can reverse an earlier rejection
+    once the user clarifies inside the same discussion thread, without the
+    RFQ going through a full resubmission back to PENDING_AI_APPROVAL first.
+
     Returns True if a validator notification email was sent. No-ops (returns
     False) if the RFQ isn't currently awaiting an AI decision — e.g. a stale or
     duplicate callback arriving after the RFQ was already resolved.
     """
-    if rfq.phase != RfqPhase.RFQ or rfq.sub_status != RfqSubStatus.PENDING_AI_APPROVAL:
+    if rfq.phase != RfqPhase.RFQ or rfq.sub_status not in (
+        RfqSubStatus.PENDING_AI_APPROVAL,
+        RfqSubStatus.REJECTED_BY_AI,
+    ):
         return False
 
     if not approved:

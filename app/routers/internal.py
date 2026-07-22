@@ -105,10 +105,14 @@ async def save_ai_validation_result(
             str(body.discussion or "")
         )
 
+    # Fall back to approved (not the RFQ's prior stored verdict) when the
+    # signal is ambiguous — otherwise an RFQ that was rejected once would
+    # stay stuck on REJECTED_BY_AI forever, since existing_record["approved"]
+    # would keep re-resolving to the earlier False value on every retry.
     resolved_approved = resolve_ai_validation_approved(
         effective_approved,
         body.status,
-        fallback=bool(existing_record.get("approved", True)),
+        fallback=True,
     )
     # Force status to "completed" when the discussion was successfully parsed.
     effective_status = body.status
