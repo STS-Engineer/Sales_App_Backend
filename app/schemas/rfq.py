@@ -58,6 +58,7 @@ class AuditLogOut(BaseModel):
 class NotificationLogOut(BaseModel):
     log_id: str
     rfq_id: str
+    systematic_rfq_id: str | None = None
     recipient_email: str
     email_type: str
     sent_at: datetime

@@ -32,6 +32,7 @@ from app.routers import (
     market_view,
     old_rfqs,
     mcp_router,
+    notification_logs,
     owner,
     products,
     rfq,
@@ -118,6 +119,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 app.include_router(auth.router)
 app.include_router(audit_logs.router)
+app.include_router(notification_logs.router)
 app.include_router(users.router)
 app.include_router(rfq.router)
 app.include_router(products.router)
