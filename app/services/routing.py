@@ -1,13 +1,17 @@
+import logging
 import unicodedata
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.product_line_routing import ProductLineRouting, ProductLineRoutingRole
 from app.models.routing_setting_viewers import RoutingSettingViewer
 from app.models.validation_matrix import ValidationMatrix
 
-# Fixed escalation emails
+logger = logging.getLogger(__name__)
+
+# Fixed escalation emails — fallback roster used when v_sales_organisation
+# (KPI_DB_Final) is unavailable or has no matching row for the role/zone.
 # N-3 (KAM): defaults to created_by_email (self-validation)
 # N-2 (Zone Manager): canonical delivery-zone routing
 N2_ZONE_EMAIL = "franck.lagadec@avocarbon.com"
@@ -72,6 +76,85 @@ def get_zone_manager_email(delivery_zone: str | None) -> tuple[str | None, str |
     if not canonical_zone:
         return None, None
     return ZONE_MANAGER_EMAILS.get(canonical_zone), canonical_zone
+
+
+# ── Validator email resolution from v_sales_organisation (KPI_DB_Final) ──────
+# The view groups zones more broadly than APPROVED_DELIVERY_ZONES (confirmed
+# against live data): "Europe" covers Europe + Africa, "North America" covers
+# North America + South America, and "Asia" covers China / South Pacific +
+# Korea / Japan. This maps each canonical app zone to the view's zone label.
+_CANONICAL_ZONE_TO_ORG_VIEW_ZONE = {
+    "Europe": "Europe",
+    "Africa": "Europe",
+    "India": "India",
+    "North America": "North America",
+    "South America": "North America",
+    "China / South Pacific": "Asia",
+    "Korea / Japan": "Asia",
+}
+
+_ORG_ZONE_MANAGER_EMAIL_SQL = text("""
+    SELECT email
+    FROM v_sales_organisation
+    WHERE role = 'Zone manager' AND lower(zone) = lower(:zone)
+    LIMIT 1
+""")
+_ORG_VP_SALES_EMAIL_SQL = text("""
+    SELECT email
+    FROM v_sales_organisation
+    WHERE role = 'VP Sales'
+    LIMIT 1
+""")
+_ORG_CEO_EMAIL_SQL = text("""
+    SELECT email
+    FROM v_sales_organisation
+    WHERE role = 'CEO'
+    LIMIT 1
+""")
+
+
+async def _query_org_email(db4: AsyncSession | None, query, params: dict | None = None) -> str:
+    if db4 is None:
+        return ""
+    try:
+        result = await db4.execute(query, params or {})
+        row = result.mappings().first()
+        return str(row["email"] or "").strip() if row else ""
+    except Exception:
+        logger.exception("Failed to query v_sales_organisation for validator routing.")
+        return ""
+
+
+async def resolve_zone_manager_email(
+    db4: AsyncSession | None,
+    delivery_zone: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve the Zone Manager's email for a delivery zone.
+
+    Prefers the live org chart (v_sales_organisation) and falls back to the
+    hardcoded roster if the KPI database is unavailable or has no match.
+    """
+    canonical_zone = normalize_delivery_zone(delivery_zone)
+    if not canonical_zone:
+        return None, None
+
+    org_zone = _CANONICAL_ZONE_TO_ORG_VIEW_ZONE.get(canonical_zone)
+    if org_zone:
+        email = await _query_org_email(db4, _ORG_ZONE_MANAGER_EMAIL_SQL, {"zone": org_zone})
+        if email:
+            return email, canonical_zone
+
+    return ZONE_MANAGER_EMAILS.get(canonical_zone), canonical_zone
+
+
+async def resolve_vp_sales_email(db4: AsyncSession | None) -> str:
+    email = await _query_org_email(db4, _ORG_VP_SALES_EMAIL_SQL)
+    return email or N1_VP_EMAIL
+
+
+async def resolve_ceo_email(db4: AsyncSession | None) -> str:
+    email = await _query_org_email(db4, _ORG_CEO_EMAIL_SQL)
+    return email or N0_CEO_EMAIL
 
 
 def _normalize_email(value: str | None) -> str:
@@ -295,9 +378,15 @@ async def assign_validator(
     commercial_email: str,
     db: AsyncSession,
     delivery_zone: str | None = None,
-) -> str:
+    db4: AsyncSession | None = None,
+) -> tuple[str, str]:
     """
     Assigns a validator email based on the PTE and the product line thresholds.
+
+    Returns (email, role) where role is one of "KAM", "Zone Manager",
+    "VP Sales", "CEO". Zone Manager / VP Sales / CEO emails are resolved from
+    v_sales_organisation when `db4` is provided, falling back to the
+    hardcoded roster otherwise.
     """
     result = await db.execute(
         select(ValidationMatrix).where(ValidationMatrix.product_line == product_line)
@@ -307,14 +396,14 @@ async def assign_validator(
         raise ValueError(f"Unknown product line: '{product_line}'")
 
     if pte <= matrix.n3_kam_limit:
-        return commercial_email
+        return commercial_email, "KAM"
     if pte <= matrix.n2_zone_limit:
         if delivery_zone:
-            zone_manager_email, _ = get_zone_manager_email(delivery_zone)
+            zone_manager_email, _ = await resolve_zone_manager_email(db4, delivery_zone)
             if not zone_manager_email:
                 raise ValueError(f"Unknown delivery zone: '{delivery_zone}'")
-            return zone_manager_email
-        return N2_ZONE_EMAIL
+            return zone_manager_email, "Zone Manager"
+        return N2_ZONE_EMAIL, "Zone Manager"
     if pte <= matrix.n1_vp_limit:
-        return N1_VP_EMAIL
-    return N0_CEO_EMAIL
+        return await resolve_vp_sales_email(db4), "VP Sales"
+    return await resolve_ceo_email(db4), "CEO"

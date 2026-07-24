@@ -2544,6 +2544,7 @@ async def submit_rfq_for_validation(
 async def assign_rfq_validator(
     rfq_id: str,
     db: AsyncSession = Depends(get_db),
+    db4: AsyncSession | None = Depends(get_db4_optional),
     current_user: User = Depends(get_current_user),
 ):
     """Compute and save the validator email for an RFQ based on product line, delivery zone, and TO total."""
@@ -2585,26 +2586,16 @@ async def assign_rfq_validator(
     commercial_email = rfq.created_by_email or ""
 
     try:
-        validator_email = await assign_validator(
+        validator_email, validator_role = await assign_validator(
             product_line=product_line_name,
             pte=to_total,
             commercial_email=commercial_email,
             db=db,
             delivery_zone=delivery_zone or None,
+            db4=db4,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # Determine validator_role label
-    from app.services.routing import N1_VP_EMAIL, N0_CEO_EMAIL
-    if validator_email == commercial_email:
-        validator_role = "KAM"
-    elif validator_email in (N1_VP_EMAIL,):
-        validator_role = "VP Sales"
-    elif validator_email == N0_CEO_EMAIL:
-        validator_role = "CEO"
-    else:
-        validator_role = "Zone Manager"
 
     # Persist to rfq_data
     updated_data = dict(extracted_data)
